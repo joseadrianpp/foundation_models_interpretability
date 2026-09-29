@@ -1,9 +1,0 @@
-method,cell_type,n_query_genes,n_significant_terms
-attention_zero_shot,astrocytes,30,9
-attention_zero_shot,da_neurons,30,26
-attention_zero_shot,microglia,30,7
-attention_zero_shot,oligodendrocytes,30,2
-ig_lora,astrocytes,30,2
-ig_lora,da_neurons,30,17
-ig_lora,microglia,30,8
-ig_lora,oligodendrocytes,30,24

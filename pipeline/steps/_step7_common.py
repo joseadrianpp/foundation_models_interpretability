@@ -88,26 +88,13 @@ def _load_zero_shot_model(vocab, model_configs: dict, device: torch.device) -> n
     return model
 
 
-def _load_lora_phase2_model(full_model_path, vocab, model_configs: dict,
-                             device: torch.device) -> nn.Module:
-    ckpt = torch.load(full_model_path, map_location=device)
+# LoRA model load: pipeline_unified Step 5.1 saves the adapters merged into
+# the backbone and the head as cls_decoder, all in one plain state_dict
+def _load_lora_model(full_model_path, vocab, model_configs: dict,
+                     device: torch.device) -> nn.Module:
     model = build_base_model(vocab, model_configs, n_cls=1)
-    state_dict = ckpt["state_dict"]
-    state_dict_clean = {k: v for k, v in state_dict.items()
-                        if not k.startswith("cls_decoder.")}
-    model.load_state_dict(state_dict_clean, strict=False)
-    flex_cfg = ckpt["model_arch_config"]["cls_decoder_config"]
-    flex_mlp = FlexMLP(
-        input_dim=flex_cfg["input_dim"],
-        n_layers=flex_cfg["n_layers"],
-        hidden_size=flex_cfg["hidden_size"],
-        dropout=flex_cfg["dropout"],
-        activation=flex_cfg["activation"],
-        mlp_type=flex_cfg["mlp_type"],
-        n_classes=flex_cfg["n_classes"],
-    )
-    flex_mlp.load_state_dict(ckpt["cls_decoder"])
-    model.cls_decoder = flex_mlp
+    model.cls_decoder = FlexMLP(**C.SCGPT_LORA_HEAD_CONFIG)
+    model.load_state_dict(torch.load(full_model_path, map_location=device))
     model.to(device); model.eval()
     return model
 
@@ -231,7 +218,6 @@ def _compute_attn_per_gene_per_condition(
 
     # Initialize variables to save attention values
     sum_by_gid: Dict[int, Dict[int, float]] = {0: {}, 1: {}}
-    cnt_by_gid: Dict[int, Dict[int, int]] = {0: {}, 1: {}}
     n_per_cond = {0: 0, 1: 0}
     n_correct = {0: 0, 1: 0}
 
@@ -277,17 +263,20 @@ def _compute_attn_per_gene_per_condition(
                 if gid == pad_id or gid in special_ids:
                     continue
                 sum_by_gid[true][gid] = sum_by_gid[true].get(gid, 0.0) + float(row[pos])
-                cnt_by_gid[true][gid] = cnt_by_gid[true].get(gid, 0) + 1
 
-    # Compute the mean attention per gene per condition (positive; PD and negative; Control)
+    # Cells that entered each condition: all of them, or only the correctly classified ones
+    n_used = n_correct if use_predictions else n_per_cond
+
+    # Compute the mean attention per gene per condition (positive; PD and negative; Control).
+    # The mean is over every cell of the condition and a cell without the gene adds 0,
+    # so a gene seen in a handful of cells cannot outrank one seen in all of them
     means: Dict[int, Dict[str, float]] = {0: {}, 1: {}}
     for cond in (0, 1):
         for gid, s in sum_by_gid[cond].items():
             name = vocab.lookup_tokens([gid])[0]
             if name in C.SPECIAL_TOKENS:
                 continue
-            c = cnt_by_gid[cond][gid]
-            means[cond][name] = s / c if c > 0 else 0.0
+            means[cond][name] = s / n_used[cond] if n_used[cond] > 0 else 0.0
 
     # Safe case for 100% or 0% accuracy
     if use_predictions:

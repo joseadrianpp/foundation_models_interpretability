@@ -1,4 +1,4 @@
-"""Shared GO3 / GWAS Catalog helpers for gwas_similarity.py and gene_matrix.py.
+"""Shared GO3 / GWAS Catalog / PD panel helpers for gwas_similarity.py and gene_matrix.py.
 
 go3 is a local Rust/PyO3 package (not on PyPI); this module only assumes it is
 importable in the running environment (it already is inside scgpt_env).
@@ -26,6 +26,15 @@ GWAS_TRAITS = {"parkinson": "Parkinsons Disease",
                "cad": "Coronary Artery Disease"}
 ASPECT_TO_GO_SOURCE = {"P": "GO:BP", "C": "GO:CC", "F": "GO:MF"}
 
+# Two curated Parkinson's references besides the GWAS one: the PanelApp
+# "Parkinson Disease and Complex Parkinsonism" panel and the ParkinsonsUK-UCL
+# GO annotations exported from QuickGO
+PANELS_DIR = Path(__file__).resolve().parents[2] / "data" / "pd_panels"
+PANELAPP_TSV = PANELS_DIR / "panelapp_parkinson_disease_and_complex_parkinsonism.tsv"
+PARKINSONSUK_UCL_TSV = PANELS_DIR / "quickgo_parkinsonsuk_ucl.tsv"
+# PanelApp status 3 or more is Green, the diagnostic-grade genes of the panel
+PANELAPP_MIN_STATUS = 3
+
 
 # Fetch one GWAS Catalog trait's gene set, caching it to `cache` on first use
 def fetch_gwas(trait: str, cache: Path) -> list:
@@ -45,6 +54,29 @@ def fetch_gwas(trait: str, cache: Path) -> list:
 # Fetch (or reuse the cache of) every GWAS disease
 def fetch_all_gwas(out_dir: Path) -> dict:
     return {key: fetch_gwas(trait, out_dir / f"{key}_genes.csv") for key, trait in GWAS_TRAITS.items()}
+
+# Green genes of the PanelApp panel
+def load_panelapp() -> list:
+    df = pd.read_csv(PANELAPP_TSV, sep="\t", dtype=str)
+    status = pd.to_numeric(df["GEL_Status"], errors="coerce")
+    keep = (df["Entity type"] == "gene") & (status >= PANELAPP_MIN_STATUS)
+    return sorted(df.loc[keep, "Gene Symbol"].dropna().unique())
+
+# Genes with at least one ParkinsonsUK-UCL GO annotation
+def load_parkinsonsuk_ucl() -> list:
+    df = pd.read_csv(PARKINSONSUK_UCL_TSV, sep="\t", dtype=str, encoding="utf-8-sig")
+    # A NOT qualifier says the gene lacks the function, and the ComplexPortal
+    # and RNAcentral rows are complexes and RNAs, not genes
+    keep = ~df["QUALIFIER"].str.startswith("NOT") & (df["GENE PRODUCT DB"] == "UniProtKB")
+    return sorted(df.loc[keep, "SYMBOL"].unique())
+
+# Load both PD panels and save them next to the GWAS gene sets, so gene_matrix.py reads them the same way
+def load_pd_panels(out_dir: Path) -> dict:
+    panels = {"panelapp": load_panelapp(), "parkinsonsuk_ucl": load_parkinsonsuk_ucl()}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, genes in panels.items():
+        pd.DataFrame({"gene": genes}).to_csv(out_dir / f"{key}_genes.csv", index=False)
+    return panels
 
 # This function gets all Gene symbols at least one GO annotation
 def gaf_symbols_by_go_source() -> dict:

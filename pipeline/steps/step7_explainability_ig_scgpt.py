@@ -13,7 +13,8 @@ How it works:
     from baseline to the real cell, using `n_steps` Gauss-Legendre points.
   - IG(gene) = (real_value - baseline_value) * integrated_gradient.
   - We keep only correctly classified cells and score each gene by the MEAN
-    ABSOLUTE attribution over them (non-negative, like RF importance).
+    ABSOLUTE attribution over all of them, a cell without the gene counting
+    as 0 (non-negative, like RF importance).
 """
 
 from typing import Dict, Tuple
@@ -100,7 +101,6 @@ def _compute_ig_importance(
     # Pass 2: Integrated Gradients, only on the correctly classified subset.
     # Initialize variables
     sum_abs: Dict[int, float] = {}
-    cnt: Dict[int, int] = {}
 
     # Iterate over the correctly classified cells in batches, computing IG for each
     for start in range(0, n_used, batch_size):
@@ -129,16 +129,16 @@ def _compute_ig_importance(
                 if gid == pad_id or gid in special_ids:
                     continue
                 sum_abs[gid] = sum_abs.get(gid, 0.0) + abs(float(ig[i, pos]))
-                cnt[gid] = cnt.get(gid, 0) + 1
 
-    # Compute the mean IG per gene
+    # Compute the mean IG per gene over every correctly classified cell, a cell
+    # without the gene adds 0, so a gene seen in a handful of cells cannot
+    # outrank one seen in all of them
     mean_abs: Dict[str, float] = {}
     for gid, s in sum_abs.items():
         name = vocab.lookup_tokens([gid])[0]
         if name in C.SPECIAL_TOKENS:
             continue
-        c = cnt[gid]
-        mean_abs[name] = s / c if c > 0 else 0.0
+        mean_abs[name] = s / n_used
 
     # Safe case for 100% or 0% accuracy
     ok = n_used > 0

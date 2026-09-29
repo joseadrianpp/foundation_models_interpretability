@@ -6,12 +6,17 @@ import pandas as pd
 
 from .enrichment import CELL_TYPES, METHODS
 
-METHOD_LABELS = {"attention_zero_shot": "Zero-shot (attention)", "ig_lora": "LoRA (Integrated Gradients)"}
-METHOD_COLORS = {"attention_zero_shot": "#4878CF", "ig_lora": "#D65F5F"}
+METHOD_LABELS = {"attention_zero_shot_scgpt": "scGPT zero-shot (attention)",
+                 "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
+                 "attention_zero_shot_geneformer": "Geneformer zero-shot (attention)",
+                 "attention_lora_geneformer": "Geneformer LoRA (attention)"}
+METHOD_COLORS = {"attention_zero_shot_scgpt": "#4878CF", "ig_lora_scgpt": "#D65F5F",
+                 "attention_zero_shot_geneformer": "#6ACC65", "attention_lora_geneformer": "#B47CC7"}
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                      "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
 SIG_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
-BAR_WIDTH = 0.32
+# The bars of all methods share 0.8 of the space of each cell type
+BAR_WIDTH = 0.8 / len(METHODS)
 
 def _stars_for(p: float) -> str:
     for threshold, label in SIG_LEVELS:
@@ -19,12 +24,23 @@ def _stars_for(p: float) -> str:
             return label
     return ""
 
+# One bracket per significant pair of methods, each one above the previous one.
+# Returns the height of the last bracket
+def _draw_brackets(ax, rows: pd.DataFrame, x_ct: float, offsets: dict, y: float, step: float) -> float:
+    for _, row in rows.iterrows():
+        y += step
+        x1, x2 = x_ct + offsets[row["method_a"]], x_ct + offsets[row["method_b"]]
+        ax.plot([x1, x1, x2, x2], [y - step * 0.3, y, y, y - step * 0.3], color="black", lw=1)
+        ax.text((x1 + x2) / 2, y, _stars_for(row["p_value"]), ha="center", va="bottom", fontsize=9)
+    return y
+
 def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame,
                             metric: str, metric_key: str, title: str) -> None:
     x = np.arange(len(CELL_TYPES))
+    # Position of each method's bar with respect to the cell type tick
+    offsets = {m: (i - (len(METHODS) - 1) / 2) * BAR_WIDTH for i, m in enumerate(METHODS)}
     tops = {}
-    for i, method in enumerate(METHODS):
-        offsets = x + (i - 0.5) * BAR_WIDTH
+    for method in METHODS:
         heights = []
         for cell_type in CELL_TYPES:
             row = summary[(summary["cell_type"] == cell_type) & (summary["method"] == method)]
@@ -32,21 +48,19 @@ def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame,
             val = 0.0 if pd.isna(val) else val
             heights.append(val)
             tops[(cell_type, method)] = val
-        ax.bar(offsets, heights, width=BAR_WIDTH, label=METHOD_LABELS[method], color=METHOD_COLORS[method])
+        ax.bar(x + offsets[method], heights, width=BAR_WIDTH, label=METHOD_LABELS[method], color=METHOD_COLORS[method])
 
-    # n_significant_terms has no pairwise test (only IC/intersection_size do)
+    # n_significant_terms has no pairwise test (only IC/intersection_size/functional abundance do)
     ymax = max(tops.values(), default=0.0)
     if metric_key is not None and ymax > 0:
         step = ymax * 0.14
+        top = ymax
         for i, cell_type in enumerate(CELL_TYPES):
-            row = tests[(tests["cell_type"] == cell_type) & (tests["metric"] == metric_key)]
-            if row.empty or pd.isna(row["p_value"].iloc[0]) or row["p_value"].iloc[0] >= 0.05:
-                continue
-            x1, x2 = x[i] - BAR_WIDTH / 2, x[i] + BAR_WIDTH / 2
-            y = max(tops[(cell_type, METHODS[0])], tops[(cell_type, METHODS[1])]) + step
-            ax.plot([x1, x1, x2, x2], [y - step * 0.3, y, y, y - step * 0.3], color="black", lw=1)
-            ax.text((x1 + x2) / 2, y, _stars_for(row["p_value"].iloc[0]), ha="center", va="bottom", fontsize=9)
-        ax.set_ylim(top=ymax * 1.25)
+            rows = tests[(tests["cell_type"] == cell_type) & (tests["metric"] == metric_key)
+                         & (tests["p_value"] < 0.05)]
+            y = max(tops[(cell_type, m)] for m in METHODS)
+            top = max(top, _draw_brackets(ax, rows, x[i], offsets, y, step))
+        ax.set_ylim(top=max(ymax * 1.25, top + step))
 
     ax.set_xticks(x)
     ax.set_xticklabels([CELL_TYPE_LABELS[c] for c in CELL_TYPES], rotation=20, ha="right")
@@ -62,13 +76,14 @@ def plot_enrichment_summary(results_dir: Path) -> Path:
         ("n_significant_terms", None, "Number of significant\nGO/KEGG/REAC terms"),
         ("mean_information_content", "information_content", "Mean information content\n(significant terms)"),
         ("mean_intersection_size", "intersection_size", "Mean intersection size\n(genes per term)"),
+        ("mean_functional_abundance", "functional_abundance", "Mean functional abundance\n(fraction of the term covered)"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    fig, axes = plt.subplots(1, len(panels), figsize=(18, 4.5))
     for ax, (metric, metric_key, title) in zip(axes, panels):
         _draw_enrichment_panel(ax, summary, tests, metric, metric_key, title)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+    fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
     fig.tight_layout(rect=[0, 0.05, 1, 1])
 
     out_path = results_dir / "plots" / "enrichment_summary.png"
@@ -129,7 +144,7 @@ def plot_gwas_similarity(results_dir: Path) -> Path:
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in METHODS]
     fig.legend(handles, [METHOD_LABELS[m] for m in METHODS], loc="lower center",
-               ncol=2, frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+               ncol=len(METHODS), frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
     fig.tight_layout(rect=[0, 0.05, 1, 1])
 
     out_path = results_dir / "plots" / "gwas_similarity.png"

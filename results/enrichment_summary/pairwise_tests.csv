@@ -1,9 +1,0 @@
-cell_type,metric,method_a,method_b,n_a,n_b,p_value
-astrocytes,information_content,attention_zero_shot,ig_lora,9,2,0.5547888326462094
-astrocytes,intersection_size,attention_zero_shot,ig_lora,9,2,0.718725663171857
-da_neurons,information_content,attention_zero_shot,ig_lora,26,17,0.7093718527033729
-da_neurons,intersection_size,attention_zero_shot,ig_lora,26,17,0.5189139548188091
-microglia,information_content,attention_zero_shot,ig_lora,7,8,0.1020809611324846
-microglia,intersection_size,attention_zero_shot,ig_lora,7,8,0.1635549011773484
-oligodendrocytes,information_content,attention_zero_shot,ig_lora,2,24,0.13576647516202967
-oligodendrocytes,intersection_size,attention_zero_shot,ig_lora,2,24,0.05845030230251996

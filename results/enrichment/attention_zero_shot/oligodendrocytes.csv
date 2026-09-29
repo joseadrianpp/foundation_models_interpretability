@@ -1,3 +1,0 @@
-source,native,name,p_value,significant,description,term_size,query_size,intersection_size,effective_domain_size,precision,recall,query,parents
-GO:MF,GO:0015349,thyroid hormone transmembrane transporter activity,0.025500657168978886,True,"""Enables the transfer of thyroid hormones from one side of a membrane to the other. Thyroid hormone are any of the compounds secreted by the thyroid gland, largely thyroxine and triiodothyronine."" [GOC:ai]",8,28,2,17354,0.07142857142857142,0.25,query_1,['GO:0015291']
-REAC,REAC:R-HSA-1250342,PI3K events in ERBB4 signaling,0.03778162587890044,True,PI3K events in ERBB4 signaling,9,20,2,11056,0.1,0.2222222222222222,query_1,['REAC:R-HSA-1236394']

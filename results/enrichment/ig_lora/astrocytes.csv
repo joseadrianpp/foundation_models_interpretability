@@ -1,3 +1,0 @@
-source,native,name,p_value,significant,description,term_size,query_size,intersection_size,effective_domain_size,precision,recall,query,parents
-GO:BP,GO:0010001,glial cell differentiation,0.03392334518674092,True,"""The process in which a relatively unspecialized cell acquires the specialized features of a glial cell."" [GOC:go_curators, GOC:mtg_sensu]",111,25,4,16180,0.16,0.036036036036036036,query_1,"['GO:0030154', 'GO:0042063']"
-GO:BP,GO:0045685,regulation of glial cell differentiation,0.034936807929661196,True,"""Any process that modulates the frequency, rate or extent of glia cell differentiation."" [GOC:go_curators]",37,25,3,16180,0.12,0.08108108108108109,query_1,"['GO:0010001', 'GO:0045595']"
