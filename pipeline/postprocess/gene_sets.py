@@ -7,13 +7,14 @@ Methods:
   * attention_residualized_ols_scgpt - OLS residual of the scGPT pooled attention (method 2.3)
   * ig_lora_scgpt                    - Integrated Gradients on the LoRA scGPT model
   * attention_zero_shot_geneformer   - Geneformer pooled CLS attention, PD - control
+  * attention_cssi_geneformer        - Geneformer CSSI-max attention over Leiden strata
   * attention_lora_geneformer        - CLS attention of the LoRA Geneformer model
 
 Selections:
   * top30 - static top-30 ranking
   * elbow - Kneedle elbow on the descending score curve (variable size)
 
-IG and the Geneformer tasks only write a top-30, so they have no elbow gene set.
+IG and the Geneformer LoRA task only write a top-30, so they have no elbow gene set.
 
 All paths are relative to the per-dataset results folder (results/dataset_a,
 results/dataset_b).
@@ -50,6 +51,11 @@ GENE_LIST_PATHS = {
     },
     "attention_zero_shot_geneformer": {
         "top30": "attention_zero_shot_geneformer/{ct}/top30_genes.csv",
+        "elbow": "attention_zero_shot_geneformer/{ct}/csv/elbow.csv",
+    },
+    "attention_cssi_geneformer": {
+        "top30": "attention_zero_shot_geneformer/{ct}/cssi/csv/top30.csv",
+        "elbow": "attention_zero_shot_geneformer/{ct}/cssi/csv/elbow.csv",
     },
     "attention_lora_geneformer": {
         "top30": "attention_lora_geneformer/{ct}/top30_genes.csv",

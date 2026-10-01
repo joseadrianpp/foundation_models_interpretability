@@ -22,6 +22,7 @@ METHOD_LABELS = {
     "attention_residualized_ols_scgpt": "scGPT OLS-residual attention (2.3)",
     "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
     "attention_zero_shot_geneformer": "Geneformer zero-shot attention (pooled)",
+    "attention_cssi_geneformer": "Geneformer CSSI-max attention",
     "attention_lora_geneformer": "Geneformer LoRA (attention)",
 }
 METHOD_SHORT = {
@@ -30,15 +31,17 @@ METHOD_SHORT = {
     "attention_residualized_ols_scgpt": "OLS resid.",
     "ig_lora_scgpt": "IG LoRA",
     "attention_zero_shot_geneformer": "GF pooled",
+    "attention_cssi_geneformer": "GF CSSI",
     "attention_lora_geneformer": "GF LoRA",
 }
-# Fixed categorical order (blue, orange, aqua, yellow, violet, magenta)
+# Fixed categorical order (blue, orange, aqua, yellow, violet, brown, magenta)
 METHOD_COLORS = {
     "attention_zero_shot_scgpt": "#2a78d6",
     "attention_cssi_scgpt": "#eb6834",
     "attention_residualized_ols_scgpt": "#1baf7a",
     "ig_lora_scgpt": "#eda100",
     "attention_zero_shot_geneformer": "#7b5cd6",
+    "attention_cssi_geneformer": "#a0672b",
     "attention_lora_geneformer": "#d6458f",
 }
 # Dynamic-selection summary (n_selected per rule) of the methods that have one
@@ -46,6 +49,8 @@ SUMMARY_PATHS = {
     "attention_zero_shot_scgpt": "attention_zero_shot_scgpt/{ct}/csv/selection_summary.json",
     "attention_cssi_scgpt": "attention_zero_shot_scgpt/{ct}/cssi/csv/selection_summary.json",
     "attention_residualized_ols_scgpt": "attention_residualized_ols_scgpt/{ct}/csv/selection_summary.json",
+    "attention_zero_shot_geneformer": "attention_zero_shot_geneformer/{ct}/csv/selection_summary.json",
+    "attention_cssi_geneformer": "attention_zero_shot_geneformer/{ct}/cssi/csv/selection_summary.json",
 }
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                     "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
@@ -337,6 +342,8 @@ ALL_SCORE_PATHS = {
                                   "attention_zero_shot_scgpt/{ct}/csv/permutation_audit.csv"],
     "attention_cssi_scgpt": ["attention_zero_shot_scgpt/{ct}/cssi_genes.csv"],
     "attention_residualized_ols_scgpt": ["attention_residualized_ols_scgpt/{ct}/csv/ols.csv"],
+    "attention_zero_shot_geneformer": ["attention_zero_shot_geneformer/{ct}/csv/all_genes.csv"],
+    "attention_cssi_geneformer": ["attention_zero_shot_geneformer/{ct}/cssi_genes.csv"],
 }
 CUTOFF_STYLES = {"top30": ":", "z-score": "--", "otsu": "-.", "elbow": "-"}
 MAX_RANK_SHOWN = 200

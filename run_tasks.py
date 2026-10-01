@@ -6,7 +6,8 @@ Interpretability outputs for the scGPT and Geneformer models:
      plus the CSSI-max score over Leiden strata and the dynamic selections
      (top30 / z-score / otsu / elbow) of both.
   2. Integrated Gradients on the LoRA fine-tuned scGPT model -> top-30 genes.
-  3. The same attention score as 1 with the zero-shot Geneformer model.
+  3. The same outputs as 1 (pooled + CSSI + dynamic selections) with the
+     zero-shot Geneformer model.
   4. The same attention score with the LoRA fine-tuned Geneformer model, only
      on its correctly classified cells.
   5. OLS residualization of the scGPT zero-shot attention -> all genes +
@@ -185,6 +186,67 @@ def _split_cell_types(counts: dict, n_workers: int):
     return workers, loads
 
 
+def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_ids=None) -> None:
+    """Pooled + CSSI scores, dynamic selections and Leiden artifacts of one cell type.
+
+    Model independent: it only reads the AttentionCache. With `donor_ids`
+    the donor-level permutation selector also runs (--permutation).
+    """
+    means, cssi_scores, gate, strata, meta = cssi.compute_attention_cssi(
+        cache,
+        n_neighbors=CSSI_N_NEIGHBORS,
+        target_k=CSSI_TARGET_K,
+        min_cells_per_condition=CSSI_MIN_CELLS_PER_CONDITION,
+        random_state=SEED,
+    )
+    if not gate["ok"]:
+        print(f"  skipped: {gate['reason']}", flush=True)
+        return
+    print(
+        f"  CSSI: {meta.get('n_clusters', 1)} Leiden strata "
+        f"(resolution={meta.get('resolution', 0):.4g}), "
+        f"{cache.embeddings.shape[1]}-D embeddings",
+        flush=True,
+    )
+
+    pooled_scores = common._gene_scores(means, _signed_score)
+
+    # Preserve the original baseline/output consumed by downstream tasks.
+    _write_top_n(pooled_scores, out_dir / "top30_genes.csv")
+    _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
+    _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
+
+    donor_data = None if donor_ids is None else dynamic.donor_attention_data(cache, donor_ids, strata)
+
+    # Dynamic top-N: pooled attention and CSSI separately. Permutation is
+    # donor-level and therefore uses the same donor identities in both.
+    summaries = {}
+    for name, scores, sel_dir, cssi_mode in [("pooled", pooled_scores, out_dir / "csv", False),
+                                             ("CSSI", cssi_scores, out_dir / "cssi" / "csv", True)]:
+        summaries[name] = dynamic.write_selection_family(
+            scores,
+            sel_dir,
+            donor_data=donor_data,
+            cssi_mode=cssi_mode,
+            random_state=SEED,
+            permutation_n=DYNAMIC_PERMUTATIONS,
+            permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
+            permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
+        )
+
+    np.save(out_dir / "cell_embeddings.npy", cache.embeddings)
+    pd.DataFrame({"cell_index": np.arange(len(strata)), "leiden": strata}).to_csv(
+        out_dir / "leiden_clusters.csv", index=False
+    )
+    cssi.save_metadata(out_dir / "cssi_metadata.json", meta)
+
+    print(f"  wrote {out_dir / 'top30_genes.csv'}", flush=True)
+    print(f"  wrote {out_dir / 'cssi_genes.csv'} ({len(cssi_scores)} genes)", flush=True)
+    for name, summary in summaries.items():
+        print(f"  {name} dynamic N: " + ", ".join(f"{k}={v['n_selected']}" for k, v in summary.items()),
+              flush=True)
+
+
 def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
                          cell_types=None, opts=None) -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
@@ -196,82 +258,15 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
         print(f"\n# attention_scgpt | {ct} | {sub.n_obs:,} cells | {device} #", flush=True)
         pt = common._tokenise(sub, vocab)
 
-        # One forward pass; pooled, CSSI and donor-level scores all read this cache
-        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2)
-        means, cssi_scores, gate, strata, meta = cssi.compute_attention_cssi(
-            cache,
-            n_neighbors=CSSI_N_NEIGHBORS,
-            target_k=CSSI_TARGET_K,
-            min_cells_per_condition=CSSI_MIN_CELLS_PER_CONDITION,
-            random_state=SEED,
-        )
-        print(
-            f"  CSSI: {meta.get('n_clusters', 1)} Leiden strata "
-            f"(resolution={meta.get('resolution', 0):.4g}), "
-            f"{cache.embeddings.shape[1]}-D embeddings",
-            flush=True,
-        )
-
-        if not gate["ok"]:
-            print(f"  skipped: {gate['reason']}", flush=True)
-            continue
-
-        pooled_scores = common._gene_scores(means, _signed_score)
-        out_dir = results_dir / "attention_zero_shot_scgpt" / slug
-
-        # Preserve the original baseline/output consumed by downstream tasks.
-        _write_top_n(pooled_scores, out_dir / "top30_genes.csv")
-        _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
-        _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
-
-        donor_data = None
+        donor_ids = None
         if opts["permutation"]:
             donor_column = dynamic.resolve_donor_column(sub, opts["donor_col"])
             donor_ids = sub.obs[donor_column].astype(str).to_numpy()
             print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
-            donor_data = dynamic.donor_attention_data(cache, donor_ids, strata)
 
-        # Dynamic top-N: pooled attention and CSSI separately. Permutation is
-        # donor-level and therefore uses the same donor identities in both.
-        pooled_summary = dynamic.write_selection_family(
-            pooled_scores,
-            out_dir / "csv",
-            donor_data=donor_data,
-            cssi_mode=False,
-            random_state=SEED,
-            permutation_n=DYNAMIC_PERMUTATIONS,
-            permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
-            permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
-        )
-        cssi_summary = dynamic.write_selection_family(
-            cssi_scores,
-            out_dir / "cssi" / "csv",
-            donor_data=donor_data,
-            cssi_mode=True,
-            random_state=SEED,
-            permutation_n=DYNAMIC_PERMUTATIONS,
-            permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
-            permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
-        )
-
-        np.save(out_dir / "cell_embeddings.npy", cache.embeddings)
-        pd.DataFrame({"cell_index": np.arange(len(strata)), "leiden": strata}).to_csv(
-            out_dir / "leiden_clusters.csv", index=False
-        )
-        cssi.save_metadata(out_dir / "cssi_metadata.json", meta)
-
-        print(f"  wrote {out_dir / 'top30_genes.csv'}", flush=True)
-        print(f"  wrote {out_dir / 'cssi_genes.csv'} ({len(cssi_scores)} genes)", flush=True)
-        print(
-            "  pooled dynamic N: "
-            + ", ".join(f"{k}={v['n_selected']}" for k, v in pooled_summary.items()),
-            flush=True,
-        )
-        print(
-            "  CSSI dynamic N: "
-            + ", ".join(f"{k}={v['n_selected']}" for k, v in cssi_summary.items()),
-            flush=True,
-        )
+        # One forward pass; pooled, CSSI and donor-level scores all read this cache
+        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2)
+        _write_attention_outputs(cache, results_dir / "attention_zero_shot_scgpt" / slug, donor_ids)
 
     del model
     torch.cuda.empty_cache()
@@ -304,6 +299,7 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 
 
 # Attention per gene per condition of one Geneformer model, for every cell type
+# (used by the LoRA task: top-30 of the correctly classified cells)
 def _attention_geneformer(model, method: str, use_predictions: bool, data_dir: Path,
                           results_dir: Path, device: torch.device, cell_types=None,
                           max_cells=None) -> None:
@@ -327,11 +323,20 @@ def _attention_geneformer(model, method: str, use_predictions: bool, data_dir: P
 
 def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
                               cell_types=None, opts=None) -> None:
+    # Like the scGPT attention task: every cell, grouped by its true label,
+    # with the same pooled + CSSI scores and dynamic selections
     opts = {**DEFAULT_OPTS, **(opts or {})}
-    # Like the scGPT attention task: every cell, grouped by its true label
+    if opts["permutation"]:
+        print("  --permutation ignored: the Geneformer datasets have no donor column", flush=True)
+    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    ds = _load_full_dataset_geneformer(data_dir)
     model = gf._load_zero_shot_model(device)
-    _attention_geneformer(model, "attention_zero_shot_geneformer", False, data_dir, results_dir,
-                          device, cell_types, opts["max_cells_per_type"])
+
+    for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
+        print(f"\n# attention_geneformer | {ct} | {sub.num_rows:,} cells | {device} #", flush=True)
+        cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device)
+        _write_attention_outputs(cache, results_dir / "attention_zero_shot_geneformer" / slug)
+
     del model
     torch.cuda.empty_cache()
 

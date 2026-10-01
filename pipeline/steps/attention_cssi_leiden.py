@@ -11,7 +11,7 @@ Your existing output is gene-level (PD-control attention), not TF-target edges,
 so the scoring step is the gene-level analogue of the paper's per-edge scoring.
 
 One forward pass per cell type fills an `AttentionCache` (model specific:
-`collect_scgpt`); everything after it (pooled means, Leiden strata, CSSI,
+`collect_scgpt`, `collect_geneformer`); everything after it (pooled means, Leiden strata, CSSI,
 donor-level matrices in attention_dynamic_selection.py) only reads the cache,
 so it is the same code for every model.
 
@@ -32,6 +32,7 @@ import torch
 from einops import rearrange
 
 from . import _step7_common as common
+from . import _step7_geneformer as gf
 from .. import config as C
 
 DEFAULT_N_NEIGHBORS = 15
@@ -87,18 +88,30 @@ class _CacheBuilder:
         self._labels.append(np.asarray(labels, dtype=int))
         self._embs.append(np.asarray(embeddings, dtype=np.float32))
 
+    # `order[p]` is the original index of the p-th cell added (cells batched
+    # out of order, e.g. by length); the cache is put back in original order
     def build(self, id_to_gene: Callable[[np.ndarray], Sequence[str]],
-              embedding_source: str) -> AttentionCache:
+              embedding_source: str, order: Optional[np.ndarray] = None) -> AttentionCache:
         gids = np.concatenate(self._gids)
+        attn = np.concatenate(self._attn)
+        lens = np.concatenate(self._lens)
+        labels = np.concatenate(self._labels)
+        embs = np.concatenate(self._embs)
+        if order is not None:
+            back = np.argsort(order)
+            starts = np.concatenate([[0], np.cumsum(lens)])[:-1][back]
+            lens = lens[back]
+            new_starts = np.concatenate([[0], np.cumsum(lens)])[:-1]
+            tokens = np.repeat(starts - new_starts, lens) + np.arange(lens.sum())
+            gids, attn, labels, embs = gids[tokens], attn[tokens], labels[back], embs[back]
         # Compact gene index: the cache only knows the genes it has seen
         uniq, inv = np.unique(gids, return_inverse=True)
-        lens = np.concatenate(self._lens)
         return AttentionCache(
             gene_idx=inv.astype(np.int32),
-            attn=np.concatenate(self._attn),
+            attn=attn,
             cell_ptr=np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
-            labels=np.concatenate(self._labels),
-            embeddings=np.concatenate(self._embs),
+            labels=labels,
+            embeddings=embs,
             genes=np.asarray([str(g) for g in id_to_gene(uniq)]),
             embedding_source=embedding_source,
         )
@@ -184,6 +197,34 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
     return builder.build(
         lambda ids: vocab.lookup_tokens([int(i) for i in ids]),
         f"scGPT residual-stream CLS embedding entering transformer layer {common.NUM_ATTN_LAYERS}",
+    )
+
+
+def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
+                       device: torch.device, batch_size: int = gf.ATTN_BATCH_SIZE) -> AttentionCache:
+    """One Geneformer forward pass over the tokenised cells of one cell type.
+
+    Cells are batched by length so each batch carries little padding (cells
+    have 165-4096 tokens); the cache comes back in the original cell order.
+    """
+    # <pad>, <mask>, <cls> and <eos> are not genes
+    special_ids = np.array(sorted(v for k, v in token_dict.items() if k.startswith("<")))
+    pad_id = token_dict["<pad>"]
+    labels = pt["condition_labels"].numpy()
+    order = np.argsort([len(s) for s in pt["input_ids"]], kind="stable")
+    builder = _CacheBuilder()
+    for start in range(0, len(order), batch_size):
+        idx = order[start:start + batch_size]
+        ids, attn = gf._pad_batch([pt["input_ids"][i] for i in idx], pad_id, device)
+        cls_attn, _, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, False)
+        gids = ids.cpu().numpy()
+        keep = ~np.isin(gids, special_ids)
+        keep[:, 0] = False
+        builder.add(gids, cls_attn.cpu().numpy(), keep, labels[idx], embeddings.cpu().numpy())
+    return builder.build(
+        lambda ids: [gene_names[int(i)] for i in ids],
+        f"Geneformer residual-stream CLS embedding entering encoder layer {gf.NUM_ATTN_LAYER}",
+        order=order,
     )
 
 

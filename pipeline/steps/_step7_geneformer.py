@@ -127,6 +127,40 @@ def _forward_cls_attention(
     return cls_attn, preds
 
 
+# Same CLS attention as _forward_cls_attention, plus the residual-stream CLS
+# embedding entering layer NUM_ATTN_LAYER (the cell embedding the CSSI strata
+# are built from, see attention_cssi_leiden.collect_geneformer)
+def _forward_cls_attention_with_embedding(
+    model: nn.Module, ids: torch.Tensor, attn: torch.Tensor, use_predictions: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    bert = model.backbone.bert if isinstance(model, GeneformerClassifier) else model
+    layer = bert.encoder.layer[NUM_ATTN_LAYER]
+    n_head = bert.config.num_attention_heads
+    mask = attn.eq(0)
+
+    capture = _LayerInputCapture(layer)
+    try:
+        with torch.no_grad():
+            if use_predictions:
+                logits = model(input_ids=ids, attention_mask=attn)
+            else:
+                bert(input_ids=ids, attention_mask=attn)
+    finally:
+        capture.remove()
+
+    with torch.no_grad():
+        embs = capture.captured.float()
+        self_attn = layer.attention.self
+        q = rearrange(self_attn.query(embs), "b s (h d) -> b h s d", h=n_head)
+        k = rearrange(self_attn.key(embs), "b s (h d) -> b h s d", h=n_head)
+        cls_scores = (q[:, :, 0:1, :] @ k.transpose(-1, -2)).squeeze(2)
+        cls_attn = _cls_attn_rank_norm_head_avg(cls_scores, mask)
+
+    preds = (logits > 0).long() if use_predictions else None
+    return cls_attn, preds, embs[:, 0, :]
+
+
 # Add the attention of one cell to the per-gene sums, gene by gene, because the
 # attention we want is the attention of genes, not cells
 def _add_cell(sums: Dict[int, float], cell_gids: np.ndarray, row: np.ndarray,
