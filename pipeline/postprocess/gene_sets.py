@@ -2,16 +2,21 @@
 Gene sets fed to the post-hoc analyses, per (method, selection, cell type).
 
 Methods:
-  * attention_zero_shot        - pooled CLS attention, PD - control (baseline)
-  * attention_cssi             - CSSI-max attention over Leiden strata (method 2.1)
-  * attention_residualized_ols - OLS residual of the pooled attention (method 2.3)
-  * ig_lora                    - Integrated Gradients on the LoRA model
+  * attention_zero_shot_scgpt        - scGPT pooled CLS attention, PD - control (baseline)
+  * attention_cssi_scgpt             - scGPT CSSI-max attention over Leiden strata (method 2.1)
+  * attention_residualized_ols_scgpt - OLS residual of the scGPT pooled attention (method 2.3)
+  * ig_lora_scgpt                    - Integrated Gradients on the LoRA scGPT model
+  * attention_zero_shot_geneformer   - Geneformer pooled CLS attention, PD - control
+  * attention_lora_geneformer        - CLS attention of the LoRA Geneformer model
 
 Selections:
   * top30 - static top-30 ranking
   * elbow - Kneedle elbow on the descending score curve (variable size)
 
-IG only writes a top-30, so it has no elbow gene set.
+IG and the Geneformer tasks only write a top-30, so they have no elbow gene set.
+
+All paths are relative to the per-dataset results folder (results/dataset_a,
+results/dataset_b).
 
 top30 outputs keep the original locations (`results/<task>/...`,
 `results/plots/<name>.png`); every other selection gets its own subfolder
@@ -28,20 +33,26 @@ SELECTIONS = ["top30", "elbow"]
 
 # Gene-list CSV (columns rank, gene, score) relative to results_dir
 GENE_LIST_PATHS = {
-    "attention_zero_shot": {
-        "top30": "attention_zero_shot/{ct}/top30_genes.csv",
-        "elbow": "attention_zero_shot/{ct}/csv/elbow.csv",
+    "attention_zero_shot_scgpt": {
+        "top30": "attention_zero_shot_scgpt/{ct}/top30_genes.csv",
+        "elbow": "attention_zero_shot_scgpt/{ct}/csv/elbow.csv",
     },
-    "attention_cssi": {
-        "top30": "attention_zero_shot/{ct}/cssi/csv/top30.csv",
-        "elbow": "attention_zero_shot/{ct}/cssi/csv/elbow.csv",
+    "attention_cssi_scgpt": {
+        "top30": "attention_zero_shot_scgpt/{ct}/cssi/csv/top30.csv",
+        "elbow": "attention_zero_shot_scgpt/{ct}/cssi/csv/elbow.csv",
     },
-    "attention_residualized_ols": {
-        "top30": "attention_residualized_ols/{ct}/csv/top30.csv",
-        "elbow": "attention_residualized_ols/{ct}/csv/elbow.csv",
+    "attention_residualized_ols_scgpt": {
+        "top30": "attention_residualized_ols_scgpt/{ct}/csv/top30.csv",
+        "elbow": "attention_residualized_ols_scgpt/{ct}/csv/elbow.csv",
     },
-    "ig_lora": {
-        "top30": "ig_lora/{ct}/top30_genes.csv",
+    "ig_lora_scgpt": {
+        "top30": "ig_lora_scgpt/{ct}/top30_genes.csv",
+    },
+    "attention_zero_shot_geneformer": {
+        "top30": "attention_zero_shot_geneformer/{ct}/top30_genes.csv",
+    },
+    "attention_lora_geneformer": {
+        "top30": "attention_lora_geneformer/{ct}/top30_genes.csv",
     },
 }
 METHODS = list(GENE_LIST_PATHS)

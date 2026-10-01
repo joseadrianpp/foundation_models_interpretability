@@ -17,23 +17,35 @@ import pandas as pd
 from .gene_sets import CELL_TYPES, METHODS as METHODS_ORDER, SELECTIONS, load_genes, methods_for, output_dir, plot_path
 
 METHOD_LABELS = {
-    "attention_zero_shot": "Zero-shot attention (pooled)",
-    "attention_cssi": "CSSI-max attention (2.1)",
-    "attention_residualized_ols": "OLS-residual attention (2.3)",
-    "ig_lora": "LoRA (Integrated Gradients)",
+    "attention_zero_shot_scgpt": "scGPT zero-shot attention (pooled)",
+    "attention_cssi_scgpt": "scGPT CSSI-max attention (2.1)",
+    "attention_residualized_ols_scgpt": "scGPT OLS-residual attention (2.3)",
+    "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
+    "attention_zero_shot_geneformer": "Geneformer zero-shot attention (pooled)",
+    "attention_lora_geneformer": "Geneformer LoRA (attention)",
 }
 METHOD_SHORT = {
-    "attention_zero_shot": "Pooled",
-    "attention_cssi": "CSSI",
-    "attention_residualized_ols": "OLS resid.",
-    "ig_lora": "IG LoRA",
+    "attention_zero_shot_scgpt": "Pooled",
+    "attention_cssi_scgpt": "CSSI",
+    "attention_residualized_ols_scgpt": "OLS resid.",
+    "ig_lora_scgpt": "IG LoRA",
+    "attention_zero_shot_geneformer": "GF pooled",
+    "attention_lora_geneformer": "GF LoRA",
 }
-# Fixed categorical order (blue, orange, aqua, yellow): adjacent-pair CVD safe
+# Fixed categorical order (blue, orange, aqua, yellow, violet, magenta)
 METHOD_COLORS = {
-    "attention_zero_shot": "#2a78d6",
-    "attention_cssi": "#eb6834",
-    "attention_residualized_ols": "#1baf7a",
-    "ig_lora": "#eda100",
+    "attention_zero_shot_scgpt": "#2a78d6",
+    "attention_cssi_scgpt": "#eb6834",
+    "attention_residualized_ols_scgpt": "#1baf7a",
+    "ig_lora_scgpt": "#eda100",
+    "attention_zero_shot_geneformer": "#7b5cd6",
+    "attention_lora_geneformer": "#d6458f",
+}
+# Dynamic-selection summary (n_selected per rule) of the methods that have one
+SUMMARY_PATHS = {
+    "attention_zero_shot_scgpt": "attention_zero_shot_scgpt/{ct}/csv/selection_summary.json",
+    "attention_cssi_scgpt": "attention_zero_shot_scgpt/{ct}/cssi/csv/selection_summary.json",
+    "attention_residualized_ols_scgpt": "attention_residualized_ols_scgpt/{ct}/csv/selection_summary.json",
 }
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                     "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
@@ -104,7 +116,7 @@ def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame, metho
         ax.bar(x + off, heights, width=width * 0.92, label=METHOD_LABELS[method],
                color=METHOD_COLORS[method])
 
-    # n_significant_terms has no pairwise test (only IC/intersection_size do).
+    # n_significant_terms has no pairwise test (only IC/intersection_size/functional abundance do).
     # Brackets mark method pairs with BH-adjusted p < 0.05, stacked above the bars.
     ymax = max(tops.values(), default=0.0)
     if metric_key is not None and ymax > 0:
@@ -140,8 +152,9 @@ def plot_enrichment_summary(results_dir: Path, selection: str = "top30") -> Path
         ("n_significant_terms", None, "Number of significant\nGO/KEGG/REAC terms"),
         ("mean_information_content", "information_content", "Mean information content\n(significant terms)"),
         ("mean_intersection_size", "intersection_size", "Mean intersection size\n(genes per term)"),
+        ("mean_functional_abundance", "functional_abundance", "Mean functional abundance\n(fraction of the term covered)"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    fig, axes = plt.subplots(1, len(panels), figsize=(20, 4.8))
     for ax, (metric, metric_key, title) in zip(axes, panels):
         _draw_enrichment_panel(ax, summary, tests, methods, metric, metric_key, title)
     fig.suptitle(f"g:Profiler enrichment - {SELECTION_LABELS[selection]} gene sets "
@@ -285,11 +298,7 @@ def plot_gene_set_overlap(results_dir: Path, selection: str = "top30") -> Path:
 def plot_gene_set_sizes(results_dir: Path) -> Path:
     """Number of genes each method selects per selection rule (all dynamic rules)."""
     rules = ["top30", "z-score", "otsu", "elbow"]
-    sources = {
-        "attention_zero_shot": "attention_zero_shot/{ct}/csv/selection_summary.json",
-        "attention_cssi": "attention_zero_shot/{ct}/cssi/csv/selection_summary.json",
-        "attention_residualized_ols": "attention_residualized_ols/{ct}/csv/selection_summary.json",
-    }
+    sources = SUMMARY_PATHS
     methods = list(sources)
     fig, axes = plt.subplots(1, len(rules), figsize=(4 * len(rules), 4.2), sharey=True)
     x = np.arange(len(CELL_TYPES))
@@ -324,15 +333,10 @@ def plot_gene_set_sizes(results_dir: Path) -> Path:
 # all-gene file in older runs, so the permutation audit (one row per testable
 # gene) is used as fallback.
 ALL_SCORE_PATHS = {
-    "attention_zero_shot": ["attention_zero_shot/{ct}/csv/all_genes.csv",
-                            "attention_zero_shot/{ct}/csv/permutation_audit.csv"],
-    "attention_cssi": ["attention_zero_shot/{ct}/cssi_genes.csv"],
-    "attention_residualized_ols": ["attention_residualized_ols/{ct}/csv/ols.csv"],
-}
-SUMMARY_PATHS = {
-    "attention_zero_shot": "attention_zero_shot/{ct}/csv/selection_summary.json",
-    "attention_cssi": "attention_zero_shot/{ct}/cssi/csv/selection_summary.json",
-    "attention_residualized_ols": "attention_residualized_ols/{ct}/csv/selection_summary.json",
+    "attention_zero_shot_scgpt": ["attention_zero_shot_scgpt/{ct}/csv/all_genes.csv",
+                                  "attention_zero_shot_scgpt/{ct}/csv/permutation_audit.csv"],
+    "attention_cssi_scgpt": ["attention_zero_shot_scgpt/{ct}/cssi_genes.csv"],
+    "attention_residualized_ols_scgpt": ["attention_residualized_ols_scgpt/{ct}/csv/ols.csv"],
 }
 CUTOFF_STYLES = {"top30": ":", "z-score": "--", "otsu": "-.", "elbow": "-"}
 MAX_RANK_SHOWN = 200
@@ -384,7 +388,7 @@ def plot_dynamic_selection(results_dir: Path) -> Path:
 def plot_ols_residualization(results_dir: Path) -> Path:
     fig, axes = plt.subplots(2, len(CELL_TYPES), figsize=(4 * len(CELL_TYPES), 7.5))
     for c, cell_type in enumerate(CELL_TYPES):
-        base = results_dir / "attention_residualized_ols" / cell_type
+        base = results_dir / "attention_residualized_ols_scgpt" / cell_type
         path = base / "residualized_genes.csv"
         if not path.exists():
             for ax in axes[:, c]:
@@ -404,10 +408,10 @@ def plot_ols_residualization(results_dir: Path) -> Path:
             ax = axes[r, c]
             ax.scatter(df.loc[rest, "attention_score"], df.loc[rest, ycol], s=6, color="#c3c2b7", lw=0)
             ax.scatter(df.loc[only_raw, "attention_score"], df.loc[only_raw, ycol], s=18,
-                       color=METHOD_COLORS["attention_zero_shot"], edgecolors=SURFACE, lw=0.6,
+                       color=METHOD_COLORS["attention_zero_shot_scgpt"], edgecolors=SURFACE, lw=0.6,
                        label="top-30 raw only")
             ax.scatter(df.loc[only_res, "attention_score"], df.loc[only_res, ycol], s=18,
-                       color=METHOD_COLORS["attention_residualized_ols"], edgecolors=SURFACE, lw=0.6,
+                       color=METHOD_COLORS["attention_residualized_ols_scgpt"], edgecolors=SURFACE, lw=0.6,
                        label="top-30 residual only")
             ax.scatter(df.loc[in_both, "attention_score"], df.loc[in_both, ycol], s=18,
                        color=INK, edgecolors=SURFACE, lw=0.6, label="top-30 in both")

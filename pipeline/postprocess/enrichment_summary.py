@@ -1,7 +1,8 @@
 """
 Summary statistics over the enrichment CSVs produced by `enrichment.py`:
-per (cell_type, method) term counts/IC/intersection size, and pairwise
-Mann-Whitney significance of the difference between methods.
+per (cell_type, method) term counts/IC/intersection size/functional
+abundance, and pairwise Mann-Whitney significance of the difference between
+methods.
 """
 
 import itertools
@@ -15,10 +16,10 @@ from statsmodels.stats.multitest import multipletests
 from .gene_sets import CELL_TYPES, SELECTIONS, methods_for, output_dir
 from .plots import plot_enrichment_summary
 
-METRICS = ["information_content", "intersection_size"]
+METRICS = ["information_content", "intersection_size", "functional_abundance"]
 
 
-# Load one method and cell type enrichment CSV and calculate its per-term IC
+# Load one method and cell type enrichment CSV and calculate its per-term IC and functional abundance
 def _load_terms(enrichment_dir: Path, method: str, cell_type: str) -> pd.DataFrame:
     path = enrichment_dir / method / f"{cell_type}.csv"
     try:
@@ -29,6 +30,8 @@ def _load_terms(enrichment_dir: Path, method: str, cell_type: str) -> pd.DataFra
         return df
     # Frequency-based Information Content: rarer/more specific terms score higher
     df["information_content"] = -np.log2(df["term_size"] / df["effective_domain_size"])
+    # Functional abundance (g:Profiler's recall): how much of each term our gene set covers
+    df["functional_abundance"] = df["intersection_size"] / df["term_size"]
     return df
 
 
@@ -62,7 +65,7 @@ def _query_sizes(enrichment_dir: Path) -> dict:
     return {(r.method, r.cell_type): int(r.n_query_genes) for r in manifest.itertuples()}
 
 
-# One row per (cell_type, method) with the pooled term-count/IC/intersection stats
+# One row per (cell_type, method) with the pooled term-count/IC/intersection/functional abundance stats
 def _build_summary_table(long_terms: pd.DataFrame, methods: list, sizes: dict) -> pd.DataFrame:
     rows = []
     for method in methods:
@@ -74,6 +77,7 @@ def _build_summary_table(long_terms: pd.DataFrame, methods: list, sizes: dict) -
                 "n_significant_terms": len(sub),
                 "mean_information_content": sub["information_content"].mean() if len(sub) else np.nan,
                 "mean_intersection_size": sub["intersection_size"].mean() if len(sub) else np.nan,
+                "mean_functional_abundance": sub["functional_abundance"].mean() if len(sub) else np.nan,
             })
     return pd.DataFrame(rows)
 
@@ -109,7 +113,7 @@ def _summary_for_selection(results_dir: Path, selection: str) -> None:
     out_dir = output_dir(results_dir, "enrichment_summary", selection)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pooled term-count/IC/intersection stats per cell_type and method
+    # Pooled term-count/IC/intersection/functional abundance stats per cell_type and method
     long_terms = _build_long_terms(enrichment_dir, methods)
     summary = _build_summary_table(long_terms, methods, _query_sizes(enrichment_dir))
     summary.to_csv(out_dir / "summary_table.csv", index=False)

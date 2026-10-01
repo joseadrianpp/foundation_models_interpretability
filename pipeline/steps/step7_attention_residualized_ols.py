@@ -44,21 +44,11 @@ from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 
 
-DATA_DIR = C.DATA_DIR
-TRAIN_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_train.h5ad"
-VAL_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_val.h5ad"
-
 # BH over ~1000 genes needs >= m/alpha = 20k permutations for a single gene to
 # reach q < 0.05 (min q = m / (n_perm + 1)); 50k gives margin (min q ~ 0.02).
 DYNAMIC_PERMUTATIONS = dynamic.PERMUTATION_N
 DYNAMIC_PERMUTATION_ALPHA = 0.05
 DYNAMIC_PERMUTATION_EFFECT_SIZE = dynamic.PERMUTATION_EFFECT_SIZE
-
-
-def _load_full_dataset() -> ad.AnnData:
-    train = sc.read_h5ad(TRAIN_H5AD)
-    val = sc.read_h5ad(VAL_H5AD)
-    return ad.concat([train, val])
 
 
 def _cell_type_subsets(adata: ad.AnnData):
@@ -263,11 +253,12 @@ def _write_ols_score_csv(rows: list, out_csv: Path) -> None:
 
 
 def task_attention_residualized_ols(
+    adata: ad.AnnData,
     results_dir: Path,
     device: torch.device,
     donor_col=None,
 ) -> None:
-    """Run OLS residualization for every cell type and save all genes."""
+    """Run OLS residualization for every cell type of `adata` and save all genes."""
     if device.type != "cuda":
         raise ValueError(
             "attention_residualized_ols needs a CUDA device for the scGPT "
@@ -275,7 +266,6 @@ def task_attention_residualized_ols(
         )
 
     vocab, model_configs = load_vocab(), load_model_configs()
-    adata = _load_full_dataset()
     model = common._load_zero_shot_model(vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets(adata):
@@ -328,7 +318,7 @@ def task_attention_residualized_ols(
             features,
         )
 
-        out_dir = results_dir / "attention_residualized_ols" / slug
+        out_dir = results_dir / "attention_residualized_ols_scgpt" / slug
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Preserve the detailed all-gene audit output.

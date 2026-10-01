@@ -1,5 +1,6 @@
 """Gene-to-gene GO semantic-similarity matrices between each method's gene set
-(top-30 or elbow) and GWAS disease gene sets.
+(one per selection) and the Parkinson's references (GWAS, PanelApp,
+ParkinsonsUK-UCL).
 
 For every (selection x cell_type x disease x distance x ontology) builds a
 matrix of shape (sum of method gene-set sizes) x (n_disease_genes), each cell
@@ -9,7 +10,7 @@ Lin/SimRel are GO term-similarity measures, so the cell values are
 
 Adapted from code/comparison_geneset_ref/compute_genematrix_disease.py, dropped
 to a single dataset and the methods this package actually produces (no
-RF/Lasso baselines here). Reuses the GWAS reference gene lists cached by
+RF/Lasso baselines here). Reuses the reference gene lists cached by
 gwas_similarity.py.
 """
 
@@ -29,8 +30,8 @@ from .plots import plot_gwas_similarity
 
 GROUPWISE = "bma"
 ONTOLOGIES = ["BP", "CC", "MF"]
-# Diseases to compare against
-DEFAULT_DISEASES = ["parkinson"]
+# Diseases to compare against: the PD GWAS set and the two PD panels
+DEFAULT_DISEASES = ["parkinson", "panelapp", "parkinsonsuk_ucl"]
 PCTS = [10, 25, 75, 90, 95]
 
 

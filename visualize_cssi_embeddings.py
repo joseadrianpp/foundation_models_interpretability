@@ -2,7 +2,7 @@
 """Visualize the exact model embeddings and Leiden/k-NN graph used by CSSI.
 
 The attention run saves residual-stream CLS embeddings and Leiden labels under
-results/attention_zero_shot/<cell_type>/. This script performs no model
+results/dataset_*/attention_zero_shot_scgpt/<cell_type>/. This script performs no model
 inference: it loads those artifacts, recomputes PCA/UMAP/t-SNE for plotting,
 and saves one figure per cell type to results/plots/<cell_type>/.
 """
@@ -90,12 +90,12 @@ def _visualize_one(attention_dir: Path, out_path: Path, n_neighbors: int, n_pcs:
     print(f"  saved {out_path}")
 
 
-# Iterates every results/attention_zero_shot/<cell_type>/ subfolder and
-# writes each cell type's figure to its own results/plots/<cell_type>/
-# subfolder, mirroring the attention_zero_shot layout.
+# Iterates every results/dataset_*/attention_zero_shot_scgpt/<cell_type>/
+# subfolder and writes each cell type's figure to its own
+# results/dataset_*/plots/<cell_type>/ subfolder, mirroring the attention layout.
 def visualize_cell_type(results_dir: Path, cell_types, n_neighbors: int, n_pcs: int, graph_max_nodes: int, seed: int):
     for cell_type in cell_types:
-        attention_dir = results_dir / "attention_zero_shot" / cell_type
+        attention_dir = results_dir / "attention_zero_shot_scgpt" / cell_type
         out_path = results_dir / "plots" / cell_type / "embedding_leiden.png"
         print(f"\n# visualize | {cell_type} #")
         _visualize_one(attention_dir, out_path, n_neighbors, n_pcs, graph_max_nodes, seed)
@@ -104,6 +104,7 @@ def visualize_cell_type(results_dir: Path, cell_types, n_neighbors: int, n_pcs: 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", type=Path, default=HERE / "results")
+    p.add_argument("--dataset", choices=["A", "B"], default="A")
     p.add_argument("--cell-types", default=",".join(CELL_TYPES))
     p.add_argument("--n-neighbors", type=int, default=15)
     p.add_argument("--n-pcs", type=int, default=50)
@@ -113,7 +114,7 @@ def main():
 
     cell_types = [x.strip() for x in args.cell_types.split(",") if x.strip()]
     visualize_cell_type(
-        args.results_dir,
+        args.results_dir / f"dataset_{args.dataset.lower()}",
         cell_types,
         args.n_neighbors,
         args.n_pcs,
