@@ -17,6 +17,9 @@ Permutation selector:
 
 For CSSI, the statistic is the maximum absolute Cohen's d across valid Leiden
 strata, with the same max-over-strata operation applied in every permutation.
+
+The permutation selector is opt-in (run_tasks.py --permutation): without donor
+data `write_selection_family` only writes the fixed selectors.
 """
 
 from pathlib import Path
@@ -25,9 +28,7 @@ import json
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
-import torch
 
-from pipeline import config as C
 from pipeline.steps import attention_cssi_leiden as cssi
 
 TOP_N = 30
@@ -189,163 +190,56 @@ def validate_donor_labels(donor_ids: np.ndarray, labels: np.ndarray):
     return donors, donor_labels
 
 
-def _collect_donor_data(
-    all_attn: np.ndarray,
-    all_gids: np.ndarray,
-    labels: np.ndarray,
-    donor_ids: np.ndarray,
-    vocab,
-    strata: Optional[np.ndarray] = None,
-):
-    """Aggregate cell-level attention to donor x gene means, optionally per stratum."""
-    donors, donor_labels = validate_donor_labels(donor_ids, labels)
-    donor_to_idx = {d: i for i, d in enumerate(donors)}
-    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
-    pad_id = vocab[C.PAD_TOKEN]
-
-    gene_ids = sorted({
-        int(gid)
-        for row in all_gids
-        for gid in row[1:]
-        if int(gid) != pad_id and int(gid) not in special_ids
-    })
-    genes = [str(vocab.lookup_tokens([gid])[0]) for gid in gene_ids]
-    gene_to_col = {gid: j for j, gid in enumerate(gene_ids)}
-    D, G = len(donors), len(genes)
-
-    pooled_sum = np.zeros((D, G), dtype=np.float64)
-    pooled_cnt = np.zeros((D, G), dtype=np.int32)
-    strata_sum = {}
-    strata_cnt = {}
-
-    for i in range(all_attn.shape[0]):
-        di = donor_to_idx[str(donor_ids[i])]
-        si = None if strata is None else int(strata[i])
-        if si is not None and si not in strata_sum:
-            strata_sum[si] = np.zeros((D, G), dtype=np.float64)
-            strata_cnt[si] = np.zeros((D, G), dtype=np.int32)
-        for pos in range(1, all_gids.shape[1]):
-            gid = int(all_gids[i, pos])
-            j = gene_to_col.get(gid)
-            if j is None:
-                continue
-            value = float(all_attn[i, pos])
-            pooled_sum[di, j] += value
-            pooled_cnt[di, j] += 1
-            if si is not None:
-                strata_sum[si][di, j] += value
-                strata_cnt[si][di, j] += 1
-
-    pooled = np.divide(
-        pooled_sum, pooled_cnt,
-        out=np.full_like(pooled_sum, np.nan, dtype=float),
-        where=pooled_cnt > 0,
+# Donor x gene mean attention over the cells in `cell_mask`. A donor's mean is
+# over all its cells (a cell without the gene adds 0); donors without cells in
+# the mask get a NaN row, which the Cohen's d below skips
+def _donor_gene_means(cache: cssi.AttentionCache, donor_idx: np.ndarray, n_donors: int,
+                      cell_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    n_genes = cache.genes.size
+    cells = np.ones(cache.n_cells, dtype=bool) if cell_mask is None else cell_mask
+    tokens = cells[cache.token_cells]
+    key = donor_idx[cache.token_cells[tokens]].astype(np.int64) * n_genes + cache.gene_idx[tokens]
+    sums = np.bincount(key, weights=cache.attn[tokens], minlength=n_donors * n_genes)
+    n_cells = np.bincount(donor_idx[cells], minlength=n_donors).astype(float)
+    return np.divide(
+        sums.reshape(n_donors, n_genes), n_cells[:, None],
+        out=np.full((n_donors, n_genes), np.nan),
+        where=n_cells[:, None] > 0,
     )
+
+
+def donor_attention_data(cache: cssi.AttentionCache, donor_ids,
+                         strata: Optional[np.ndarray] = None) -> dict:
+    """Donor-level attention matrices for the permutation selector.
+
+    Read from the same AttentionCache as the pooled/CSSI scores, so no second
+    forward pass is needed. With `strata`, also one matrix per Leiden stratum
+    (CSSI permutation).
+    """
+    donor_ids = np.asarray(donor_ids).astype(str)
+    if donor_ids.size != cache.n_cells:
+        raise ValueError("donor_ids must have one entry per cached cell")
+    donors, donor_labels = validate_donor_labels(donor_ids, cache.labels)
+    # np.unique sorts, so searchsorted maps every cell to its donor row
+    donor_idx = np.searchsorted(donors, donor_ids)
+    D = len(donors)
+
     strata_scores = {}
-    for si in sorted(strata_sum):
-        strata_scores[si] = np.divide(
-            strata_sum[si], strata_cnt[si],
-            out=np.full_like(strata_sum[si], np.nan, dtype=float),
-            where=strata_cnt[si] > 0,
-        )
+    if strata is not None:
+        strata = np.asarray(strata, dtype=int)
+        if strata.size != cache.n_cells:
+            raise ValueError("strata must have one label per cell")
+        for si in np.unique(strata):
+            strata_scores[int(si)] = _donor_gene_means(cache, donor_idx, D, strata == si)
 
     return {
         "donors": donors.tolist(),
         "labels": donor_labels,
-        "genes": genes,
-        "scores": pooled,
+        "genes": cache.genes.tolist(),
+        "scores": _donor_gene_means(cache, donor_idx, D),
         "strata": strata_scores,
     }
 
-
-def collect_donor_attention_data(
-    model,
-    pt: dict,
-    vocab,
-    n_head: int,
-    device: torch.device,
-    donor_ids,
-    *,
-    need_cssi: bool,
-    n_neighbors: int = 15,
-    target_k: int = 6,
-    random_state: int = 42,
-    batch_size: int = 16,
-    fixed_strata=None,
-):
-    """Run the model once and return donor-level attention data.
-
-    This is deliberately separate from `compute_attention_cssi` so the existing
-    CSSI code and its outputs remain unchanged. It is used only by the new
-    donor-permutation statistical selector.
-    """
-    donor_ids = np.asarray(donor_ids).astype(str)
-    if donor_ids.size != pt["gene_ids"].shape[0]:
-        raise ValueError("donor_ids must have one entry per tokenized cell")
-
-    attn_batches, gid_batches, labels_batches, emb_batches = [], [], [], []
-    n_cells = pt["gene_ids"].shape[0]
-    for start in range(0, n_cells, batch_size):
-        end = min(start + batch_size, n_cells)
-        batch = {k: v[start:end] for k, v in pt.items()}
-        if need_cssi and fixed_strata is None:
-            attn, _, emb = cssi._forward_cls_attention_with_embedding(
-                model, batch, vocab, n_head, device, n_cls=2
-            )
-            emb_batches.append(emb.cpu().numpy())
-        else:
-            attn, _ = __import__("pipeline.steps._step7_common", fromlist=["_"])._forward_cls_attention(
-                model, batch, vocab, n_head, device, n_cls=2
-            )
-        attn_batches.append(attn.cpu().numpy())
-        gid_batches.append(batch["gene_ids"].cpu().numpy())
-        labels_batches.append(batch["condition_labels"].cpu().numpy())
-
-    all_attn = np.concatenate(attn_batches, axis=0)
-    all_gids = np.concatenate(gid_batches, axis=0)
-    labels = np.concatenate(labels_batches, axis=0).astype(int)
-
-    strata = None
-    if fixed_strata is not None:
-        strata = np.asarray(fixed_strata, dtype=int)
-        if strata.size != n_cells:
-            raise ValueError("fixed_strata must have one label per cell")
-    elif need_cssi:
-        embeddings = np.concatenate(emb_batches, axis=0).astype(np.float32)
-        strata, _ = cssi._leiden_from_embeddings(
-            embeddings,
-            n_neighbors=n_neighbors,
-            target_k=target_k,
-            random_state=random_state,
-        )
-    data = _collect_donor_data(all_attn, all_gids, labels, donor_ids, vocab, strata)
-    data["condition_means"] = _condition_means(all_attn, all_gids, labels, vocab)
-    return data
-
-
-def _condition_means(all_attn: np.ndarray, all_gids: np.ndarray, labels: np.ndarray, vocab):
-    """Cell-level mean attention per gene per condition, from the same forward pass.
-
-    Mirrors `_step7_common._compute_attn_per_gene_per_condition(use_predictions=False)`
-    so callers that also need donor data do not have to run the model twice.
-    """
-    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
-    pad_id = vocab[C.PAD_TOKEN]
-    sums = {0: {}, 1: {}}
-    cnts = {0: {}, 1: {}}
-    for i in range(all_attn.shape[0]):
-        cond = int(labels[i])
-        for pos in range(1, all_gids.shape[1]):
-            gid = int(all_gids[i, pos])
-            if gid == pad_id or gid in special_ids:
-                continue
-            sums[cond][gid] = sums[cond].get(gid, 0.0) + float(all_attn[i, pos])
-            cnts[cond][gid] = cnts[cond].get(gid, 0) + 1
-    means = {0: {}, 1: {}}
-    for cond in (0, 1):
-        for gid, s in sums[cond].items():
-            means[cond][str(vocab.lookup_tokens([gid])[0])] = s / cnts[cond][gid]
-    return means
 
 
 def _cohen_d_from_groups(X: np.ndarray, group1: np.ndarray):
@@ -589,7 +483,7 @@ def write_selection_family(
     score_map: Dict[str, float],
     out_dir: Path,
     *,
-    donor_data: dict,
+    donor_data: Optional[dict] = None,
     cssi_mode: bool = False,
     random_state: int = 42,
     permutation_n: int = PERMUTATION_N,
@@ -603,6 +497,12 @@ def write_selection_family(
         path = out_dir / f"{method}.csv"
         write_selection_csv(selected, path)
         summary[method] = {**metadata, "n_selected": len(selected), "output": str(path)}
+
+    # Permutation is opt-in: without donor data only the fixed selectors run
+    if donor_data is None:
+        with open(out_dir / "selection_summary.json", "w") as handle:
+            json.dump(summary, handle, indent=2)
+        return summary
 
     _, perm_meta, audit_all = permutation_selection(
         score_map,

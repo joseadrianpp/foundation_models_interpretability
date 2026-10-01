@@ -22,7 +22,8 @@ model uses the flash-attention backend (fp16/bf16 only), and it matches the
 autocast forward pass of the attention task so the residualized score is the
 same pooled attention. The OLS fit and selectors are numpy (CPU). Dynamic
 top-N selectors are also applied to the residual attention scores, while
-`ols.csv` retains all genes ranked by the residual signal.
+`ols.csv` retains all genes ranked by the residual signal. The donor
+permutation selector only runs with permutation=True.
 """
 
 from pathlib import Path
@@ -40,6 +41,7 @@ from scipy.stats import f as f_dist
 
 from pipeline import config as C
 from pipeline.steps import _step7_common as common
+from pipeline.steps import attention_cssi_leiden as cssi
 from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 
@@ -257,6 +259,7 @@ def task_attention_residualized_ols(
     results_dir: Path,
     device: torch.device,
     donor_col=None,
+    permutation: bool = False,
 ) -> None:
     """Run OLS residualization for every cell type of `adata` and save all genes."""
     if device.type != "cuda":
@@ -273,7 +276,7 @@ def task_attention_residualized_ols(
 
         # This deliberately uses the exact same attention computation as the
         # existing attention_zero_shot task. One forward pass feeds both the
-        # cell-level condition means and the donor-level matrix.
+        # cell-level condition means and, with --permutation, the donor-level matrix.
         pt = common._tokenise(sub, vocab)
         labels = pt["condition_labels"].numpy()
         if not (np.any(labels == 0) and np.any(labels == 1)):
@@ -284,24 +287,9 @@ def task_attention_residualized_ols(
             )
             continue
 
-        donor_column = dynamic.resolve_donor_column(sub, donor_col)
-        donor_ids = sub.obs[donor_column].astype(str).to_numpy()
-        print(
-            f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors",
-            flush=True,
-        )
-        donor_data = dynamic.collect_donor_attention_data(
-            model,
-            pt,
-            vocab,
-            model_configs["nheads"],
-            device,
-            donor_ids,
-            need_cssi=False,
-        )
-
+        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device)
         attention_scores = common._gene_scores(
-            donor_data["condition_means"],
+            cssi.condition_means(cache),
             lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
         )
 
@@ -335,22 +323,31 @@ def task_attention_residualized_ols(
             if np.isfinite(row["residual_attention"])
         }
 
-        # Residualize each donor's gene-attention vector with the same fitted
-        # gene-level OLS prediction. This is a fixed per-gene offset, so the
-        # donor-level Cohen's d is evaluated on the residualized values while
-        # preserving the current OLS definition.
-        predicted_by_gene = {
-            str(row["gene"]): float(row["predicted_attention"])
-            for row in rows
-            if np.isfinite(row["predicted_attention"])
-        }
-        donor_genes = donor_data["genes"]
-        predicted_vector = np.asarray(
-            [predicted_by_gene.get(g, np.nan) for g in donor_genes],
-            dtype=float,
-        )
-        donor_residual_scores = donor_data["scores"] - predicted_vector[None, :]
-        donor_residual_data = {**donor_data, "scores": donor_residual_scores}
+        donor_residual_data = None
+        if permutation:
+            donor_column = dynamic.resolve_donor_column(sub, donor_col)
+            donor_ids = sub.obs[donor_column].astype(str).to_numpy()
+            print(
+                f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors",
+                flush=True,
+            )
+            donor_data = dynamic.donor_attention_data(cache, donor_ids)
+
+            # Residualize each donor's gene-attention vector with the same fitted
+            # gene-level OLS prediction. This is a fixed per-gene offset, so the
+            # donor-level Cohen's d is evaluated on the residualized values while
+            # preserving the current OLS definition.
+            predicted_by_gene = {
+                str(row["gene"]): float(row["predicted_attention"])
+                for row in rows
+                if np.isfinite(row["predicted_attention"])
+            }
+            predicted_vector = np.asarray(
+                [predicted_by_gene.get(g, np.nan) for g in donor_data["genes"]],
+                dtype=float,
+            )
+            donor_residual_scores = donor_data["scores"] - predicted_vector[None, :]
+            donor_residual_data = {**donor_data, "scores": donor_residual_scores}
 
         selection_summary = dynamic.write_selection_family(
             residual_scores,

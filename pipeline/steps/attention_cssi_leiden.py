@@ -9,11 +9,21 @@ The paper's CSSI stratification is:
 
 Your existing output is gene-level (PD-control attention), not TF-target edges,
 so the scoring step is the gene-level analogue of the paper's per-edge scoring.
+
+One forward pass per cell type fills an `AttentionCache` (model specific:
+`collect_scgpt`); everything after it (pooled means, Leiden strata, CSSI,
+donor-level matrices in attention_dynamic_selection.py) only reads the cache,
+so it is the same code for every model.
+
+Every mean is over all the cells of the group (condition, stratum or donor),
+a cell without the gene adding 0, the same convention as
+_step7_common._compute_attn_per_gene_per_condition: a gene seen in a handful
+of cells cannot outrank one seen in all of them.
 """
 
-from collections import defaultdict
+from dataclasses import dataclass, field
 import json
-from typing import Dict, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import anndata as ad
 import numpy as np
@@ -27,6 +37,71 @@ from .. import config as C
 DEFAULT_N_NEIGHBORS = 15
 DEFAULT_TARGET_K = 6
 DEFAULT_RESOLUTIONS = tuple(np.geomspace(0.1, 2.5, 25))
+
+
+# ---------------------------------------------------------------------------
+# Attention cache: one forward pass, every gene token of every cell
+# ---------------------------------------------------------------------------
+@dataclass
+class AttentionCache:
+    """CLS attention of every real gene token (no CLS/pad/special) of every cell.
+
+    Tokens are stored flat, cell after cell: the tokens of cell i are
+    `gene_idx[cell_ptr[i]:cell_ptr[i + 1]]`, `gene_idx` indexes `genes`.
+    """
+    gene_idx: np.ndarray      # (n_tokens,) int32
+    attn: np.ndarray          # (n_tokens,) float32
+    cell_ptr: np.ndarray      # (n_cells + 1,) int64
+    labels: np.ndarray        # (n_cells,) int, 0 = control, 1 = PD
+    embeddings: np.ndarray    # (n_cells, d) float32, residual-stream CLS embedding
+    genes: np.ndarray         # (n_genes,) gene symbols
+    embedding_source: str
+    _token_cells: Optional[np.ndarray] = field(default=None, repr=False)
+
+    @property
+    def n_cells(self) -> int:
+        return int(self.labels.size)
+
+    # Cell index of every token
+    @property
+    def token_cells(self) -> np.ndarray:
+        if self._token_cells is None:
+            self._token_cells = np.repeat(
+                np.arange(self.n_cells, dtype=np.int32), np.diff(self.cell_ptr))
+        return self._token_cells
+
+
+class _CacheBuilder:
+    """Accumulates forward-pass batches and builds an AttentionCache."""
+
+    def __init__(self):
+        self._gids, self._attn, self._lens = [], [], []
+        self._labels, self._embs = [], []
+
+    # gids/attn: (B, L) arrays; keep: (B, L) True on the gene tokens to store
+    def add(self, gids: np.ndarray, attn: np.ndarray, keep: np.ndarray,
+            labels: np.ndarray, embeddings: np.ndarray) -> None:
+        self._gids.append(gids[keep].astype(np.int64))
+        self._attn.append(attn[keep].astype(np.float32))
+        self._lens.append(keep.sum(axis=1))
+        self._labels.append(np.asarray(labels, dtype=int))
+        self._embs.append(np.asarray(embeddings, dtype=np.float32))
+
+    def build(self, id_to_gene: Callable[[np.ndarray], Sequence[str]],
+              embedding_source: str) -> AttentionCache:
+        gids = np.concatenate(self._gids)
+        # Compact gene index: the cache only knows the genes it has seen
+        uniq, inv = np.unique(gids, return_inverse=True)
+        lens = np.concatenate(self._lens)
+        return AttentionCache(
+            gene_idx=inv.astype(np.int32),
+            attn=np.concatenate(self._attn),
+            cell_ptr=np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
+            labels=np.concatenate(self._labels),
+            embeddings=np.concatenate(self._embs),
+            genes=np.asarray([str(g) for g in id_to_gene(uniq)]),
+            embedding_source=embedding_source,
+        )
 
 
 def _forward_cls_attention_with_embedding(
@@ -88,12 +163,66 @@ def _forward_cls_attention_with_embedding(
     return cls_attn, preds, cell_embeddings
 
 
+def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
+                  device: torch.device, n_cls: int = 2, batch_size: int = 16) -> AttentionCache:
+    """One scGPT forward pass over the tokenised cells of one cell type."""
+    special_ids = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}))
+    builder = _CacheBuilder()
+    n_cells = pt["gene_ids"].shape[0]
+    for start in range(0, n_cells, batch_size):
+        end = min(start + batch_size, n_cells)
+        batch = {k: v[start:end] for k, v in pt.items()}
+        cls_attn, _, embeddings = _forward_cls_attention_with_embedding(
+            model, batch, vocab, n_head, device, n_cls
+        )
+        gids = batch["gene_ids"].numpy()
+        # Position 0 is the CLS itself; pads and special tokens are not genes
+        keep = ~np.isin(gids, special_ids)
+        keep[:, 0] = False
+        builder.add(gids, cls_attn.cpu().numpy(), keep,
+                    batch["condition_labels"].numpy(), embeddings.cpu().numpy())
+    return builder.build(
+        lambda ids: vocab.lookup_tokens([int(i) for i in ids]),
+        f"scGPT residual-stream CLS embedding entering transformer layer {common.NUM_ATTN_LAYERS}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+def condition_means(cache: AttentionCache,
+                    cell_mask: Optional[np.ndarray] = None) -> Dict[int, Dict[str, float]]:
+    """Mean attention per gene per condition over the cells in `cell_mask`.
+
+    The denominator is the number of cells of the condition, so a cell
+    without the gene adds 0. Genes absent from a condition are left out of its
+    dict (common._gene_scores treats them as 0).
+    """
+    n_genes = cache.genes.size
+    token_cells = cache.token_cells
+    means: Dict[int, Dict[str, float]] = {0: {}, 1: {}}
+    for cond in (0, 1):
+        cells = cache.labels == cond
+        if cell_mask is not None:
+            cells &= cell_mask
+        n_used = int(cells.sum())
+        if n_used == 0:
+            continue
+        tokens = cells[token_cells]
+        gidx = cache.gene_idx[tokens]
+        sums = np.bincount(gidx, weights=cache.attn[tokens], minlength=n_genes)
+        present = np.bincount(gidx, minlength=n_genes) > 0
+        means[cond] = dict(zip(cache.genes[present].tolist(), (sums[present] / n_used).tolist()))
+    return means
+
+
 def _leiden_from_embeddings(
     embeddings: np.ndarray,
     n_neighbors: int = DEFAULT_N_NEIGHBORS,
     target_k: int = DEFAULT_TARGET_K,
     resolutions=DEFAULT_RESOLUTIONS,
     random_state: int = 42,
+    embedding_source: str = "",
 ):
     """Build cosine k-NN graph and choose Leiden resolution closest to target_k."""
     embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -134,127 +263,58 @@ def _leiden_from_embeddings(
         "n_clusters": int(np.unique(best_labels).size),
         "target_k": target_k,
         "metric": "cosine",
-        "embedding_source": "scGPT residual-stream CLS embedding entering transformer layer 11",
+        "embedding_source": embedding_source,
     }
     return best_labels.astype(int), meta
 
 
-def _finalize_means(sum_by_gid, cnt_by_gid, vocab):
-    means = {0: {}, 1: {}}
-    for cond in (0, 1):
-        for gid, total in sum_by_gid[cond].items():
-            name = vocab.lookup_tokens([gid])[0]
-            if name in C.SPECIAL_TOKENS:
-                continue
-            count = cnt_by_gid[cond][gid]
-            means[cond][name] = total / count if count else 0.0
-    return means
+def _signed(mean_pd: float, mean_ctrl: float) -> float:
+    return mean_pd - mean_ctrl
 
 
 def compute_attention_cssi(
-    model,
-    pt: Dict[str, torch.Tensor],
-    vocab,
-    n_head: int,
-    device: torch.device,
-    n_cls: int = 2,
+    cache: AttentionCache,
     n_neighbors: int = DEFAULT_N_NEIGHBORS,
     target_k: int = DEFAULT_TARGET_K,
     min_cells_per_condition: int = 20,
     random_state: int = 42,
-    batch_size: int = 16,
 ):
-    """Compute pooled and CSSI-max gene scores plus embeddings/Leiden labels."""
-    n_cells = pt["gene_ids"].shape[0]
-    pad_id = vocab[C.PAD_TOKEN]
-    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
+    """Pooled means, CSSI-max gene scores and Leiden labels from one cache.
 
-    # Cache per-cell attention/genes and residual embeddings so clustering only
-    # requires one model pass.
-    attn_batches = []
-    gid_batches = []
-    embeddings_batches = []
-    labels_all = []
-    n_per_cond = {0: 0, 1: 0}
-
-    for start in range(0, n_cells, batch_size):
-        end = min(start + batch_size, n_cells)
-        batch = {k: v[start:end] for k, v in pt.items()}
-        cls_attn, _, embeddings = _forward_cls_attention_with_embedding(
-            model, batch, vocab, n_head, device, n_cls
-        )
-        attn_batches.append(cls_attn.cpu().numpy())
-        gid_batches.append(batch["gene_ids"].cpu().numpy())
-        embeddings_batches.append(embeddings.cpu().numpy())
-        labels = batch["condition_labels"].cpu().numpy()
-        labels_all.append(labels)
-        for label in labels:
-            n_per_cond[int(label)] += 1
-
-    all_attn = np.concatenate(attn_batches, axis=0)
-    all_gids = np.concatenate(gid_batches, axis=0)
-    embeddings = np.concatenate(embeddings_batches, axis=0).astype(np.float32)
-    labels = np.concatenate(labels_all, axis=0).astype(int)
-
+    Returns (pooled_means, cssi_scores, gate, strata, metadata).
+    """
+    n_cells = cache.n_cells
+    labels = cache.labels
+    n_per_cond = {c: int(np.sum(labels == c)) for c in (0, 1)}
     if n_per_cond[0] == 0 or n_per_cond[1] == 0:
         gate = {
             "ok": False,
             "reason": f"ground-truth counts: control={n_per_cond[0]}, pd={n_per_cond[1]}",
             "mode": "labels",
         }
-        return {}, {}, gate, embeddings, np.zeros(n_cells, dtype=int), {}
+        return {}, {}, gate, np.zeros(n_cells, dtype=int), {}
 
     strata, cluster_meta = _leiden_from_embeddings(
-        embeddings,
+        cache.embeddings,
         n_neighbors=n_neighbors,
         target_k=target_k,
         random_state=random_state,
+        embedding_source=cache.embedding_source,
     )
 
-    sum_by_gid = {0: {}, 1: {}}
-    cnt_by_gid = {0: {}, 1: {}}
-    sum_by_stratum = defaultdict(lambda: {0: {}, 1: {}})
-    cnt_by_stratum = defaultdict(lambda: {0: {}, 1: {}})
-
-    for i in range(n_cells):
-        cond = int(labels[i])
-        stratum = int(strata[i])
-        row = all_attn[i]
-        cell_gids = all_gids[i]
-
-        for pos in range(1, len(cell_gids)):
-            gid = int(cell_gids[pos])
-            if gid == pad_id or gid in special_ids:
-                continue
-            value = float(row[pos])
-
-            sum_by_gid[cond][gid] = sum_by_gid[cond].get(gid, 0.0) + value
-            cnt_by_gid[cond][gid] = cnt_by_gid[cond].get(gid, 0) + 1
-            sum_by_stratum[stratum][cond][gid] = (
-                sum_by_stratum[stratum][cond].get(gid, 0.0) + value
-            )
-            cnt_by_stratum[stratum][cond][gid] = (
-                cnt_by_stratum[stratum][cond].get(gid, 0) + 1
-            )
-
-    pooled_means = _finalize_means(sum_by_gid, cnt_by_gid, vocab)
+    pooled_means = condition_means(cache)
     cssi_scores = {}
     valid_strata = 0
 
-    for stratum in sorted(sum_by_stratum):
-        cells_control = int(np.sum((strata == stratum) & (labels == 0)))
-        cells_pd = int(np.sum((strata == stratum) & (labels == 1)))
+    for stratum in np.unique(strata):
+        in_stratum = strata == stratum
+        cells_control = int(np.sum(in_stratum & (labels == 0)))
+        cells_pd = int(np.sum(in_stratum & (labels == 1)))
         if min(cells_control, cells_pd) < min_cells_per_condition:
             continue
         valid_strata += 1
 
-        stratum_means = _finalize_means(
-            sum_by_stratum[stratum], cnt_by_stratum[stratum], vocab
-        )
-        scores = common._gene_scores(
-            stratum_means,
-            lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
-        )
+        scores = common._gene_scores(condition_means(cache, in_stratum), _signed)
         for gene, score in scores.items():
             # CSSI-max is the maximum signed stratum-specific contrast.
             if gene not in cssi_scores or score > cssi_scores[gene]:
@@ -262,19 +322,16 @@ def compute_attention_cssi(
 
     if valid_strata == 0:
         # No valid PD/control-balanced stratum: do not invent a contrast.
-        cssi_scores = common._gene_scores(
-            pooled_means,
-            lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
-        )
+        cssi_scores = common._gene_scores(pooled_means, _signed)
 
     cluster_meta["valid_strata"] = valid_strata
     cluster_meta["n_cells"] = int(n_cells)
-    cluster_meta["n_embedding_dims"] = int(embeddings.shape[1])
+    cluster_meta["n_embedding_dims"] = int(cache.embeddings.shape[1])
     return pooled_means, cssi_scores, {
         "ok": True,
         "reason": "",
         "mode": "labels",
-    }, embeddings, strata, cluster_meta
+    }, strata, cluster_meta
 
 
 def save_metadata(path, metadata):

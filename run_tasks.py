@@ -115,19 +115,32 @@ def _load_full_dataset_geneformer(data_dir: Path):
     return concatenate_datasets([load_from_disk(str(data_dir / p)) for p in GENEFORMER_DATASETS])
 
 
-def _cell_type_subsets_scgpt(adata, allowed_cell_types=None):
+# Default task options; main() overrides them from the command line
+DEFAULT_OPTS = {"donor_col": None, "permutation": False, "max_cells_per_type": None}
+
+
+# Indices of one cell type, optionally a seeded random subset of at most
+# `max_cells` (for quick test runs). The seed is fixed per call, so the subset
+# does not depend on which cell types were processed before
+def _cell_type_indices(values: np.ndarray, ct: str, max_cells=None) -> np.ndarray:
+    idx = np.where(values == ct)[0]
+    if max_cells is not None and idx.size > max_cells:
+        idx = np.sort(np.random.default_rng(SEED).choice(idx, max_cells, replace=False))
+    return idx
+
+
+def _cell_type_subsets_scgpt(adata, allowed_cell_types=None, max_cells=None):
     """Yield (cell type, slug, AnnData subset), optionally restricted to assigned cell types."""
-    values = adata.obs[C.CELL_TYPE_COL].astype(str)
+    values = adata.obs[C.CELL_TYPE_COL].astype(str).to_numpy()
     allowed = None if allowed_cell_types is None else set(allowed_cell_types)
 
-    for ct in sorted(values.unique()):
+    for ct in sorted(set(values)):
         if allowed is not None and ct not in allowed:
             continue
-        mask = (values == ct).to_numpy()
-        yield ct, common._slug_cell_type(ct), adata[mask].copy()
+        yield ct, common._slug_cell_type(ct), adata[_cell_type_indices(values, ct, max_cells)].copy()
 
 
-def _cell_type_subsets_geneformer(ds, allowed_cell_types=None):
+def _cell_type_subsets_geneformer(ds, allowed_cell_types=None, max_cells=None):
     """Same as _cell_type_subsets_scgpt but for a Hugging Face dataset."""
     values = np.array(ds[C.CELL_TYPE_COL])
     allowed = None if allowed_cell_types is None else set(allowed_cell_types)
@@ -135,10 +148,10 @@ def _cell_type_subsets_geneformer(ds, allowed_cell_types=None):
     for ct in sorted(set(values)):
         if allowed is not None and ct not in allowed:
             continue
-        yield ct, common._slug_cell_type(ct), ds.select(np.where(values == ct)[0])
+        yield ct, common._slug_cell_type(ct), ds.select(_cell_type_indices(values, ct, max_cells))
 
 
-def _cell_type_counts(task_name: str, data_dir: Path) -> dict:
+def _cell_type_counts(task_name: str, data_dir: Path, max_cells=None) -> dict:
     """Cells per cell type, read without loading expression values or tokens."""
     counts = {}
     if task_name.endswith("geneformer"):
@@ -149,6 +162,8 @@ def _cell_type_counts(task_name: str, data_dir: Path) -> dict:
     for col in columns:
         for ct, n in pd.Series(col).value_counts().items():
             counts[str(ct)] = counts.get(str(ct), 0) + int(n)
+    if max_cells is not None:
+        counts = {ct: min(n, max_cells) for ct, n in counts.items()}
     return counts
 
 
@@ -171,25 +186,20 @@ def _split_cell_types(counts: dict, n_workers: int):
 
 
 def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                         cell_types=None, donor_col=None) -> None:
+                         cell_types=None, opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset_scgpt(data_dir)
     model = common._load_zero_shot_model(vocab, model_configs, device)
 
-    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types):
-        print(f"\n# attention_scgpt | {ct} | {device} #", flush=True)
+    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
+        print(f"\n# attention_scgpt | {ct} | {sub.n_obs:,} cells | {device} #", flush=True)
         pt = common._tokenise(sub, vocab)
-        donor_column = dynamic.resolve_donor_column(sub, donor_col)
-        donor_ids = sub.obs[donor_column].astype(str).to_numpy()
-        print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
 
-        means, cssi_scores, gate, embeddings, strata, meta = cssi.compute_attention_cssi(
-            model,
-            pt,
-            vocab,
-            model_configs["nheads"],
-            device,
-            n_cls=2,
+        # One forward pass; pooled, CSSI and donor-level scores all read this cache
+        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2)
+        means, cssi_scores, gate, strata, meta = cssi.compute_attention_cssi(
+            cache,
             n_neighbors=CSSI_N_NEIGHBORS,
             target_k=CSSI_TARGET_K,
             min_cells_per_condition=CSSI_MIN_CELLS_PER_CONDITION,
@@ -198,7 +208,7 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
         print(
             f"  CSSI: {meta.get('n_clusters', 1)} Leiden strata "
             f"(resolution={meta.get('resolution', 0):.4g}), "
-            f"{meta.get('n_embedding_dims', embeddings.shape[1])}-D embeddings",
+            f"{cache.embeddings.shape[1]}-D embeddings",
             flush=True,
         )
 
@@ -214,19 +224,12 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
         _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
         _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
 
-        donor_data = dynamic.collect_donor_attention_data(
-            model,
-            pt,
-            vocab,
-            model_configs["nheads"],
-            device,
-            donor_ids,
-            need_cssi=True,
-            n_neighbors=CSSI_N_NEIGHBORS,
-            target_k=CSSI_TARGET_K,
-            random_state=SEED,
-            fixed_strata=strata,
-        )
+        donor_data = None
+        if opts["permutation"]:
+            donor_column = dynamic.resolve_donor_column(sub, opts["donor_col"])
+            donor_ids = sub.obs[donor_column].astype(str).to_numpy()
+            print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
+            donor_data = dynamic.donor_attention_data(cache, donor_ids, strata)
 
         # Dynamic top-N: pooled attention and CSSI separately. Permutation is
         # donor-level and therefore uses the same donor identities in both.
@@ -251,7 +254,7 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
             permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
         )
 
-        np.save(out_dir / "cell_embeddings.npy", embeddings)
+        np.save(out_dir / "cell_embeddings.npy", cache.embeddings)
         pd.DataFrame({"cell_index": np.arange(len(strata)), "leiden": strata}).to_csv(
             out_dir / "leiden_clusters.csv", index=False
         )
@@ -275,15 +278,16 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
 
 
 def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                       cell_types=None, donor_col=None) -> None:
+                       cell_types=None, opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset_scgpt(data_dir)
 
     print(f"[{device}] loading LoRA model...", flush=True)
     model = common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
 
-    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types):
-        print(f"\n=== ig_lora_scgpt | {ct} | {device} ===", flush=True)
+    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
+        print(f"\n=== ig_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} ===", flush=True)
 
         pt = common._tokenise(sub, vocab)
 
@@ -301,12 +305,13 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 
 # Attention per gene per condition of one Geneformer model, for every cell type
 def _attention_geneformer(model, method: str, use_predictions: bool, data_dir: Path,
-                          results_dir: Path, device: torch.device, cell_types=None) -> None:
+                          results_dir: Path, device: torch.device, cell_types=None,
+                          max_cells=None) -> None:
     # See geneformer_model.py for this functions description
     token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
     ds = _load_full_dataset_geneformer(data_dir)
-    for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types):
-        print(f"\n# {method} | {ct} | {device} #", flush=True)
+    for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, max_cells):
+        print(f"\n# {method} | {ct} | {sub.num_rows:,} cells | {device} #", flush=True)
         pt = gf._to_inputs(sub)
         means, gate = gf._compute_attn_per_gene_per_condition(
             model, pt, token_dict, gene_names, device, use_predictions,
@@ -321,29 +326,39 @@ def _attention_geneformer(model, method: str, use_predictions: bool, data_dir: P
 
 
 def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
-                              cell_types=None, donor_col=None) -> None:
+                              cell_types=None, opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
     # Like the scGPT attention task: every cell, grouped by its true label
     model = gf._load_zero_shot_model(device)
     _attention_geneformer(model, "attention_zero_shot_geneformer", False, data_dir, results_dir,
-                          device, cell_types)
+                          device, cell_types, opts["max_cells_per_type"])
     del model
     torch.cuda.empty_cache()
 
 
 def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
-                                   cell_types=None, donor_col=None) -> None:
+                                   cell_types=None, opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
     # With the LoRA classifier only the correctly classified cells are used
     model = gf._load_lora_model(data_dir / LORA_DIR_GENEFORMER, device)
     _attention_geneformer(model, "attention_lora_geneformer", True, data_dir, results_dir,
-                          device, cell_types)
+                          device, cell_types, opts["max_cells_per_type"])
     del model
     torch.cuda.empty_cache()
 
 
 def task_attention_residualized_ols_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                                          donor_col=None) -> None:
+                                          opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
+    adata = _load_full_dataset_scgpt(data_dir)
+    if opts["max_cells_per_type"] is not None:
+        # Same per-cell-type subset as the attention task
+        values = adata.obs[C.CELL_TYPE_COL].astype(str).to_numpy()
+        idx = np.sort(np.concatenate([_cell_type_indices(values, ct, opts["max_cells_per_type"])
+                                      for ct in sorted(set(values))]))
+        adata = adata[idx].copy()
     residualized_ols.task_attention_residualized_ols(
-        _load_full_dataset_scgpt(data_dir), results_dir, device, donor_col)
+        adata, results_dir, device, opts["donor_col"], opts["permutation"])
     torch.cuda.empty_cache()
 
 
@@ -369,7 +384,7 @@ POSTPROCESS_TASKS = {
 TASKS = {**MODEL_TASKS, **SINGLE_GPU_TASKS, **POSTPROCESS_TASKS}
 
 
-def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, donor_col=None):
+def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, opts):
     """
     One independent process per GPU.
 
@@ -389,7 +404,7 @@ def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, donor_col=
         f"{len(cell_types)} cell types",
         flush=True,
     )
-    MODEL_TASKS[task_name](data_dir, results_dir, device, cell_types, donor_col)
+    MODEL_TASKS[task_name](data_dir, results_dir, device, cell_types, opts)
     print(f"[worker GPU {gpu_id}] finished", flush=True)
 
 
@@ -411,7 +426,7 @@ def _parse_gpus(value):
     return gpus
 
 
-def _run_multi_gpu(task_name, gpus, data_dir, results_dir, donor_col=None):
+def _run_multi_gpu(task_name, gpus, data_dir, results_dir, opts):
     if not torch.cuda.is_available():
         raise RuntimeError(
             "--gpus requires CUDA, but torch.cuda.is_available() is False"
@@ -426,7 +441,8 @@ def _run_multi_gpu(task_name, gpus, data_dir, results_dir, donor_col=None):
         )
 
     # Used only to calculate a balanced cell-type assignment.
-    assignments, loads = _split_cell_types(_cell_type_counts(task_name, data_dir), len(gpus))
+    counts = _cell_type_counts(task_name, data_dir, opts["max_cells_per_type"])
+    assignments, loads = _split_cell_types(counts, len(gpus))
 
     print("\nMulti-GPU assignment:", flush=True)
     for gpu_id, cell_types, load in zip(gpus, assignments, loads):
@@ -449,7 +465,7 @@ def _run_multi_gpu(task_name, gpus, data_dir, results_dir, donor_col=None):
 
         p = ctx.Process(
             target=_gpu_worker,
-            args=(task_name, gpu_id, cell_types, data_dir, results_dir, donor_col),
+            args=(task_name, gpu_id, cell_types, data_dir, results_dir, opts),
         )
         p.start()
         processes.append((gpu_id, p))
@@ -486,13 +502,20 @@ def main():
     )
 
     p.add_argument("--donor-col", default=None,
-                   help="Donor/subject column in h5ad obs; auto-detected if omitted.")
+                   help="Donor/subject column in h5ad obs; auto-detected if omitted. "
+                        "Only used with --permutation.")
+    p.add_argument("--permutation", action="store_true",
+                   help="Also run the donor-level permutation selector (scGPT only, slow).")
+    p.add_argument("--max-cells-per-type", type=int, default=None,
+                   help="Seeded random subset of at most N cells per cell type (quick test runs).")
 
     p.add_argument("--results-dir", type=Path, default=_HERE / "results")
     p.add_argument("--selection", choices=SELECTIONS + ["all"], default="all",
                    help="Gene-set selection used by the post-hoc tasks (default: all).")
     args = p.parse_args()
     selections = SELECTIONS if args.selection == "all" else [args.selection]
+    opts = {"donor_col": args.donor_col, "permutation": args.permutation,
+            "max_cells_per_type": args.max_cells_per_type}
 
     # Each dataset writes to its own folder (results/dataset_a, results/dataset_b),
     # so the post-hoc analyses never mix the two
@@ -508,14 +531,14 @@ def main():
             )
 
         print(f"\n# {args.task} | Dataset {args.dataset} | GPUs {args.gpus} #", flush=True)
-        _run_multi_gpu(args.task, args.gpus, data_dir, results_dir, args.donor_col)
+        _run_multi_gpu(args.task, args.gpus, data_dir, results_dir, opts)
         return
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     if args.task in SINGLE_GPU_TASKS:
         print(f"\n# {args.task} | Dataset {args.dataset} | {device} #", flush=True)
-        SINGLE_GPU_TASKS[args.task](data_dir, results_dir, device, args.donor_col)
+        SINGLE_GPU_TASKS[args.task](data_dir, results_dir, device, opts)
         return
 
     # --task all only runs the GPU-bound model tasks, because the post-hoc
@@ -523,7 +546,7 @@ def main():
     for name in (list(MODEL_TASKS) if args.task == "all" else [args.task]):
         print(f"\n# {name} | Dataset {args.dataset} #", flush=True)
         if name in MODEL_TASKS:
-            TASKS[name](data_dir, results_dir, device)
+            TASKS[name](data_dir, results_dir, device, None, opts)
         else:
             TASKS[name](results_dir, selections)
 
