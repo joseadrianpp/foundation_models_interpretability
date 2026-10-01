@@ -10,17 +10,16 @@ Interpretability outputs for the scGPT and Geneformer models:
      zero-shot Geneformer model.
   4. The same attention score with the LoRA fine-tuned Geneformer model, only
      on its correctly classified cells.
-  5. OLS residualization of the scGPT zero-shot attention -> all genes +
-     selections.
+  5. OLS residualization of the zero-shot attention of 1 and 3 (scGPT and
+     Geneformer) -> all genes + selections.
 
 Runs on the full dataset (train + val + test combined), on Dataset A or
 Dataset B (--dataset), each with its own results folder.
 
 GPU-bound model tasks (1-4) can use --gpus to run independent cell-type
-workers on multiple GPUs. `attention_residualized_ols_scgpt` runs on the
-single --device GPU: its scGPT forward pass needs CUDA (the flash-attention
-backend is fp16/bf16-only), while the regression/selection stage is numpy and
-is never routed through the multi-GPU model worker.
+workers on multiple GPUs. The OLS tasks (5) run on CPU from the attention
+tasks' output, so they need 1 / 3 to have run first with the same
+--max-cells-per-type.
 """
 
 import argparse
@@ -216,7 +215,13 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
     _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
     _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
 
-    donor_data = None if donor_ids is None else dynamic.donor_attention_data(cache, donor_ids, strata)
+    donor_data = None
+    if donor_ids is not None:
+        donor_data = dynamic.donor_attention_data(cache, donor_ids, strata)
+        # The OLS task residualizes this matrix for its own permutation selector
+        np.savez_compressed(out_dir / "donor_attention.npz", donors=np.asarray(donor_data["donors"]),
+                            labels=donor_data["labels"], genes=np.asarray(donor_data["genes"]),
+                            scores=donor_data["scores"])
 
     # Dynamic top-N: pooled attention and CSSI separately. Permutation is
     # donor-level and therefore uses the same donor identities in both.
@@ -352,19 +357,29 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
     torch.cuda.empty_cache()
 
 
-def task_attention_residualized_ols_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                                          opts=None) -> None:
+# OLS residualization of the attention task output (CPU, no model). The cells
+# (and --max-cells-per-type subset) are the same the attention task used
+def task_attention_residualized_ols_scgpt(data_dir: Path, results_dir: Path, opts=None) -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
+    vocab = load_vocab()
     adata = _load_full_dataset_scgpt(data_dir)
-    if opts["max_cells_per_type"] is not None:
-        # Same per-cell-type subset as the attention task
-        values = adata.obs[C.CELL_TYPE_COL].astype(str).to_numpy()
-        idx = np.sort(np.concatenate([_cell_type_indices(values, ct, opts["max_cells_per_type"])
-                                      for ct in sorted(set(values))]))
-        adata = adata[idx].copy()
-    residualized_ols.task_attention_residualized_ols(
-        adata, results_dir, device, opts["donor_col"], opts["permutation"])
-    torch.cuda.empty_cache()
+    for ct, slug, sub in _cell_type_subsets_scgpt(adata, None, opts["max_cells_per_type"]):
+        print(f"\n# attention_residualized_ols_scgpt | {ct} | {sub.n_obs:,} cells #", flush=True)
+        genes, features = residualized_ols.scgpt_gene_features(sub, vocab)
+        residualized_ols.residualize_cell_type(results_dir, "scgpt", slug, genes, features,
+                                               sub.n_obs, opts["permutation"])
+
+
+def task_attention_residualized_ols_geneformer(data_dir: Path, results_dir: Path, opts=None) -> None:
+    opts = {**DEFAULT_OPTS, **(opts or {})}
+    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    ds = _load_full_dataset_geneformer(data_dir)
+    for ct, slug, sub in _cell_type_subsets_geneformer(ds, None, opts["max_cells_per_type"]):
+        print(f"\n# attention_residualized_ols_geneformer | {ct} | {sub.num_rows:,} cells #", flush=True)
+        genes, features = residualized_ols.geneformer_rank_features(
+            gf._to_inputs(sub)["input_ids"], token_dict, gene_names)
+        residualized_ols.residualize_cell_type(results_dir, "geneformer", slug, genes, features,
+                                               sub.num_rows, opts["permutation"])
 
 
 MODEL_TASKS = {
@@ -374,8 +389,10 @@ MODEL_TASKS = {
     "attention_lora_geneformer": task_attention_lora_geneformer,
 }
 
-SINGLE_GPU_TASKS = {
+# CPU tasks computed from the model tasks' output
+DERIVED_TASKS = {
     "attention_residualized_ols_scgpt": task_attention_residualized_ols_scgpt,
+    "attention_residualized_ols_geneformer": task_attention_residualized_ols_geneformer,
 }
 
 POSTPROCESS_TASKS = {
@@ -386,7 +403,7 @@ POSTPROCESS_TASKS = {
     "plots": task_plots,
 }
 
-TASKS = {**MODEL_TASKS, **SINGLE_GPU_TASKS, **POSTPROCESS_TASKS}
+TASKS = {**MODEL_TASKS, **DERIVED_TASKS, **POSTPROCESS_TASKS}
 
 
 def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, opts):
@@ -531,8 +548,7 @@ def main():
         if args.task not in MODEL_TASKS:
             raise SystemExit(
                 "--gpus is only supported with GPU model tasks: "
-                f"{', '.join(MODEL_TASKS)}. attention_residualized_ols_scgpt uses "
-                "the single --device GPU, and --task all is not a multi-GPU task."
+                f"{', '.join(MODEL_TASKS)}. --task all is not a multi-GPU task."
             )
 
         print(f"\n# {args.task} | Dataset {args.dataset} | GPUs {args.gpus} #", flush=True)
@@ -541,17 +557,15 @@ def main():
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    if args.task in SINGLE_GPU_TASKS:
-        print(f"\n# {args.task} | Dataset {args.dataset} | {device} #", flush=True)
-        SINGLE_GPU_TASKS[args.task](data_dir, results_dir, device, opts)
-        return
-
-    # --task all only runs the GPU-bound model tasks, because the post-hoc
-    # analyses depend on their output and are run individually.
-    for name in (list(MODEL_TASKS) if args.task == "all" else [args.task]):
+    # --task all runs the GPU-bound model tasks and then the OLS tasks built on
+    # their output; the post-hoc analyses are run individually.
+    names = list(MODEL_TASKS) + list(DERIVED_TASKS) if args.task == "all" else [args.task]
+    for name in names:
         print(f"\n# {name} | Dataset {args.dataset} #", flush=True)
         if name in MODEL_TASKS:
             TASKS[name](data_dir, results_dir, device, None, opts)
+        elif name in DERIVED_TASKS:
+            TASKS[name](data_dir, results_dir, opts)
         else:
             TASKS[name](results_dir, selections)
 

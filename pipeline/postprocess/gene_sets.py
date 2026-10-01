@@ -8,6 +8,7 @@ Methods:
   * ig_lora_scgpt                    - Integrated Gradients on the LoRA scGPT model
   * attention_zero_shot_geneformer   - Geneformer pooled CLS attention, PD - control
   * attention_cssi_geneformer        - Geneformer CSSI-max attention over Leiden strata
+  * attention_residualized_ols_geneformer - OLS residual of the Geneformer pooled attention
   * attention_lora_geneformer        - CLS attention of the LoRA Geneformer model
 
 Selections:
@@ -56,6 +57,10 @@ GENE_LIST_PATHS = {
     "attention_cssi_geneformer": {
         "top30": "attention_zero_shot_geneformer/{ct}/cssi/csv/top30.csv",
         "elbow": "attention_zero_shot_geneformer/{ct}/cssi/csv/elbow.csv",
+    },
+    "attention_residualized_ols_geneformer": {
+        "top30": "attention_residualized_ols_geneformer/{ct}/csv/top30.csv",
+        "elbow": "attention_residualized_ols_geneformer/{ct}/csv/elbow.csv",
     },
     "attention_lora_geneformer": {
         "top30": "attention_lora_geneformer/{ct}/top30_genes.csv",

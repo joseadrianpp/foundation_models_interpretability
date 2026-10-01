@@ -1,13 +1,18 @@
 """
-OLS residualization of scGPT zero-shot attention against gene-level features.
+OLS residualization of zero-shot attention (scGPT or Geneformer) against
+gene-level features.
 
 For each cell type:
-  1. Recompute the same signed PD-vs-control attention score used by the
-     existing attention task.
-  2. Compute gene-level univariate features from the original h5ad X:
+  1. Read the signed PD-vs-control pooled attention score of every gene from
+     the attention task (attention_zero_shot_<model>/<cell_type>/csv/all_genes.csv).
+  2. Compute gene-level univariate features over the same cells:
        - mean expression
        - expression variance
-       - dropout rate (fraction of cells with X == 0)
+       - dropout rate (fraction of cells without the gene)
+     scGPT: from the h5ad X. Geneformer cells come rank-value encoded (no
+     expression values), so the features use a rank pseudo-expression instead:
+     v = 1 - (p - 1) / (n - 1) for the gene at position p of a cell's n genes
+     (1 = the cell's most expressed gene) and v = 0 when the gene is absent.
   3. Fit, across genes, the OLS model
        Attention_g = beta_0 + beta_1*expression_g
                               + beta_2*variance_g
@@ -17,13 +22,11 @@ For each cell type:
 The residual is the part of the signed attention score not explained by the
 three supplied univariate gene features.
 
-Only the scGPT forward pass runs on `device`; it must be CUDA because the
-model uses the flash-attention backend (fp16/bf16 only), and it matches the
-autocast forward pass of the attention task so the residualized score is the
-same pooled attention. The OLS fit and selectors are numpy (CPU). Dynamic
-top-N selectors are also applied to the residual attention scores, while
-`ols.csv` retains all genes ranked by the residual signal. The donor
-permutation selector only runs with permutation=True.
+No model runs here: the OLS fit and selectors are numpy (CPU). Dynamic top-N
+selectors are also applied to the residual attention scores, while `ols.csv`
+retains all genes ranked by the residual signal. The donor permutation
+selector only runs with permutation=True, reusing the donor matrix the
+attention task saved with --permutation.
 """
 
 from pathlib import Path
@@ -34,16 +37,11 @@ import json
 
 import anndata as ad
 import numpy as np
-import scanpy as sc
-import torch
+import pandas as pd
 from scipy.sparse import issparse
 from scipy.stats import f as f_dist
 
-from pipeline import config as C
-from pipeline.steps import _step7_common as common
-from pipeline.steps import attention_cssi_leiden as cssi
 from pipeline.steps import attention_dynamic_selection as dynamic
-from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 
 
 # BH over ~1000 genes needs >= m/alpha = 20k permutations for a single gene to
@@ -53,10 +51,50 @@ DYNAMIC_PERMUTATION_ALPHA = 0.05
 DYNAMIC_PERMUTATION_EFFECT_SIZE = dynamic.PERMUTATION_EFFECT_SIZE
 
 
-def _cell_type_subsets(adata: ad.AnnData):
-    values = adata.obs[C.CELL_TYPE_COL].astype(str)
-    for ct in sorted(values.unique()):
-        yield ct, common._slug_cell_type(ct), adata[(values == ct).to_numpy()].copy()
+def scgpt_gene_features(adata: ad.AnnData, vocab) -> Tuple[list, Dict[str, Dict[str, float]]]:
+    """Genes and expression features of one cell type, as the scGPT attention task sees it.
+
+    Same gene universe as that task: genes present in the scGPT vocabulary
+    and in this cell-type AnnData.
+    """
+    in_vocab = np.array([g in vocab for g in adata.var.index])
+    genes = [str(g) for g in adata.var.index[in_vocab]]
+    return genes, _gene_features(adata[:, in_vocab].copy())
+
+
+def geneformer_rank_features(input_ids, token_dict: dict,
+                             gene_names: dict) -> Tuple[list, Dict[str, Dict[str, float]]]:
+    """Genes and rank pseudo-expression features of one cell type (Geneformer).
+
+    `input_ids` holds each cell's tokens, genes ordered from most to least
+    expressed. Every gene seen in the cell type is kept, the same universe as
+    the Geneformer attention task.
+    """
+    special_ids = np.array(sorted(v for k, v in token_dict.items() if k.startswith("<")))
+    gids, values = [], []
+    for ids in input_ids:
+        ids = np.asarray(ids)
+        ids = ids[~np.isin(ids, special_ids)]
+        n = ids.size
+        gids.append(ids)
+        values.append(1.0 - np.arange(n) / (n - 1) if n > 1 else np.ones(n))
+    gids, values = np.concatenate(gids), np.concatenate(values)
+    uniq, inv = np.unique(gids, return_inverse=True)
+
+    n_cells = float(len(input_ids))
+    mean = np.bincount(inv, weights=values) / n_cells
+    variance = np.maximum(np.bincount(inv, weights=values * values) / n_cells - mean * mean, 0.0)
+    dropout = 1.0 - np.bincount(inv) / n_cells
+
+    genes = [str(gene_names[int(t)]) for t in uniq]
+    return genes, {
+        gene: {
+            "expression_mean": float(mean[i]),
+            "expression_variance": float(variance[i]),
+            "dropout_rate": float(dropout[i]),
+        }
+        for i, gene in enumerate(genes)
+    }
 
 
 def _gene_features(adata: ad.AnnData) -> Dict[str, Dict[str, float]]:
@@ -254,129 +292,114 @@ def _write_ols_score_csv(rows: list, out_csv: Path) -> None:
             writer.writerow([rank, gene, score])
 
 
-def task_attention_residualized_ols(
-    adata: ad.AnnData,
+def _load_donor_data(path: Path) -> dict:
+    with np.load(path) as npz:
+        return {"donors": npz["donors"].tolist(), "labels": npz["labels"],
+                "genes": npz["genes"].tolist(), "scores": npz["scores"], "strata": {}}
+
+
+def residualize_cell_type(
     results_dir: Path,
-    device: torch.device,
-    donor_col=None,
+    model: str,
+    slug: str,
+    genes,
+    features: Dict[str, Dict[str, float]],
+    n_cells: int,
     permutation: bool = False,
 ) -> None:
-    """Run OLS residualization for every cell type of `adata` and save all genes."""
-    if device.type != "cuda":
-        raise ValueError(
-            "attention_residualized_ols needs a CUDA device for the scGPT "
-            "forward pass (flash-attention backend is fp16/bf16 GPU-only)."
-        )
+    """OLS-residualize one cell type's pooled attention against its gene features.
 
-    vocab, model_configs = load_vocab(), load_model_configs()
-    model = common._load_zero_shot_model(vocab, model_configs, device)
+    The attention score is read from the attention task output
+    (attention_zero_shot_<model>/<slug>/csv/all_genes.csv), so this runs on
+    CPU and is exactly the pooled score the attention task ranked. `n_cells`
+    must match the cells that task used (same --max-cells-per-type).
+    """
+    attention_dir = results_dir / f"attention_zero_shot_{model}" / slug
+    scores_csv = attention_dir / "csv" / "all_genes.csv"
+    if not scores_csv.exists():
+        print(f"  skipped: {scores_csv} missing (run the attention task first)", flush=True)
+        return
+    meta_path = attention_dir / "cssi_metadata.json"
+    if meta_path.exists():
+        n_attention = json.loads(meta_path.read_text()).get("n_cells")
+        if n_attention is not None and n_attention != n_cells:
+            print(f"  skipped: the attention task used {n_attention} cells and the features "
+                  f"{n_cells}; use the same --max-cells-per-type for both", flush=True)
+            return
 
-    for ct, slug, sub in _cell_type_subsets(adata):
-        print(f"\n# attention_residualized_ols | {ct} | {device} #", flush=True)
+    attention_df = pd.read_csv(scores_csv)
+    attention_scores = dict(zip(attention_df["gene"].astype(str), attention_df["score"].astype(float)))
+    rows, metadata = _ols_residualize(genes, attention_scores, features)
+    metadata["attention_source"] = str(scores_csv.relative_to(results_dir))
+    metadata["n_cells"] = int(n_cells)
 
-        # This deliberately uses the exact same attention computation as the
-        # existing attention_zero_shot task. One forward pass feeds both the
-        # cell-level condition means and, with --permutation, the donor-level matrix.
-        pt = common._tokenise(sub, vocab)
-        labels = pt["condition_labels"].numpy()
-        if not (np.any(labels == 0) and np.any(labels == 1)):
-            print(
-                f"  skipped: ground-truth counts: control={int(np.sum(labels == 0))}, "
-                f"pd={int(np.sum(labels == 1))}",
-                flush=True,
-            )
-            continue
+    out_dir = results_dir / f"attention_residualized_ols_{model}" / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device)
-        attention_scores = common._gene_scores(
-            cssi.condition_means(cache),
-            lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
-        )
+    # Preserve the detailed all-gene audit output.
+    out_csv = out_dir / "residualized_genes.csv"
+    _write_csv(rows, out_csv)
 
-        # Same gene universe as the attention task: genes present in the
-        # scGPT vocabulary and in this cell-type AnnData.
-        in_vocab = np.array([g in vocab for g in sub.var.index])
-        genes = [str(g) for g in sub.var.index[in_vocab]]
-        sub_for_features = sub[:, in_vocab].copy()
+    # New standard-format OLS output: all genes ranked by residual signal.
+    _write_ols_score_csv(rows, out_dir / "csv" / "ols.csv")
 
-        features = _gene_features(sub_for_features)
-        rows, metadata = _ols_residualize(
-            genes,
-            attention_scores,
-            features,
-        )
+    # Also provide the same dynamic selectors on residualized attention.
+    residual_scores = {
+        str(row["gene"]): float(row["residual_attention"])
+        for row in rows
+        if np.isfinite(row["residual_attention"])
+    }
 
-        out_dir = results_dir / "attention_residualized_ols_scgpt" / slug
-        out_dir.mkdir(parents=True, exist_ok=True)
+    donor_residual_data = None
+    donor_npz = attention_dir / "donor_attention.npz"
+    if permutation and not donor_npz.exists():
+        print(f"  permutation skipped: {donor_npz} missing (run the attention task "
+              "with --permutation)", flush=True)
+    elif permutation:
+        donor_data = _load_donor_data(donor_npz)
 
-        # Preserve the detailed all-gene audit output.
-        out_csv = out_dir / "residualized_genes.csv"
-        _write_csv(rows, out_csv)
-
-        # New standard-format OLS output: all genes ranked by residual signal.
-        _write_ols_score_csv(rows, out_dir / "csv" / "ols.csv")
-
-        # Also provide the same dynamic selectors on residualized attention.
-        residual_scores = {
-            str(row["gene"]): float(row["residual_attention"])
+        # Residualize each donor's gene-attention vector with the same fitted
+        # gene-level OLS prediction. This is a fixed per-gene offset, so the
+        # donor-level Cohen's d is evaluated on the residualized values while
+        # preserving the current OLS definition.
+        predicted_by_gene = {
+            str(row["gene"]): float(row["predicted_attention"])
             for row in rows
-            if np.isfinite(row["residual_attention"])
+            if np.isfinite(row["predicted_attention"])
         }
-
-        donor_residual_data = None
-        if permutation:
-            donor_column = dynamic.resolve_donor_column(sub, donor_col)
-            donor_ids = sub.obs[donor_column].astype(str).to_numpy()
-            print(
-                f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors",
-                flush=True,
-            )
-            donor_data = dynamic.donor_attention_data(cache, donor_ids)
-
-            # Residualize each donor's gene-attention vector with the same fitted
-            # gene-level OLS prediction. This is a fixed per-gene offset, so the
-            # donor-level Cohen's d is evaluated on the residualized values while
-            # preserving the current OLS definition.
-            predicted_by_gene = {
-                str(row["gene"]): float(row["predicted_attention"])
-                for row in rows
-                if np.isfinite(row["predicted_attention"])
-            }
-            predicted_vector = np.asarray(
-                [predicted_by_gene.get(g, np.nan) for g in donor_data["genes"]],
-                dtype=float,
-            )
-            donor_residual_scores = donor_data["scores"] - predicted_vector[None, :]
-            donor_residual_data = {**donor_data, "scores": donor_residual_scores}
-
-        selection_summary = dynamic.write_selection_family(
-            residual_scores,
-            out_dir / "csv",
-            donor_data=donor_residual_data,
-            cssi_mode=False,
-            random_state=42,
-            permutation_n=DYNAMIC_PERMUTATIONS,
-            permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
-            permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
+        predicted_vector = np.asarray(
+            [predicted_by_gene.get(g, np.nan) for g in donor_data["genes"]],
+            dtype=float,
         )
+        donor_residual_scores = donor_data["scores"] - predicted_vector[None, :]
+        donor_residual_data = {**donor_data, "scores": donor_residual_scores}
 
-        with open(out_dir / "ols_summary.json", "w") as f:
-            json.dump(metadata, f, indent=2)
+    selection_summary = dynamic.write_selection_family(
+        residual_scores,
+        out_dir / "csv",
+        donor_data=donor_residual_data,
+        cssi_mode=False,
+        random_state=42,
+        permutation_n=DYNAMIC_PERMUTATIONS,
+        permutation_alpha=DYNAMIC_PERMUTATION_ALPHA,
+        permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
+    )
 
-        print(
-            f"  wrote {out_csv} ({len(rows)} genes; "
-            f"R^2={metadata['r_squared']:.4f}; "
-            f"F={metadata['f_statistic']:.3f}; "
-            f"p={metadata['f_p_value']:.3e})",
-            flush=True,
-        )
-        print(
-            "  residual dynamic N: "
-            + ", ".join(
-                f"{method}={info['n_selected']}"
-                for method, info in selection_summary.items()
-            ),
-            flush=True,
-        )
+    with open(out_dir / "ols_summary.json", "w") as f:
+        json.dump(metadata, f, indent=2)
 
-    del model
+    print(
+        f"  wrote {out_csv} ({len(rows)} genes; "
+        f"R^2={metadata['r_squared']:.4f}; "
+        f"F={metadata['f_statistic']:.3f}; "
+        f"p={metadata['f_p_value']:.3e})",
+        flush=True,
+    )
+    print(
+        "  residual dynamic N: "
+        + ", ".join(
+            f"{method}={info['n_selected']}"
+            for method, info in selection_summary.items()
+        ),
+        flush=True,
+    )
