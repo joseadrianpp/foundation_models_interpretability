@@ -3,7 +3,6 @@
 Fixed selectors:
   * top30: 30 highest method scores.
   * z-score: score > mean + 2.5 * std.
-  * Otsu: genes above the Otsu threshold.
   * elbow: Kneedle elbow on the descending score curve.
 
 Permutation selector:
@@ -33,7 +32,6 @@ from pipeline.steps import attention_cssi_leiden as cssi
 
 TOP_N = 30
 Z_THRESHOLD = 2.5
-OTSU_MAX_BINS = 256
 ELBOW_S = 1.0
 PERMUTATION_N = 50000
 PERMUTATION_ALPHA = 0.05
@@ -75,41 +73,6 @@ def _zscore(items: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], di
         "z_threshold": Z_THRESHOLD,
         "threshold": threshold,
         "fallback_top1": fallback,
-    }
-
-
-def _otsu_threshold(scores: np.ndarray) -> float:
-    if scores.size < 2 or np.all(scores == scores[0]):
-        return float(scores[0])
-    lo, hi = float(scores.min()), float(scores.max())
-    n_bins = min(OTSU_MAX_BINS, max(2, int(np.unique(scores).size)))
-    hist, edges = np.histogram(scores, bins=n_bins, range=(lo, hi))
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    w = hist.astype(float)
-    cw = np.cumsum(w)
-    cm = np.cumsum(w * centers)
-    total_w, total_m = cw[-1], cm[-1]
-    denom = cw * (total_w - cw)
-    between = np.zeros_like(cm)
-    valid = denom > 0
-    between[valid] = (total_m * cw[valid] - cm[valid]) ** 2 / denom[valid]
-    if between.size > 2:
-        between[0] = -np.inf
-        between[-1] = -np.inf
-    return float(centers[int(np.argmax(between))])
-
-
-def _otsu(items: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], dict]:
-    scores = np.asarray([s for _, s in items], dtype=float)
-    threshold = _otsu_threshold(scores)
-    keep = scores > threshold
-    fallback = not bool(np.any(keep))
-    if fallback:
-        keep[np.argmax(scores)] = True
-    return [item for item, flag in zip(items, keep) if flag], {
-        "threshold": threshold,
-        "fallback_top1": fallback,
-        "n_bins": min(OTSU_MAX_BINS, max(2, int(np.unique(scores).size))),
     }
 
 
@@ -446,7 +409,6 @@ def select_all(score_map: Dict[str, float]):
     return {
         "top30": (_select_top_k(items, TOP_N), {"k": min(TOP_N, len(items))}),
         "z-score": _zscore(items),
-        "otsu": _otsu(items),
         "elbow": _elbow(items),
     }
 

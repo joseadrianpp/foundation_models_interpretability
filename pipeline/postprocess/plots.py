@@ -302,7 +302,7 @@ def plot_gene_set_overlap(results_dir: Path, selection: str = "top30") -> Path:
 
 def plot_gene_set_sizes(results_dir: Path) -> Path:
     """Number of genes each method selects per selection rule (all dynamic rules)."""
-    rules = ["top30", "z-score", "otsu", "elbow"]
+    rules = ["top30", "z-score", "elbow"]
     sources = SUMMARY_PATHS
     methods = list(sources)
     fig, axes = plt.subplots(1, len(rules), figsize=(4 * len(rules), 4.2), sharey=True)
@@ -345,7 +345,7 @@ ALL_SCORE_PATHS = {
     "attention_zero_shot_geneformer": ["attention_zero_shot_geneformer/{ct}/csv/all_genes.csv"],
     "attention_cssi_geneformer": ["attention_zero_shot_geneformer/{ct}/cssi_genes.csv"],
 }
-CUTOFF_STYLES = {"top30": ":", "z-score": "--", "otsu": "-.", "elbow": "-"}
+CUTOFF_STYLES = {"top30": ":", "z-score": "--", "elbow": "-"}
 MAX_RANK_SHOWN = 200
 
 

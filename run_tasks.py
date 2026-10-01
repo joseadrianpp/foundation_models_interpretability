@@ -4,7 +4,7 @@ Interpretability outputs for the scGPT and Geneformer models:
 
   1. scGPT zero-shot CLS-attention signed score (PD vs Control) -> top-30 genes,
      plus the CSSI-max score over Leiden strata and the dynamic selections
-     (top30 / z-score / otsu / elbow) of both.
+     (top30 / z-score / elbow) of both.
   2. Integrated Gradients on the LoRA fine-tuned scGPT model -> top-30 genes.
   3. The same outputs as 1 (pooled + CSSI + dynamic selections) with the
      zero-shot Geneformer model.
