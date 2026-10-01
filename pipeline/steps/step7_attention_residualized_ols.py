@@ -17,9 +17,12 @@ For each cell type:
 The residual is the part of the signed attention score not explained by the
 three supplied univariate gene features.
 
-The task is CPU-only. Dynamic top-N selectors are also applied to the
-residual attention scores, while `ols.csv` retains all genes ranked by the
-residual signal.
+Only the scGPT forward pass runs on `device`; it must be CUDA because the
+model uses the flash-attention backend (fp16/bf16 only), and it matches the
+autocast forward pass of the attention task so the residualized score is the
+same pooled attention. The OLS fit and selectors are numpy (CPU). Dynamic
+top-N selectors are also applied to the residual attention scores, while
+`ols.csv` retains all genes ranked by the residual signal.
 """
 
 from pathlib import Path
@@ -45,7 +48,9 @@ DATA_DIR = C.DATA_DIR
 TRAIN_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_train.h5ad"
 VAL_H5AD = DATA_DIR / "mixed_split" / "Mixed_HVG_1000_pc_noXY_noMT_mixed_val.h5ad"
 
-DYNAMIC_PERMUTATIONS = 2000
+# BH over ~1000 genes needs >= m/alpha = 20k permutations for a single gene to
+# reach q < 0.05 (min q = m / (n_perm + 1)); 50k gives margin (min q ~ 0.02).
+DYNAMIC_PERMUTATIONS = dynamic.PERMUTATION_N
 DYNAMIC_PERMUTATION_ALPHA = 0.05
 DYNAMIC_PERMUTATION_EFFECT_SIZE = dynamic.PERMUTATION_EFFECT_SIZE
 
@@ -187,11 +192,11 @@ def _ols_residualize(
         else:
             row["residual_zscore"] = 0.0
 
-    # Keep the detailed audit table sorted by predicted attention, as requested.
+    # Sort the detailed audit table by residual attention (rank 1 = largest residual).
     rows.sort(
         key=lambda r: (
-            -r["predicted_attention"]
-            if np.isfinite(r["predicted_attention"])
+            -r["residual_attention"]
+            if np.isfinite(r["residual_attention"])
             else float("inf")
         )
     )
@@ -263,36 +268,31 @@ def task_attention_residualized_ols(
     donor_col=None,
 ) -> None:
     """Run OLS residualization for every cell type and save all genes."""
-    if device.type != "cpu":
-        raise ValueError("attention_residualized_ols is CPU-only.")
+    if device.type != "cuda":
+        raise ValueError(
+            "attention_residualized_ols needs a CUDA device for the scGPT "
+            "forward pass (flash-attention backend is fp16/bf16 GPU-only)."
+        )
 
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset()
-    model = common._load_zero_shot_model(vocab, model_configs, torch.device("cpu"))
+    model = common._load_zero_shot_model(vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets(adata):
-        print(f"\n# attention_residualized_ols | {ct} | CPU #", flush=True)
+        print(f"\n# attention_residualized_ols | {ct} | {device} #", flush=True)
 
         # This deliberately uses the exact same attention computation as the
-        # existing attention_zero_shot task.
+        # existing attention_zero_shot task. One forward pass feeds both the
+        # cell-level condition means and the donor-level matrix.
         pt = common._tokenise(sub, vocab)
-        means, gate = common._compute_attn_per_gene_per_condition(
-            model,
-            pt,
-            vocab,
-            model_configs["nheads"],
-            torch.device("cpu"),
-            n_cls=2,
-            use_predictions=False,
-        )
-        if not gate["ok"]:
-            print(f"  skipped: {gate['reason']}", flush=True)
+        labels = pt["condition_labels"].numpy()
+        if not (np.any(labels == 0) and np.any(labels == 1)):
+            print(
+                f"  skipped: ground-truth counts: control={int(np.sum(labels == 0))}, "
+                f"pd={int(np.sum(labels == 1))}",
+                flush=True,
+            )
             continue
-
-        attention_scores = common._gene_scores(
-            means,
-            lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
-        )
 
         donor_column = dynamic.resolve_donor_column(sub, donor_col)
         donor_ids = sub.obs[donor_column].astype(str).to_numpy()
@@ -305,9 +305,14 @@ def task_attention_residualized_ols(
             pt,
             vocab,
             model_configs["nheads"],
-            torch.device("cpu"),
+            device,
             donor_ids,
             need_cssi=False,
+        )
+
+        attention_scores = common._gene_scores(
+            donor_data["condition_means"],
+            lambda mean_pd, mean_ctrl: mean_pd - mean_ctrl,
         )
 
         # Same gene universe as the attention task: genes present in the

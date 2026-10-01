@@ -34,7 +34,7 @@ NUM_ATTN_LAYERS = 11        # 0-indexed transformer encoder layer for attention
 # ---------------------------------------------------------------------------
 # Tokenisation (matches Step 6: include_zero_gene=False, no normalisation/log)
 # ---------------------------------------------------------------------------
-def _tokenise(adata: sc.AnnData, vocab) -> Dict[str, torch.Tensor]:
+def _tokenise(adata: sc.AnnData, vocab, seed: int = C.BINNING_SEED) -> Dict[str, torch.Tensor]:
     # scGPT can only embed genes that have a token, so anything outside the
     # vocabulary is dropped before the column order is frozen into gene_ids
 
@@ -56,7 +56,16 @@ def _tokenise(adata: sc.AnnData, vocab) -> Dict[str, torch.Tensor]:
         normalize_total=False, log1p=False, subset_hvg=False,
         binning=C.N_BINS, result_binned_key="X_binned",
     )
-    pre(adata, batch_key=None)
+    # scGPT's _digitize breaks bin ties with np.random.rand, so without a fixed
+    # seed the binned values (and every downstream score) depend on the global
+    # RNG state, i.e. on which cell types were processed before. The global
+    # state is restored afterwards so other random steps are unaffected.
+    rng_state = np.random.get_state()
+    np.random.seed(seed)
+    try:
+        pre(adata, batch_key=None)
+    finally:
+        np.random.set_state(rng_state)
     binned = adata.layers["X_binned"]
     counts = binned.toarray() if issparse(binned) else binned
 

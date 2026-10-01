@@ -1,0 +1,48 @@
+{
+  "top30": {
+    "k": 30,
+    "n_selected": 30,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/top30.csv"
+  },
+  "z-score": {
+    "mean": 0.11418771652419588,
+    "std": 0.17860326897790876,
+    "z_threshold": 2.5,
+    "threshold": 0.5606958889689678,
+    "fallback_top1": false,
+    "n_selected": 56,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/z-score.csv"
+  },
+  "otsu": {
+    "threshold": 0.748435839661397,
+    "fallback_top1": false,
+    "n_bins": 256,
+    "n_selected": 2,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/otsu.csv"
+  },
+  "elbow": {
+    "k": 11,
+    "fallback": null,
+    "n_selected": 11,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/elbow.csv"
+  },
+  "permutation": {
+    "n_permutations": 50000,
+    "alpha": 0.05,
+    "effect_size_threshold": 0.5,
+    "selection_rule": "q < alpha AND abs(Cohen's d) >= effect_size",
+    "two_sided": true,
+    "multiple_testing": "Benjamini-Hochberg",
+    "n_donors": 28,
+    "n_donors_control": 13,
+    "n_donors_pd": 15,
+    "min_donors_per_group": 2,
+    "test": "two-sided donor-label Cohen's d, max-|d| over CSSI strata",
+    "n_selected": 0,
+    "n_audit_genes": 944,
+    "n_q_pass": 0,
+    "n_effect_pass": 839,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/permutation.csv",
+    "audit_output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/da_neurons/cssi/csv/permutation_audit.csv"
+  }
+}

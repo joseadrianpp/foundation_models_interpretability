@@ -1,0 +1,20 @@
+test,setting,value
+correctness,max |d_vec - d_naive|,6.661338147750939e-16
+correctness,BH == statsmodels,1.0
+null,frac p<0.05 (expected 0.05),0.067
+null,KS uniform p-value,0.38871778139555135
+null,n q<0.05,0.0
+resolution,"min q, 1 gene, 2000 perms",0.49975012493753124
+resolution,"min q, 1 gene, 10000 perms",0.0999900009999
+resolution,"min q, 1 gene, 20000 perms",0.04999750012499375
+resolution,"min q, 1 gene, 50000 perms",0.01999960000799984
+power,true d=0.8: TP/50,0.0
+power,true d=0.8: FP,0.0
+power,true d=1.2: TP/50,13.0
+power,true d=1.2: FP,0.0
+power,true d=1.6: TP/50,41.0
+power,true d=1.6: FP,4.0
+power,true d=2.0: TP/50,48.0
+power,true d=2.0: FP,2.0
+power,true d=2.5: TP/50,50.0
+power,true d=2.5: FP,1.0

@@ -38,6 +38,11 @@ PERMUTATION_N = 50000
 PERMUTATION_ALPHA = 0.05
 PERMUTATION_EFFECT_SIZE = 0.2
 MIN_DONORS_PER_GROUP = 2
+# Observed and permuted d are computed with different (but equivalent) variance
+# formulas, so an exact tie (the observed donor split recurring in a
+# permutation, frequent for genes seen in few donors) can differ by ~1e-13.
+# Null values within this relative tolerance count as >= observed.
+TIE_RTOL = 1e-9
 
 
 def _ranked_items(score_map: Dict[str, float]) -> List[Tuple[str, float]]:
@@ -314,7 +319,33 @@ def collect_donor_attention_data(
             random_state=random_state,
         )
     data = _collect_donor_data(all_attn, all_gids, labels, donor_ids, vocab, strata)
+    data["condition_means"] = _condition_means(all_attn, all_gids, labels, vocab)
     return data
+
+
+def _condition_means(all_attn: np.ndarray, all_gids: np.ndarray, labels: np.ndarray, vocab):
+    """Cell-level mean attention per gene per condition, from the same forward pass.
+
+    Mirrors `_step7_common._compute_attn_per_gene_per_condition(use_predictions=False)`
+    so callers that also need donor data do not have to run the model twice.
+    """
+    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
+    pad_id = vocab[C.PAD_TOKEN]
+    sums = {0: {}, 1: {}}
+    cnts = {0: {}, 1: {}}
+    for i in range(all_attn.shape[0]):
+        cond = int(labels[i])
+        for pos in range(1, all_gids.shape[1]):
+            gid = int(all_gids[i, pos])
+            if gid == pad_id or gid in special_ids:
+                continue
+            sums[cond][gid] = sums[cond].get(gid, 0.0) + float(all_attn[i, pos])
+            cnts[cond][gid] = cnts[cond].get(gid, 0) + 1
+    means = {0: {}, 1: {}}
+    for cond in (0, 1):
+        for gid, s in sums[cond].items():
+            means[cond][str(vocab.lookup_tokens([gid])[0])] = s / cnts[cond][gid]
+    return means
 
 
 def _cohen_d_from_groups(X: np.ndarray, group1: np.ndarray):
@@ -462,7 +493,8 @@ def permutation_selection(
         null_j = null_stat[:, j]
         null_j = null_j[np.isfinite(null_j)]
         if null_j.size:
-            p[j] = (1 + np.sum(null_j >= observed_stat[j])) / (null_j.size + 1)
+            threshold = observed_stat[j] * (1.0 - TIE_RTOL)
+            p[j] = (1 + np.sum(null_j >= threshold)) / (null_j.size + 1)
     q = np.full(G, np.nan)
     finite = np.isfinite(p)
     if finite.any():
@@ -474,6 +506,9 @@ def permutation_selection(
         j = gene_to_col.get(gene)
         if j is None or not np.isfinite(q[j]) or not np.isfinite(observed_d[j]):
             continue
+        
+        q_pass = bool(q[j] < alpha)
+        effect_pass = bool(abs(observed_d[j]) >= effect_size)
         row = {
             "gene": gene,
             "score": float(score),
@@ -483,9 +518,12 @@ def permutation_selection(
             "n_donors_control": int(observed_n0[j]),
             "n_donors_pd": int(observed_n1[j]),
             "effect_threshold": float(effect_size),
+            "q_pass": q_pass,
+            "effect_pass": effect_pass,
+            "selected": q_pass and effect_pass,
         }
         audit.append(row)
-        if q[j] < alpha and abs(observed_d[j]) >= effect_size:
+        if row["selected"]:
             selected.append((gene, float(score), row))
 
     selected.sort(key=lambda x: (-x[1], x[0]))
@@ -536,12 +574,14 @@ def write_permutation_csv(audit_rows, out_csv: Path):
         writer.writerow([
             "rank", "gene", "score", "cohen_d", "p_value", "q_value",
             "n_donors_control", "n_donors_pd", "effect_threshold",
+            "q_pass", "effect_pass", "selected",
         ])
         for rank, row in enumerate(selected, 1):
             writer.writerow([
                 rank, row["gene"], row["score"], row["cohen_d"], row["p_value"],
                 row["q_value"], row["n_donors_control"], row["n_donors_pd"],
-                row["effect_threshold"],
+                row["effect_threshold"], row.get("q_pass", False),
+                row.get("effect_pass", False), row.get("selected", False),
             ])
 
 

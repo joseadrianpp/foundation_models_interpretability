@@ -1,0 +1,13 @@
+cell_type,method,n_query_genes,n_significant_terms,mean_information_content,mean_intersection_size
+astrocytes,attention_zero_shot,27,15,6.248448621572012,6.666666666666667
+da_neurons,attention_zero_shot,22,6,6.127958031021717,5.333333333333333
+microglia,attention_zero_shot,46,4,9.466745248271701,3.25
+oligodendrocytes,attention_zero_shot,30,17,8.768772982414383,4.0
+astrocytes,attention_cssi,97,109,5.055369882705431,17.440366972477065
+da_neurons,attention_cssi,11,0,,
+microglia,attention_cssi,11,0,,
+oligodendrocytes,attention_cssi,74,64,4.674220393561409,15.703125
+astrocytes,attention_residualized_ols,19,9,8.001168652679759,3.4444444444444446
+da_neurons,attention_residualized_ols,22,6,6.127958031021717,5.333333333333333
+microglia,attention_residualized_ols,29,0,,
+oligodendrocytes,attention_residualized_ols,29,18,8.723197378425535,3.888888888888889

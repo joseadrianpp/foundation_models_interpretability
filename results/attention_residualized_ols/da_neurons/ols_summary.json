@@ -7,11 +7,15 @@
     "dropout_rate"
   ],
   "standardized_predictors": true,
-  "intercept": -0.0029605327325269307,
+  "intercept": -0.003518920550552088,
   "coefficients_standardized": {
-    "expression_mean": -0.011247059457652989,
-    "expression_variance": 0.0036444504805231495,
-    "dropout_rate": -0.011164525662316446
+    "expression_mean": -0.011162220255521962,
+    "expression_variance": 0.003933299621766279,
+    "dropout_rate": -0.011166906700291237
   },
-  "r_squared": 0.009998178716078887
+  "r_squared": 0.009952485829296531,
+  "f_statistic": 3.3374411308877203,
+  "f_p_value": 0.018845907098056162,
+  "f_test_df_model": 3,
+  "f_test_df_residual": 996
 }

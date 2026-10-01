@@ -1,6 +1,6 @@
 {
   "n_neighbors": 15,
-  "resolution": 0.2924017738212865,
+  "resolution": 0.334370152488211,
   "n_clusters": 6,
   "target_k": 6,
   "metric": "cosine",

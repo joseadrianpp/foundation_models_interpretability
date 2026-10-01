@@ -1,0 +1,5 @@
+cell_type,old_worker_position,old_file_vs_reconstructed_old,old_ranking_identical,new_file_vs_seed42,new_ranking_identical,old_vs_new_overlap,genes_in_top30_all_5_seeds,genes_in_top30_any_seed,frac_nonzero_values_tied_within_cell,frac_tokens_bin_changes_between_seeds,median_abs_bin_change,median_expressed_genes_per_cell
+astrocytes,1,30/30,True,30/30,True,30/30,13,53,0.9722675403790655,0.7408441086287425,4.0,222.0
+da_neurons,1,30/30,True,30/30,True,30/30,7,73,0.9642380267509448,0.7560035711387063,4.0,127.0
+microglia,2,30/30,True,30/30,True,17/30,10,66,0.9732348570165905,0.7715131656150422,4.0,178.0
+oligodendrocytes,2,30/30,True,30/30,True,17/30,8,70,0.9614904990053792,0.7544996309523264,4.0,114.0

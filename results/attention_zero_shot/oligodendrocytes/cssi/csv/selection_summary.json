@@ -1,0 +1,48 @@
+{
+  "top30": {
+    "k": 30,
+    "n_selected": 30,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/top30.csv"
+  },
+  "z-score": {
+    "mean": 0.08948527689669698,
+    "std": 0.12477517061789928,
+    "z_threshold": 2.5,
+    "threshold": 0.40142320344144516,
+    "fallback_top1": false,
+    "n_selected": 57,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/z-score.csv"
+  },
+  "otsu": {
+    "threshold": 0.6771437352688656,
+    "fallback_top1": false,
+    "n_bins": 256,
+    "n_selected": 1,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/otsu.csv"
+  },
+  "elbow": {
+    "k": 74,
+    "fallback": null,
+    "n_selected": 74,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/elbow.csv"
+  },
+  "permutation": {
+    "n_permutations": 50000,
+    "alpha": 0.05,
+    "effect_size_threshold": 0.5,
+    "selection_rule": "q < alpha AND abs(Cohen's d) >= effect_size",
+    "two_sided": true,
+    "multiple_testing": "Benjamini-Hochberg",
+    "n_donors": 29,
+    "n_donors_control": 14,
+    "n_donors_pd": 15,
+    "min_donors_per_group": 2,
+    "test": "two-sided donor-label Cohen's d, max-|d| over CSSI strata",
+    "n_selected": 0,
+    "n_audit_genes": 997,
+    "n_q_pass": 0,
+    "n_effect_pass": 914,
+    "output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/permutation.csv",
+    "audit_output": "/home/albertosv/foundation_models_interpretability/results/attention_zero_shot/oligodendrocytes/cssi/csv/permutation_audit.csv"
+  }
+}

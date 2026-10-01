@@ -1,0 +1,13 @@
+cell_type,data,n_genes,pi0,n_p_lt_0_01,expected_p_lt_0_01,min_q,n_q_lt_0_05,welch_n_q_lt_0_05
+astrocytes,attention (pooled),999,0.918918918918919,17,10.0,0.13985720285594289,0,0.0
+astrocytes,attention (CSSI),994,0.9114688128772636,12,9.9,0.19879006049697515,0,
+astrocytes,expression pseudobulk,1000,0.814,16,10.0,0.3099938001239975,0,0.0
+da_neurons,attention (pooled),980,1.0,8,9.8,0.7251854962900742,0,0.0
+da_neurons,attention (CSSI),944,1.0,5,9.4,0.998839661446724,0,
+da_neurons,expression pseudobulk,1000,1.0,5,10.0,0.9399812003759925,0,0.0
+microglia,attention (pooled),1000,0.962,7,10.0,0.9507777971930601,0,0.0
+microglia,attention (CSSI),993,1.0,7,9.9,0.9863996383514159,0,
+microglia,expression pseudobulk,1000,0.886,12,10.0,0.3133270667919975,0,0.0
+oligodendrocytes,attention (pooled),1000,1.0,9,10.0,0.8246346700972957,0,0.0
+oligodendrocytes,attention (CSSI),997,1.0,2,10.0,0.9887095596597802,0,
+oligodendrocytes,expression pseudobulk,1000,0.842,15,10.0,0.5408587480424305,0,0.0

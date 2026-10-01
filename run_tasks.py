@@ -12,8 +12,9 @@ attention and CSSI, and by the OLS task for residualized attention.
 
 GPU-bound model tasks (`attention` and `ig_lora`) can use --gpus to run
 independent cell-type workers on multiple GPUs. `attention_residualized_ols`
-is deliberately CPU-only because the regression/selection stage does not need
-CUDA and should never be routed through the multi-GPU model worker.
+runs on the single --device GPU: its scGPT forward pass needs CUDA (the
+flash-attention backend is fp16/bf16-only), while the regression/selection
+stage is numpy and is never routed through the multi-GPU model worker.
 """
 
 import argparse
@@ -34,7 +35,9 @@ from pipeline import config as C
 from pipeline.postprocess.enrichment import task_enrichment
 from pipeline.postprocess.enrichment_summary import task_enrichment_summary
 from pipeline.postprocess.gene_matrix import task_gene_matrix
+from pipeline.postprocess.gene_sets import SELECTIONS
 from pipeline.postprocess.gwas_similarity import task_gwas_similarity
+from pipeline.postprocess.plots import task_plots
 from pipeline.steps import _step7_common as common
 from pipeline.steps import attention_cssi_leiden as cssi
 from pipeline.steps import attention_dynamic_selection as dynamic
@@ -53,7 +56,9 @@ SEED = 42
 CSSI_N_NEIGHBORS = 15
 CSSI_TARGET_K = 6
 CSSI_MIN_CELLS_PER_CONDITION = 20
-DYNAMIC_PERMUTATIONS = 2000
+# BH over ~1000 genes needs >= m/alpha = 20k permutations for a single gene to
+# reach q < 0.05 (min q = m / (n_perm + 1)); 50k gives margin (min q ~ 0.02).
+DYNAMIC_PERMUTATIONS = dynamic.PERMUTATION_N
 DYNAMIC_PERMUTATION_ALPHA = 0.05
 DYNAMIC_PERMUTATION_EFFECT_SIZE = 0.5
 
@@ -167,6 +172,7 @@ def task_attention(results_dir: Path, device: torch.device, cell_types=None, don
         # Preserve the original baseline/output consumed by downstream tasks.
         _write_top_n(pooled_scores, out_dir / "top30_genes.csv")
         _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
+        _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
 
         donor_data = dynamic.collect_donor_attention_data(
             model,
@@ -261,13 +267,8 @@ def task_ig_lora(results_dir: Path, device: torch.device, cell_types=None) -> No
 
 
 def task_attention_residualized_ols(results_dir: Path, device: torch.device, donor_col=None) -> None:
-    # Explicit guard in addition to the CLI routing rule.
-    if device.type != "cpu":
-        raise ValueError(
-            "attention_residualized_ols is CPU-only; run it without --gpus "
-            "and do not pass a CUDA device."
-        )
-    residualized_ols.task_attention_residualized_ols(results_dir, torch.device("cpu"), donor_col)
+    residualized_ols.task_attention_residualized_ols(results_dir, device, donor_col)
+    torch.cuda.empty_cache()
 
 
 def _gpu_worker(task_name, gpu_id, cell_types, results_dir, donor_col=None):
@@ -306,7 +307,7 @@ MODEL_TASKS = {
     "ig_lora": task_ig_lora,
 }
 
-CPU_ONLY_TASKS = {
+SINGLE_GPU_TASKS = {
     "attention_residualized_ols": task_attention_residualized_ols,
 }
 
@@ -315,9 +316,10 @@ POSTPROCESS_TASKS = {
     "enrichment_summary": task_enrichment_summary,
     "gwas_similarity": task_gwas_similarity,
     "gene_matrix": task_gene_matrix,
+    "plots": task_plots,
 }
 
-TASKS = {**MODEL_TASKS, **CPU_ONLY_TASKS, **POSTPROCESS_TASKS}
+TASKS = {**MODEL_TASKS, **SINGLE_GPU_TASKS, **POSTPROCESS_TASKS}
 
 
 def _parse_gpus(value):
@@ -418,34 +420,36 @@ def main():
                    help="Donor/subject column in h5ad obs; auto-detected if omitted.")
 
     p.add_argument("--results-dir", type=Path, default=_HERE / "results")
+    p.add_argument("--selection", choices=SELECTIONS + ["all"], default="all",
+                   help="Gene-set selection used by the post-hoc tasks (default: all).")
     args = p.parse_args()
+    selections = SELECTIONS if args.selection == "all" else [args.selection]
 
     if args.gpus is not None:
         if args.task not in MODEL_TASKS:
             raise SystemExit(
                 "--gpus is only supported with GPU model tasks: "
-                "attention or ig_lora. attention_residualized_ols is CPU-only, "
-                "and --task all is not a multi-GPU task."
+                "attention or ig_lora. attention_residualized_ols uses the "
+                "single --device GPU, and --task all is not a multi-GPU task."
             )
 
         _run_multi_gpu(args.task, args.gpus, args.results_dir, args.donor_col)
         return
 
-    if args.task == "attention_residualized_ols":
-        # Never inherit --device for this task; OLS is explicitly CPU-only.
-        print("\n# attention_residualized_ols | CPU-only #", flush=True)
-        CPU_ONLY_TASKS[args.task](args.results_dir, torch.device("cpu"), args.donor_col)
-        return
-
     # Original single-GPU behavior for model tasks.
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    if args.task in SINGLE_GPU_TASKS:
+        print(f"\n# {args.task} | {device} #", flush=True)
+        SINGLE_GPU_TASKS[args.task](args.results_dir, device, args.donor_col)
+        return
 
     for name in (list(MODEL_TASKS) if args.task == "all" else [args.task]):
         print(f"\n# {name} #")
         if name in MODEL_TASKS:
             TASKS[name](args.results_dir, device)
         else:
-            TASKS[name](args.results_dir)
+            TASKS[name](args.results_dir, selections)
 
 
 if __name__ == "__main__":

@@ -13,5 +13,9 @@
     "expression_variance": -0.0029579560567855453,
     "dropout_rate": -0.004100712030356224
   },
-  "r_squared": 0.06667792887715696
+  "r_squared": 0.06667792887715696,
+  "f_statistic": 23.718578047322794,
+  "f_p_value": 7.85345334439502e-15,
+  "f_test_df_model": 3,
+  "f_test_df_residual": 996
 }

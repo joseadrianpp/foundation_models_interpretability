@@ -1,4 +1,2 @@
 source,native,name,p_value,significant,description,term_size,query_size,intersection_size,effective_domain_size,precision,recall,query,parents
-KEGG,KEGG:04510,Focal adhesion,0.026217355986398714,True,Focal adhesion,202,16,4,8716,0.25,0.019801980198019802,query_1,['KEGG:00000']
-GO:MF,GO:0005201,extracellular matrix structural constituent,0.0433971901422808,True,"""The action of a molecule that contributes to the structural integrity of the extracellular matrix."" [GOC:mah]",168,27,4,17354,0.14814814814814814,0.023809523809523808,query_1,['GO:0005198']
-KEGG,KEGG:05146,Amoebiasis,0.049940106959144075,True,Amoebiasis,102,16,3,8716,0.1875,0.029411764705882353,query_1,['KEGG:00000']
+KEGG,KEGG:05146,Amoebiasis,0.023407474383359536,True,Amoebiasis,102,13,3,8716,0.23076923076923078,0.029411764705882353,query_1,['KEGG:00000']
