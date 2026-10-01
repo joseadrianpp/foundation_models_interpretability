@@ -509,7 +509,8 @@ def main():
     np.random.seed(SEED)
 
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=list(TASKS) + ["all"], default="all")
+    p.add_argument("--task", choices=list(TASKS) + ["all", "postprocess"], default="all",
+                   help="all: model tasks + OLS tasks; postprocess: every post-hoc task in order.")
     p.add_argument("--dataset", choices=list(DATASET_DIRS), default="A")
 
     # Single-GPU device for model tasks.
@@ -558,8 +559,9 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # --task all runs the GPU-bound model tasks and then the OLS tasks built on
-    # their output; the post-hoc analyses are run individually.
-    names = list(MODEL_TASKS) + list(DERIVED_TASKS) if args.task == "all" else [args.task]
+    # their output; --task postprocess runs the post-hoc analyses in order.
+    names = {"all": list(MODEL_TASKS) + list(DERIVED_TASKS),
+             "postprocess": list(POSTPROCESS_TASKS)}.get(args.task, [args.task])
     for name in names:
         print(f"\n# {name} | Dataset {args.dataset} #", flush=True)
         if name in MODEL_TASKS:

@@ -2,7 +2,7 @@
 Summary statistics over the enrichment CSVs produced by `enrichment.py`:
 per (cell_type, method) term counts/IC/intersection size/functional
 abundance, and pairwise Mann-Whitney significance of the difference between
-methods.
+methods of the same model.
 """
 
 import itertools
@@ -13,7 +13,7 @@ import pandas as pd
 from scipy.stats import mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 
-from .gene_sets import CELL_TYPES, SELECTIONS, methods_for, output_dir
+from .gene_sets import CELL_TYPES, MODELS, SELECTIONS, methods_for, model_of, output_dir
 from .plots import plot_enrichment_summary
 
 METRICS = ["information_content", "intersection_size", "functional_abundance"]
@@ -81,30 +81,34 @@ def _build_summary_table(long_terms: pd.DataFrame, methods: list, sizes: dict) -
             })
     return pd.DataFrame(rows)
 
-# Mann-Whitney U test between every pair of methods, per cell_type and metric.
-# p-values are BH-adjusted within each (cell_type, metric) family of pairs.
+# Mann-Whitney U test between every pair of methods of the same model, per
+# cell_type and metric. p-values are BH-adjusted within each
+# (model, cell_type, metric) family of pairs.
 def _build_pairwise_tests(long_terms: pd.DataFrame, methods: list) -> pd.DataFrame:
     rows = []
-    for cell_type in CELL_TYPES:
-        for metric in METRICS:
-            family = []
-            for m1, m2 in itertools.combinations(methods, 2):
-                v1 = long_terms[(long_terms["cell_type"] == cell_type) & (long_terms["method"] == m1)][metric].dropna()
-                v2 = long_terms[(long_terms["cell_type"] == cell_type) & (long_terms["method"] == m2)][metric].dropna()
-                # Mann-Whitney needs at least 2 samples per side to be meaningful
-                p = np.nan if len(v1) < 2 or len(v2) < 2 else mannwhitneyu(v1, v2, alternative="two-sided").pvalue
-                family.append({"cell_type": cell_type, "metric": metric,
-                               "method_a": m1, "method_b": m2,
-                               "n_a": len(v1), "n_b": len(v2), "p_value": p})
-            p_values = np.array([r["p_value"] for r in family], dtype=float)
-            p_adj = np.full_like(p_values, np.nan)
-            tested = np.isfinite(p_values)
-            if tested.any():
-                p_adj[tested] = multipletests(p_values[tested], method="fdr_bh")[1]
-            for r, q in zip(family, p_adj):
-                r["p_adj_bh"] = q
-            rows += family
-    return pd.DataFrame(rows)
+    for model, cell_type, metric in itertools.product(MODELS, CELL_TYPES, METRICS):
+        model_methods = [m for m in methods if model_of(m) == model]
+        if len(model_methods) < 2:
+            continue
+        family = []
+        for m1, m2 in itertools.combinations(model_methods, 2):
+            v1 = long_terms[(long_terms["cell_type"] == cell_type) & (long_terms["method"] == m1)][metric].dropna()
+            v2 = long_terms[(long_terms["cell_type"] == cell_type) & (long_terms["method"] == m2)][metric].dropna()
+            # Mann-Whitney needs at least 2 samples per side to be meaningful
+            p = np.nan if len(v1) < 2 or len(v2) < 2 else mannwhitneyu(v1, v2, alternative="two-sided").pvalue
+            family.append({"model": model, "cell_type": cell_type, "metric": metric,
+                           "method_a": m1, "method_b": m2,
+                           "n_a": len(v1), "n_b": len(v2), "p_value": p})
+        p_values = np.array([r["p_value"] for r in family], dtype=float)
+        p_adj = np.full_like(p_values, np.nan)
+        tested = np.isfinite(p_values)
+        if tested.any():
+            p_adj[tested] = multipletests(p_values[tested], method="fdr_bh")[1]
+        for r, q in zip(family, p_adj):
+            r["p_adj_bh"] = q
+        rows += family
+    return pd.DataFrame(rows, columns=["model", "cell_type", "metric", "method_a", "method_b",
+                                       "n_a", "n_b", "p_value", "p_adj_bh"])
 
 
 def _summary_for_selection(results_dir: Path, selection: str) -> None:

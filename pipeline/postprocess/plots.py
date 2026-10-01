@@ -1,9 +1,13 @@
-"""Comparison plots between interpretability methods, per gene-set selection.
+"""Comparison plots between interpretability methods, per model and gene-set selection.
 
-Every plot is written under results/plots/; top-30 plots keep their original
-names and other selections get a `_<selection>` suffix (see gene_sets.plot_path).
-Colors follow the method (never its position), so the same method has the same
-color in every figure and selection.
+Every plot is written under results/dataset_*/plots/, one figure per model
+(`<name>_<model>.png`); top-30 plots have no selection suffix and other
+selections get a `_<selection>` suffix (see gene_sets.plot_path). Colors follow
+the ranking method (pooled / CSSI / OLS / fine-tuned), never its position, so
+the same ranking has the same color in every figure, model and selection.
+
+Every public plot_* function loops over the models and skips a model whose
+inputs are missing, so callers do not need to know which models were run.
 """
 
 import itertools
@@ -14,51 +18,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .gene_sets import CELL_TYPES, METHODS as METHODS_ORDER, SELECTIONS, load_genes, methods_for, output_dir, plot_path
+from .gene_sets import (ALL_SCORE_PATHS, CELL_TYPES, METHOD_META, METHODS, MODELS, SELECTIONS,
+                        SUMMARY_PATHS, load_genes, methods_for, output_dir, plot_path)
 
-METHOD_LABELS = {
-    "attention_zero_shot_scgpt": "scGPT zero-shot attention (pooled)",
-    "attention_cssi_scgpt": "scGPT CSSI-max attention (2.1)",
-    "attention_residualized_ols_scgpt": "scGPT OLS-residual attention (2.3)",
-    "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
-    "attention_zero_shot_geneformer": "Geneformer zero-shot attention (pooled)",
-    "attention_cssi_geneformer": "Geneformer CSSI-max attention",
-    "attention_residualized_ols_geneformer": "Geneformer OLS-residual attention",
-    "attention_lora_geneformer": "Geneformer LoRA (attention)",
-}
-METHOD_SHORT = {
-    "attention_zero_shot_scgpt": "Pooled",
-    "attention_cssi_scgpt": "CSSI",
-    "attention_residualized_ols_scgpt": "OLS resid.",
-    "ig_lora_scgpt": "IG LoRA",
-    "attention_zero_shot_geneformer": "GF pooled",
-    "attention_cssi_geneformer": "GF CSSI",
-    "attention_residualized_ols_geneformer": "GF OLS resid.",
-    "attention_lora_geneformer": "GF LoRA",
-}
-# Fixed categorical order (blue, orange, aqua, yellow, violet, brown, olive, magenta)
-METHOD_COLORS = {
-    "attention_zero_shot_scgpt": "#2a78d6",
-    "attention_cssi_scgpt": "#eb6834",
-    "attention_residualized_ols_scgpt": "#1baf7a",
-    "ig_lora_scgpt": "#eda100",
-    "attention_zero_shot_geneformer": "#7b5cd6",
-    "attention_cssi_geneformer": "#a0672b",
-    "attention_residualized_ols_geneformer": "#6f8f2f",
-    "attention_lora_geneformer": "#d6458f",
-}
-# Dynamic-selection summary (n_selected per rule) of the methods that have one
-SUMMARY_PATHS = {
-    "attention_zero_shot_scgpt": "attention_zero_shot_scgpt/{ct}/csv/selection_summary.json",
-    "attention_cssi_scgpt": "attention_zero_shot_scgpt/{ct}/cssi/csv/selection_summary.json",
-    "attention_residualized_ols_scgpt": "attention_residualized_ols_scgpt/{ct}/csv/selection_summary.json",
-    "attention_zero_shot_geneformer": "attention_zero_shot_geneformer/{ct}/csv/selection_summary.json",
-    "attention_cssi_geneformer": "attention_zero_shot_geneformer/{ct}/cssi/csv/selection_summary.json",
-    "attention_residualized_ols_geneformer": "attention_residualized_ols_geneformer/{ct}/csv/selection_summary.json",
-}
+MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer"}
+
+
+# Zero-shot rankings are colored by ranking; both LoRA variants share the fine-tuned color
+def _color_group(method: str) -> str:
+    meta = METHOD_META[method]
+    return "fine_tuned" if meta["model_form"] == "lora" else meta["ranking"]
+
+
+# Fixed categorical order (blue, orange, aqua, yellow): adjacent-pair CVD safe
+GROUP_COLORS = {"attention": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a", "fine_tuned": "#eda100"}
+GROUP_SHORT = {"attention": "Pooled", "cssi": "CSSI", "ols": "OLS resid."}
+METHOD_COLORS = {m: GROUP_COLORS[_color_group(m)] for m in METHODS}
+# Labels inside a figure: the model is already in the title
+METHOD_LABELS = {m: METHOD_META[m]["label"] for m in METHODS}
+METHOD_SHORT = {m: GROUP_SHORT.get(_color_group(m), "IG LoRA" if m == "ig_lora_scgpt" else "LoRA attn")
+                for m in METHODS}
+
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                     "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
-SELECTION_LABELS = {"top30": "static top-30", "elbow": "elbow (Kneedle)"}
+SELECTION_LABELS = {"top30": "static top-30", "z-score": "z-score (mean + 2.5 sd)",
+                    "elbow": "elbow (Kneedle)"}
+SELECTION_HATCH = {"top30": None, "z-score": "....", "elbow": "////"}
+# Parkinson's references of gwas_similarity.py / gene_matrix.py
+PD_REFERENCES = {"parkinson": "PD GWAS", "panelapp": "PD PanelApp",
+                 "parkinsonsuk_ucl": "PD ParkinsonsUK-UCL GO"}
 SIG_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
 
 INK = "#0b0b0b"
@@ -106,6 +94,21 @@ def _bar_offsets(n_methods: int):
     return width, [(i - (n_methods - 1) / 2) * width for i in range(n_methods)]
 
 
+class _NoData(Exception):
+    """A model has nothing to plot (its tasks were not run)."""
+
+
+# Run one per-model plot for every model, skipping models without inputs
+def _for_models(name: str, plot_one, *args) -> list:
+    paths = []
+    for model in MODELS:
+        try:
+            paths.append(plot_one(model, *args))
+        except (_NoData, FileNotFoundError) as exc:
+            print(f"  skipped {name} [{model}]: {exc}")
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # Enrichment summary
 # ---------------------------------------------------------------------------
@@ -137,6 +140,8 @@ def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame, metho
                         & (tests["p_adj_bh"] < 0.05)]
             level = max(tops[(cell_type, m)] for m in methods) + step
             for r in sig.itertuples():
+                if r.method_a not in pos or r.method_b not in pos:
+                    continue
                 x1, x2 = x[i] + pos[r.method_a], x[i] + pos[r.method_b]
                 ax.plot([x1, x1, x2, x2], [level - step * 0.3, level, level, level - step * 0.3],
                         color=INK, lw=0.8)
@@ -151,11 +156,15 @@ def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame, metho
     _style(ax)
 
 
-def plot_enrichment_summary(results_dir: Path, selection: str = "top30") -> Path:
+def _plot_enrichment_summary(model: str, results_dir: Path, selection: str) -> Path:
     summary_dir = output_dir(results_dir, "enrichment_summary", selection)
     summary = pd.read_csv(summary_dir / "summary_table.csv")
     tests = pd.read_csv(summary_dir / "pairwise_tests.csv")
-    methods = [m for m in methods_for(selection) if m in set(summary["method"])]
+    tests = tests[tests["model"] == model]
+    methods = [m for m in methods_for(selection, model)
+               if m in set(summary.loc[summary["n_query_genes"].notna(), "method"])]
+    if not methods:
+        raise _NoData("no enriched gene sets")
 
     panels = [
         ("n_significant_terms", None, "Number of significant\nGO/KEGG/REAC terms"),
@@ -166,34 +175,40 @@ def plot_enrichment_summary(results_dir: Path, selection: str = "top30") -> Path
     fig, axes = plt.subplots(1, len(panels), figsize=(20, 4.8))
     for ax, (metric, metric_key, title) in zip(axes, panels):
         _draw_enrichment_panel(ax, summary, tests, methods, metric, metric_key, title)
-    fig.suptitle(f"g:Profiler enrichment - {SELECTION_LABELS[selection]} gene sets "
+    fig.suptitle(f"{MODEL_LABELS[model]} - g:Profiler enrichment - {SELECTION_LABELS[selection]} gene sets "
                  "(brackets: Mann-Whitney, BH-adjusted p)", fontsize=12)
     _method_legend(fig, methods)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
-    return _save(fig, plot_path(results_dir, "enrichment_summary", selection))
+    return _save(fig, plot_path(results_dir, f"enrichment_summary_{model}", selection))
+
+
+def plot_enrichment_summary(results_dir: Path, selection: str = "top30") -> list:
+    return _for_models(f"enrichment_summary/{selection}", _plot_enrichment_summary, results_dir, selection)
 
 
 # ---------------------------------------------------------------------------
-# GWAS similarity (gene-level best match, from gene_matrix)
+# PD similarity (gene-level best match, from gene_matrix), one figure per PD reference
 # ---------------------------------------------------------------------------
 ONTOLOGIES = ["BP", "CC", "MF"]
 DISTANCE = "SimRel"
 DISEASE = "parkinson"
 
-# Per-gene closest match (row max) to the PD reference, tagged by method;
+# Per-gene closest match (row max) to one PD reference, tagged by method;
 # read straight from gene_matrix.py's matrix, not the pre-aggregated summary
-def _bestmatch_per_gene(results_dir: Path, selection: str, cell_type: str, ontology: str) -> pd.DataFrame:
+def _bestmatch_per_gene(results_dir: Path, selection: str, reference: str, cell_type: str,
+                        ontology: str) -> pd.DataFrame:
     path = (output_dir(results_dir, "gene_matrix", selection) / "matrices" / cell_type
-            / f"{DISEASE}__{DISTANCE}__{ontology}.csv")
+            / f"{reference}__{DISTANCE}__{ontology}.csv")
     mat = pd.read_csv(path, index_col=[0, 1])
     return mat.max(axis=1).rename("bestmatch").reset_index()
 
-def _draw_gwas_panel(ax, results_dir: Path, selection: str, methods: list, ontology: str) -> None:
+def _draw_gwas_panel(ax, results_dir: Path, selection: str, reference: str, methods: list,
+                     ontology: str) -> None:
     data, positions, colors = [], [], []
     tick_positions, tick_labels = [], []
     pos = 0.0
     for cell_type in CELL_TYPES:
-        df = _bestmatch_per_gene(results_dir, selection, cell_type, ontology)
+        df = _bestmatch_per_gene(results_dir, selection, reference, cell_type, ontology)
         group_start = pos
         for method in methods:
             vals = df.loc[df["method"] == method, "bestmatch"].to_numpy()
@@ -206,6 +221,8 @@ def _draw_gwas_panel(ax, results_dir: Path, selection: str, methods: list, ontol
         tick_labels.append(CELL_TYPE_LABELS[cell_type])
         pos += 0.8  # gap between cell types
 
+    if not data:
+        raise _NoData("no gene-matrix rows for this model")
     bp = ax.boxplot(data, positions=positions, widths=0.8, patch_artist=True, showfliers=False)
     for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color)
@@ -218,25 +235,50 @@ def _draw_gwas_panel(ax, results_dir: Path, selection: str, methods: list, ontol
     ax.set_title(f"GO:{ontology}", fontsize=11, fontweight="bold")
     _style(ax)
 
-def plot_gwas_similarity(results_dir: Path, selection: str = "top30") -> Path:
-    methods = methods_for(selection)
+def _plot_gwas_similarity(model: str, results_dir: Path, selection: str, reference: str) -> Path:
+    methods = methods_for(selection, model)
     fig, axes = plt.subplots(1, len(ONTOLOGIES), figsize=(15, 4.8), sharey=True)
-    for ax, ontology in zip(axes, ONTOLOGIES):
-        _draw_gwas_panel(ax, results_dir, selection, methods, ontology)
-    axes[0].set_ylabel(f"Best-match similarity to PD GWAS genes\n({DISTANCE}, per gene)", fontsize=10)
-    fig.suptitle(f"Closest PD GWAS gene per selected gene - {SELECTION_LABELS[selection]}", fontsize=12)
+    try:
+        for ax, ontology in zip(axes, ONTOLOGIES):
+            _draw_gwas_panel(ax, results_dir, selection, reference, methods, ontology)
+    except (_NoData, FileNotFoundError):
+        plt.close(fig)
+        raise
+    label = PD_REFERENCES[reference]
+    axes[0].set_ylabel(f"Best-match similarity to {label} genes\n({DISTANCE}, per gene)", fontsize=10)
+    fig.suptitle(f"{MODEL_LABELS[model]} - closest {label} gene per selected gene - "
+                 f"{SELECTION_LABELS[selection]}", fontsize=12)
     _method_legend(fig, methods)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
-    return _save(fig, plot_path(results_dir, "gwas_similarity", selection))
+    return _save(fig, plot_path(results_dir, f"gwas_similarity_{reference}_{model}", selection))
+
+
+def plot_gwas_similarity(results_dir: Path, selection: str = "top30") -> list:
+    paths = []
+    for reference in PD_REFERENCES:
+        paths += _for_models(f"gwas_similarity/{reference}/{selection}", _plot_gwas_similarity,
+                             results_dir, selection, reference)
+    return paths
 
 
 # ---------------------------------------------------------------------------
-# GWAS set-level similarity (BMA, from gwas_similarity), PD vs control diseases
+# Disease set-level similarity (BMA, from gwas_similarity): PD GWAS bars, the
+# two PD panels and the control diseases as markers
 # ---------------------------------------------------------------------------
-def plot_gwas_set_similarity(results_dir: Path, selection: str = "top30") -> Path:
+REFERENCE_MARKERS = [  # (reference, marker, filled, legend label)
+    ("panelapp", "^", True, "vs PD PanelApp"),
+    ("parkinsonsuk_ucl", "s", True, "vs PD ParkinsonsUK-UCL GO"),
+    ("alzheimer", "o", False, "vs Alzheimer (control)"),
+    ("cad", "x", True, "vs CAD (control)"),
+]
+
+
+def _plot_gwas_set_similarity(model: str, results_dir: Path, selection: str) -> Path:
     df = pd.read_csv(output_dir(results_dir, "gwas_similarity", selection) / "gene_level_similarity_all.csv")
     df = df[df["distance"] == DISTANCE]
-    methods = [m for m in methods_for(selection) if m in set(df["method"])]
+    methods = [m for m in methods_for(selection, model) if m in set(df["method"])]
+    if not methods:
+        raise _NoData("no similarity rows for this model")
     x = np.arange(len(CELL_TYPES))
     width, offsets = _bar_offsets(len(methods))
 
@@ -246,26 +288,34 @@ def plot_gwas_set_similarity(results_dir: Path, selection: str = "top30") -> Pat
         for method, off in zip(methods, offsets):
             pd_vals = [sub.get(("parkinson", method, c), np.nan) for c in CELL_TYPES]
             ax.bar(x + off, pd_vals, width=width * 0.92, color=METHOD_COLORS[method])
-            # Control diseases: the PD bar only means something relative to these
-            for ref, marker in [("alzheimer", "o"), ("cad", "x")]:
+            # Other PD references and control diseases: the PD GWAS bar only
+            # means something relative to the controls
+            for ref, marker, filled, _ in REFERENCE_MARKERS:
                 vals = [sub.get((ref, method, c), np.nan) for c in CELL_TYPES]
-                ax.scatter(x + off, vals, marker=marker, s=22, color=INK, zorder=3,
-                           facecolors="none" if marker == "o" else INK, linewidths=1)
+                ax.scatter(x + off, vals, marker=marker, s=22, zorder=3, linewidths=1,
+                           color=INK, facecolors=INK if filled else "none")
         ax.set_xticks(x)
         ax.set_xticklabels([CELL_TYPE_LABELS[c] for c in CELL_TYPES], rotation=20, ha="right")
         ax.set_title(f"GO:{ontology}", fontsize=11, fontweight="bold")
         _style(ax)
-    axes[0].set_ylabel(f"Gene-set similarity to GWAS genes\n({DISTANCE}, BMA)", fontsize=10)
+    axes[0].set_ylabel(f"Gene-set similarity to reference genes\n({DISTANCE}, BMA)", fontsize=10)
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in methods]
-    handles += [plt.Line2D([], [], ls="", marker="o", mfc="none", mec=INK),
-                plt.Line2D([], [], ls="", marker="x", color=INK)]
-    labels = [f"{METHOD_LABELS[m]} vs PD (bar)" for m in methods] + ["vs Alzheimer (control)", "vs CAD (control)"]
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9,
-               bbox_to_anchor=(0.5, -0.1))
-    fig.suptitle(f"GWAS gene-set similarity - {SELECTION_LABELS[selection]}", fontsize=12)
+    labels = [f"{METHOD_LABELS[m]} vs PD GWAS (bar)" for m in methods]
+    for _, marker, filled, label in REFERENCE_MARKERS:
+        handles.append(plt.Line2D([], [], ls="", marker=marker, color=INK,
+                                  mfc=INK if filled else "none", mec=INK))
+        labels.append(label)
+    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=9,
+               bbox_to_anchor=(0.5, -0.12))
+    fig.suptitle(f"{MODEL_LABELS[model]} - disease gene-set similarity - {SELECTION_LABELS[selection]}",
+                 fontsize=12)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
-    return _save(fig, plot_path(results_dir, "gwas_set_similarity", selection))
+    return _save(fig, plot_path(results_dir, f"gwas_set_similarity_{model}", selection))
+
+
+def plot_gwas_set_similarity(results_dir: Path, selection: str = "top30") -> list:
+    return _for_models(f"gwas_set_similarity/{selection}", _plot_gwas_set_similarity, results_dir, selection)
 
 
 # ---------------------------------------------------------------------------
@@ -276,11 +326,14 @@ def _jaccard(a: list, b: list) -> float:
     return len(a & b) / len(a | b) if a | b else np.nan
 
 
-def plot_gene_set_overlap(results_dir: Path, selection: str = "top30") -> Path:
-    methods = methods_for(selection)
+def _plot_gene_set_overlap(model: str, results_dir: Path, selection: str) -> Path:
+    methods = methods_for(selection, model)
+    sets_by_ct = {ct: {m: load_genes(results_dir, m, selection, ct) for m in methods} for ct in CELL_TYPES}
+    if not any(s for sets in sets_by_ct.values() for s in sets.values()):
+        raise _NoData("no gene lists")
     fig, axes = plt.subplots(1, len(CELL_TYPES), figsize=(4 * len(CELL_TYPES), 4.2))
     for ax, cell_type in zip(axes, CELL_TYPES):
-        sets = {m: load_genes(results_dir, m, selection, cell_type) for m in methods}
+        sets = sets_by_ct[cell_type]
         n = len(methods)
         mat = np.full((n, n), np.nan)
         for i, j in itertools.product(range(n), range(n)):
@@ -298,17 +351,27 @@ def plot_gene_set_overlap(results_dir: Path, selection: str = "top30") -> Path:
         ax.set_yticks(range(n))
         ax.set_yticklabels(labels, fontsize=8)
         ax.set_title(CELL_TYPE_LABELS[cell_type], fontsize=11, fontweight="bold")
-    fig.suptitle(f"Gene-set overlap between methods - {SELECTION_LABELS[selection]} "
+    fig.suptitle(f"{MODEL_LABELS[model]} - gene-set overlap between methods - {SELECTION_LABELS[selection]} "
                  "(Jaccard index, shared genes in brackets)", fontsize=12)
     fig.tight_layout()
-    return _save(fig, plot_path(results_dir, "gene_set_overlap", selection))
+    return _save(fig, plot_path(results_dir, f"gene_set_overlap_{model}", selection))
 
 
-def plot_gene_set_sizes(results_dir: Path) -> Path:
-    """Number of genes each method selects per selection rule (all dynamic rules)."""
-    rules = ["top30", "z-score", "elbow"]
-    sources = SUMMARY_PATHS
-    methods = list(sources)
+def plot_gene_set_overlap(results_dir: Path, selection: str = "top30") -> list:
+    return _for_models(f"gene_set_overlap/{selection}", _plot_gene_set_overlap, results_dir, selection)
+
+
+def _summary(results_dir: Path, method: str, cell_type: str):
+    path = results_dir / SUMMARY_PATHS[method].format(ct=cell_type)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _plot_gene_set_sizes(model: str, results_dir: Path) -> Path:
+    """Number of genes each method selects per selection rule."""
+    methods = [m for m in SUMMARY_PATHS if METHOD_META[m]["model"] == model]
+    if not any(_summary(results_dir, m, ct) for m in methods for ct in CELL_TYPES):
+        raise _NoData("no selection summaries")
+    rules = SELECTIONS
     fig, axes = plt.subplots(1, len(rules), figsize=(4 * len(rules), 4.2), sharey=True)
     x = np.arange(len(CELL_TYPES))
     width, offsets = _bar_offsets(len(methods))
@@ -316,65 +379,55 @@ def plot_gene_set_sizes(results_dir: Path) -> Path:
         for method, off in zip(methods, offsets):
             vals = []
             for cell_type in CELL_TYPES:
-                path = results_dir / sources[method].format(ct=cell_type)
-                n = np.nan
-                if path.exists():
-                    n = json.loads(path.read_text()).get(rule, {}).get("n_selected", np.nan)
-                vals.append(n)
+                summary = _summary(results_dir, method, cell_type)
+                vals.append(np.nan if summary is None else summary.get(rule, {}).get("n_selected", np.nan))
             bars = ax.bar(x + off, vals, width=width * 0.92, color=METHOD_COLORS[method])
             ax.bar_label(bars, labels=["" if pd.isna(v) else int(v) for v in vals],
                          fontsize=7, color=INK_2, padding=1)
         ax.set_xticks(x)
         ax.set_xticklabels([CELL_TYPE_LABELS[c] for c in CELL_TYPES], rotation=20, ha="right")
-        ax.set_title(rule, fontsize=11, fontweight="bold")
+        ax.set_title(SELECTION_LABELS[rule], fontsize=11, fontweight="bold")
         _style(ax)
     axes[0].set_ylabel("Genes selected")
-    fig.suptitle("Gene-set size per selection rule", fontsize=12)
+    fig.suptitle(f"{MODEL_LABELS[model]} - gene-set size per selection rule", fontsize=12)
     _method_legend(fig, methods)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
-    return _save(fig, results_dir / "plots" / "gene_set_sizes.png")
+    return _save(fig, results_dir / "plots" / f"gene_set_sizes_{model}.png")
+
+
+def plot_gene_set_sizes(results_dir: Path) -> list:
+    return _for_models("gene_set_sizes", _plot_gene_set_sizes, results_dir)
 
 
 # ---------------------------------------------------------------------------
 # Dynamic cut-offs on each attention method's ranked score curve
 # ---------------------------------------------------------------------------
-# All-gene score files (rank, gene, score). Pooled attention has no dedicated
-# all-gene file in older runs, so the permutation audit (one row per testable
-# gene) is used as fallback.
-ALL_SCORE_PATHS = {
-    "attention_zero_shot_scgpt": ["attention_zero_shot_scgpt/{ct}/csv/all_genes.csv",
-                                  "attention_zero_shot_scgpt/{ct}/csv/permutation_audit.csv"],
-    "attention_cssi_scgpt": ["attention_zero_shot_scgpt/{ct}/cssi_genes.csv"],
-    "attention_residualized_ols_scgpt": ["attention_residualized_ols_scgpt/{ct}/csv/ols.csv"],
-    "attention_zero_shot_geneformer": ["attention_zero_shot_geneformer/{ct}/csv/all_genes.csv"],
-    "attention_cssi_geneformer": ["attention_zero_shot_geneformer/{ct}/cssi_genes.csv"],
-    "attention_residualized_ols_geneformer": ["attention_residualized_ols_geneformer/{ct}/csv/ols.csv"],
-}
 CUTOFF_STYLES = {"top30": ":", "z-score": "--", "elbow": "-"}
 MAX_RANK_SHOWN = 200
 
 
 def _all_scores(results_dir: Path, method: str, cell_type: str):
-    for rel in ALL_SCORE_PATHS[method]:
-        path = results_dir / rel.format(ct=cell_type)
-        if path.exists():
-            return np.sort(pd.read_csv(path)["score"].to_numpy(dtype=float))[::-1]
-    return None
+    path = results_dir / ALL_SCORE_PATHS[method].format(ct=cell_type)
+    if not path.exists():
+        return None
+    return np.sort(pd.read_csv(path)["score"].to_numpy(dtype=float))[::-1]
 
 
-def plot_dynamic_selection(results_dir: Path) -> Path:
-    methods = list(ALL_SCORE_PATHS)
-    fig, axes = plt.subplots(len(methods), len(CELL_TYPES), figsize=(4 * len(CELL_TYPES), 3.2 * len(methods)))
+def _plot_dynamic_selection(model: str, results_dir: Path) -> Path:
+    methods = [m for m in ALL_SCORE_PATHS if METHOD_META[m]["model"] == model]
+    if not any(_all_scores(results_dir, m, ct) is not None for m in methods for ct in CELL_TYPES):
+        raise _NoData("no all-gene score files")
+    fig, axes = plt.subplots(len(methods), len(CELL_TYPES), squeeze=False,
+                             figsize=(4 * len(CELL_TYPES), 3.2 * len(methods)))
     for r, method in enumerate(methods):
         for c, cell_type in enumerate(CELL_TYPES):
             ax = axes[r, c]
             scores = _all_scores(results_dir, method, cell_type)
-            summary_path = results_dir / SUMMARY_PATHS[method].format(ct=cell_type)
-            if scores is None or not summary_path.exists():
+            summary = _summary(results_dir, method, cell_type)
+            if scores is None or summary is None:
                 ax.text(0.5, 0.5, "missing", ha="center", va="center", color=MUTED, transform=ax.transAxes)
                 ax.set_axis_off()
                 continue
-            summary = json.loads(summary_path.read_text())
             shown = scores[:MAX_RANK_SHOWN]
             ax.plot(np.arange(1, len(shown) + 1), shown, color=METHOD_COLORS[method], lw=2)
             for rule, ls in CUTOFF_STYLES.items():
@@ -389,18 +442,30 @@ def plot_dynamic_selection(results_dir: Path) -> Path:
             if r == len(methods) - 1:
                 ax.set_xlabel(f"Gene rank (first {MAX_RANK_SHOWN})")
             _style(ax)
-    fig.suptitle("Ranked score curves and dynamic cut-offs per attention method", fontsize=12)
+    fig.suptitle(f"{MODEL_LABELS[model]} - ranked score curves and dynamic cut-offs per attention method",
+                 fontsize=12)
     fig.tight_layout()
-    return _save(fig, results_dir / "plots" / "dynamic_selection_cutoffs.png")
+    return _save(fig, results_dir / "plots" / f"dynamic_selection_cutoffs_{model}.png")
+
+
+def plot_dynamic_selection(results_dir: Path) -> list:
+    return _for_models("dynamic_selection_cutoffs", _plot_dynamic_selection, results_dir)
 
 
 # ---------------------------------------------------------------------------
 # Method 2.3 diagnostics: what OLS removes from the attention score
 # ---------------------------------------------------------------------------
-def plot_ols_residualization(results_dir: Path) -> Path:
+OLS_COVARIATES = {"scgpt": "expression mean/variance/dropout",
+                  "geneformer": "rank pseudo-expression mean/variance/dropout"}
+
+
+def _plot_ols_residualization(model: str, results_dir: Path) -> Path:
+    bases = {ct: results_dir / f"attention_residualized_ols_{model}" / ct for ct in CELL_TYPES}
+    if not any((b / "residualized_genes.csv").exists() for b in bases.values()):
+        raise _NoData("no OLS outputs")
     fig, axes = plt.subplots(2, len(CELL_TYPES), figsize=(4 * len(CELL_TYPES), 7.5))
     for c, cell_type in enumerate(CELL_TYPES):
-        base = results_dir / "attention_residualized_ols_scgpt" / cell_type
+        base = bases[cell_type]
         path = base / "residualized_genes.csv"
         if not path.exists():
             for ax in axes[:, c]:
@@ -420,10 +485,10 @@ def plot_ols_residualization(results_dir: Path) -> Path:
             ax = axes[r, c]
             ax.scatter(df.loc[rest, "attention_score"], df.loc[rest, ycol], s=6, color="#c3c2b7", lw=0)
             ax.scatter(df.loc[only_raw, "attention_score"], df.loc[only_raw, ycol], s=18,
-                       color=METHOD_COLORS["attention_zero_shot_scgpt"], edgecolors=SURFACE, lw=0.6,
+                       color=METHOD_COLORS[f"attention_zero_shot_{model}"], edgecolors=SURFACE, lw=0.6,
                        label="top-30 raw only")
             ax.scatter(df.loc[only_res, "attention_score"], df.loc[only_res, ycol], s=18,
-                       color=METHOD_COLORS["attention_residualized_ols_scgpt"], edgecolors=SURFACE, lw=0.6,
+                       color=METHOD_COLORS[f"attention_residualized_ols_{model}"], edgecolors=SURFACE, lw=0.6,
                        label="top-30 residual only")
             ax.scatter(df.loc[in_both, "attention_score"], df.loc[in_both, ycol], s=18,
                        color=INK, edgecolors=SURFACE, lw=0.6, label="top-30 in both")
@@ -439,19 +504,23 @@ def plot_ols_residualization(results_dir: Path) -> Path:
             if r == 1:
                 ax.set_xlabel("attention_score (PD - control)")
             _style(ax)
-    handles, labels = axes[1, 0].get_legend_handles_labels()
+    handles, labels = next((ax.get_legend_handles_labels() for ax in axes[1] if ax.get_legend_handles_labels()[0]),
+                           ([], []))
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=10,
                bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle("Method 2.3: attention explained by expression mean/variance/dropout (top) "
+    fig.suptitle(f"{MODEL_LABELS[model]} - method 2.3: attention explained by {OLS_COVARIATES[model]} (top) "
                  "vs residual kept for ranking (bottom; dashed y = x)", fontsize=12)
     fig.tight_layout(rect=[0, 0.03, 1, 1])
-    return _save(fig, results_dir / "plots" / "ols_residualization.png")
+    return _save(fig, results_dir / "plots" / f"ols_residualization_{model}.png")
+
+
+def plot_ols_residualization(results_dir: Path) -> list:
+    return _for_models("ols_residualization", _plot_ols_residualization, results_dir)
 
 
 # ---------------------------------------------------------------------------
-# Static top-30 vs elbow, per method: set size, enrichment and PD similarity
+# Selections compared per method: set size, enrichment and PD similarity
 # ---------------------------------------------------------------------------
-SELECTION_HATCH = {"top30": None, "elbow": "////"}
 GWAS_ONTOLOGY = "BP"
 
 
@@ -466,10 +535,10 @@ def _selection_metrics(results_dir: Path, selection: str) -> pd.DataFrame:
     return df
 
 
-def plot_selection_comparison(results_dir: Path, selections=SELECTIONS) -> Path:
-    df = pd.concat([_selection_metrics(results_dir, s) for s in selections], ignore_index=True)
-    df.to_csv(results_dir / "plots" / "selection_comparison.csv", index=False)
-    methods = [m for m in METHODS_ORDER if m in set(df["method"])]
+def _plot_selection_comparison(model: str, results_dir: Path, df: pd.DataFrame, selections) -> Path:
+    methods = [m for m in METHODS if METHOD_META[m]["model"] == model and m in set(df["method"])]
+    if not methods:
+        raise _NoData("no enrichment/similarity rows for this model")
     rows = [("n_query_genes", "Genes in set"),
             ("n_significant_terms", "Significant\nGO/KEGG/REAC terms"),
             ("similarity", f"PD GWAS similarity\n({DISTANCE}, BMA, GO:{GWAS_ONTOLOGY})")]
@@ -505,10 +574,17 @@ def plot_selection_comparison(results_dir: Path, selections=SELECTIONS) -> Path:
         labels.append(SELECTION_LABELS[selection])
     fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False, fontsize=9,
                bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle("Static top-30 (solid) vs elbow (hatched) gene sets per method "
-                 "(IG LoRA has no elbow set)", fontsize=12)
+    fig.suptitle(f"{MODEL_LABELS[model]} - gene sets per method and selection "
+                 "(LoRA variants only have a top-30 set)", fontsize=12)
     fig.tight_layout(rect=[0, 0.03, 1, 1])
-    return _save(fig, results_dir / "plots" / "selection_comparison.png")
+    return _save(fig, results_dir / "plots" / f"selection_comparison_{model}.png")
+
+
+def plot_selection_comparison(results_dir: Path, selections=SELECTIONS) -> list:
+    df = pd.concat([_selection_metrics(results_dir, s) for s in selections], ignore_index=True)
+    (results_dir / "plots").mkdir(parents=True, exist_ok=True)
+    df.to_csv(results_dir / "plots" / "selection_comparison.csv", index=False)
+    return _for_models("selection_comparison", _plot_selection_comparison, results_dir, df, selections)
 
 
 def task_plots(results_dir: Path, selections=SELECTIONS) -> None:
