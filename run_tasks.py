@@ -43,7 +43,7 @@ from pipeline.postprocess.enrichment import task_enrichment
 from pipeline.postprocess.enrichment_summary import task_enrichment_summary
 from pipeline.postprocess.gene_matrix import task_gene_matrix
 from pipeline.postprocess.gene_sets import SELECTIONS
-from pipeline.postprocess.gwas_similarity import task_gwas_similarity
+from pipeline.postprocess.gwas_similarity import DEFAULT_DISTANCES as GO3_DISTANCES, task_gwas_similarity
 from pipeline.postprocess.plots import task_plots
 from pipeline.steps import _step7_common as common
 from pipeline.steps import _step7_geneformer as gf
@@ -116,7 +116,25 @@ def _load_full_dataset_geneformer(data_dir: Path):
 
 
 # Default task options; main() overrides them from the command line
-DEFAULT_OPTS = {"donor_col": None, "permutation": False, "max_cells_per_type": None}
+DEFAULT_OPTS = {"donor_col": None, "permutation": False, "max_cells_per_type": None,
+                "batch_scale": "auto"}
+
+# The model batch sizes (scGPT attention 16, Geneformer attention 8, IG 8 cells
+# in chunks of 32) fit an 8 GB GPU. --batch-scale multiplies all of them;
+# "auto" takes one step per GPU_GIB_PER_SCALE of GPU memory (RTX 2070 x1,
+# L40 x4, H100 x7, H200 x8), capped at MAX_BATCH_SCALE
+GPU_GIB_PER_SCALE = 10
+MAX_BATCH_SCALE = 8
+
+
+def _batch_scale(device: torch.device, opts: dict) -> int:
+    scale = opts["batch_scale"]
+    if scale != "auto":
+        return max(1, int(scale))
+    if device.type != "cuda":
+        return 1
+    gib = torch.cuda.get_device_properties(device).total_memory / 2**30
+    return int(max(1, min(MAX_BATCH_SCALE, gib // GPU_GIB_PER_SCALE)))
 
 
 # Indices of one cell type, optionally a seeded random subset of at most
@@ -255,12 +273,13 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
 def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
                          cell_types=None, opts=None) -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
+    scale = _batch_scale(device, opts)
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset_scgpt(data_dir)
     model = common._load_zero_shot_model(vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
-        print(f"\n# attention_scgpt | {ct} | {sub.n_obs:,} cells | {device} #", flush=True)
+        print(f"\n# attention_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} #", flush=True)
         pt = common._tokenise(sub, vocab)
 
         donor_ids = None
@@ -270,7 +289,8 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
             print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
 
         # One forward pass; pooled, CSSI and donor-level scores all read this cache
-        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2)
+        cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2,
+                                   batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale)
         _write_attention_outputs(cache, results_dir / "attention_zero_shot_scgpt" / slug, donor_ids)
 
     del model
@@ -280,6 +300,7 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
 def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
                        cell_types=None, opts=None) -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
+    scale = _batch_scale(device, opts)
     vocab, model_configs = load_vocab(), load_model_configs()
     adata = _load_full_dataset_scgpt(data_dir)
 
@@ -287,11 +308,13 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
     model = common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
-        print(f"\n=== ig_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} ===", flush=True)
+        print(f"\n=== ig_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
 
         pt = common._tokenise(sub, vocab)
 
-        mean_abs, gate = ig._compute_ig_importance(model, pt, vocab, device)
+        mean_abs, gate = ig._compute_ig_importance(
+            model, pt, vocab, device, batch_size=ig.IG_BATCH_SIZE * scale,
+            internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale)
 
         if not gate["ok"]:
             print(f"  skipped: {gate['reason']}", flush=True)
@@ -303,34 +326,12 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
     torch.cuda.empty_cache()
 
 
-# Attention per gene per condition of one Geneformer model, for every cell type
-# (used by the LoRA task: top-30 of the correctly classified cells)
-def _attention_geneformer(model, method: str, use_predictions: bool, data_dir: Path,
-                          results_dir: Path, device: torch.device, cell_types=None,
-                          max_cells=None) -> None:
-    # See geneformer_model.py for this functions description
-    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
-    ds = _load_full_dataset_geneformer(data_dir)
-    for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, max_cells):
-        print(f"\n# {method} | {ct} | {sub.num_rows:,} cells | {device} #", flush=True)
-        pt = gf._to_inputs(sub)
-        means, gate = gf._compute_attn_per_gene_per_condition(
-            model, pt, token_dict, gene_names, device, use_predictions,
-        )
-        if not gate["ok"]:
-            print(f"  skipped: {gate['reason']}", flush=True)
-            continue
-
-        # Same score and top N file as the scGPT attention
-        scores = common._gene_scores(means, _signed_score)
-        _write_top_n(scores, results_dir / method / slug / "top30_genes.csv")
-
-
 def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
                               cell_types=None, opts=None) -> None:
     # Like the scGPT attention task: every cell, grouped by its true label,
     # with the same pooled + CSSI scores and dynamic selections
     opts = {**DEFAULT_OPTS, **(opts or {})}
+    scale = _batch_scale(device, opts)
     if opts["permutation"]:
         print("  --permutation ignored: the Geneformer datasets have no donor column", flush=True)
     token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
@@ -338,8 +339,10 @@ def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.d
     model = gf._load_zero_shot_model(device)
 
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
-        print(f"\n# attention_geneformer | {ct} | {sub.num_rows:,} cells | {device} #", flush=True)
-        cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device)
+        print(f"\n# attention_geneformer | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #",
+              flush=True)
+        cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device,
+                                        batch_size=gf.ATTN_BATCH_SIZE * scale)
         _write_attention_outputs(cache, results_dir / "attention_zero_shot_geneformer" / slug)
 
     del model
@@ -348,11 +351,27 @@ def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.d
 
 def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
                                    cell_types=None, opts=None) -> None:
+    # Pooled attention score of the LoRA classifier, only on the cells it
+    # classifies correctly (the same convention as upstream), top-30
     opts = {**DEFAULT_OPTS, **(opts or {})}
-    # With the LoRA classifier only the correctly classified cells are used
+    scale = _batch_scale(device, opts)
+    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    ds = _load_full_dataset_geneformer(data_dir)
     model = gf._load_lora_model(data_dir / LORA_DIR_GENEFORMER, device)
-    _attention_geneformer(model, "attention_lora_geneformer", True, data_dir, results_dir,
-                          device, cell_types, opts["max_cells_per_type"])
+
+    for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
+        print(f"\n# attention_lora_geneformer | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #",
+              flush=True)
+        cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device,
+                                        batch_size=gf.ATTN_BATCH_SIZE * scale, use_predictions=True)
+        n_correct = {c: int(np.sum(cache.correct & (cache.labels == c))) for c in (0, 1)}
+        if min(n_correct.values()) == 0:
+            print(f"  skipped: correctly-classified counts: control={n_correct[0]}, pd={n_correct[1]}",
+                  flush=True)
+            continue
+        scores = common._gene_scores(cssi.condition_means(cache, cache.correct), _signed_score)
+        _write_top_n(scores, results_dir / "attention_lora_geneformer" / slug / "top30_genes.csv")
+
     del model
     torch.cuda.empty_cache()
 
@@ -404,6 +423,8 @@ POSTPROCESS_TASKS = {
 }
 
 TASKS = {**MODEL_TASKS, **DERIVED_TASKS, **POSTPROCESS_TASKS}
+# Post-hoc tasks that compute GO3 similarities (take --distances)
+GO3_TASKS = {"gwas_similarity", "gene_matrix"}
 
 
 def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, opts):
@@ -531,14 +552,22 @@ def main():
                    help="Also run the donor-level permutation selector (scGPT only, slow).")
     p.add_argument("--max-cells-per-type", type=int, default=None,
                    help="Seeded random subset of at most N cells per cell type (quick test runs).")
+    p.add_argument("--batch-scale", default="auto",
+                   help="Multiplier of the model batch sizes (tuned for 8 GB); 'auto' (default) "
+                        "scales with GPU memory: x1 per 10 GiB, up to x8.")
 
     p.add_argument("--results-dir", type=Path, default=_HERE / "results")
     p.add_argument("--selection", choices=SELECTIONS + ["all"], default="all",
                    help="Gene-set selection used by the post-hoc tasks (default: all).")
+    p.add_argument("--distances", nargs="+", choices=GO3_DISTANCES, default=GO3_DISTANCES,
+                   help="GO term similarities for gwas_similarity/gene_matrix (default: all three; "
+                        "the plots use SimRel).")
     args = p.parse_args()
+    if args.batch_scale != "auto" and not args.batch_scale.isdigit():
+        p.error("--batch-scale must be 'auto' or a positive integer")
     selections = SELECTIONS if args.selection == "all" else [args.selection]
     opts = {"donor_col": args.donor_col, "permutation": args.permutation,
-            "max_cells_per_type": args.max_cells_per_type}
+            "max_cells_per_type": args.max_cells_per_type, "batch_scale": args.batch_scale}
 
     # Each dataset writes to its own folder (results/dataset_a, results/dataset_b),
     # so the post-hoc analyses never mix the two
@@ -568,6 +597,8 @@ def main():
             TASKS[name](data_dir, results_dir, device, None, opts)
         elif name in DERIVED_TASKS:
             TASKS[name](data_dir, results_dir, opts)
+        elif name in GO3_TASKS:
+            TASKS[name](results_dir, selections, distances=args.distances)
         else:
             TASKS[name](results_dir, selections)
 

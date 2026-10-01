@@ -21,14 +21,11 @@ import numpy as np
 import pandas as pd
 from scipy.stats import skew as scipy_skew
 
-import go3
-
 from . import _go3_common as g3c
 from .gene_sets import CELL_TYPES, SELECTIONS, load_genes, methods_for, output_dir
 from .gwas_similarity import DEFAULT_DISTANCES
 from .plots import plot_gwas_similarity
 
-GROUPWISE = "bma"
 ONTOLOGIES = ["BP", "CC", "MF"]
 # Diseases to compare against: the PD GWAS set and the two PD panels
 DEFAULT_DISEASES = ["parkinson", "panelapp", "parkinsonsuk_ucl"]
@@ -51,20 +48,10 @@ def _load_refs(refs_dir: Path, diseases: list) -> dict:
     return {d: pd.read_csv(refs_dir / f"{d}_genes.csv")["gene"].astype(str).tolist() for d in diseases}
 
 
-# Map (method_gene, ref_gene) to similarity for every needed pair, deduplicated
-# once per (ontology, distance) so the same pair is never scored twice
-def _similarity_lookup(entries: list, refs: dict, ont: str, distance: str, counter) -> dict:
-    method_genes = sorted({g for e in entries for g in e["genes"]})
-    ref_genes = sorted({g for genes in refs.values() for g in genes})
-    pairs = [(a, b) for a in method_genes for b in ref_genes]
-    sims = go3.compare_gene_pairs_batch(pairs, ont, distance, GROUPWISE, counter)
-    return dict(zip(pairs, sims))
-
-
-# (len(genes) x len(ref_genes)) matrix of similarities, read from the lookup
-def _build_matrix(genes: list, ref_genes: list, lut: dict) -> pd.DataFrame:
-    data = [[lut[(g, r)] for r in ref_genes] for g in genes]
-    return pd.DataFrame(data, index=genes, columns=ref_genes, dtype=float)
+# (len(genes) x len(ref_genes)) matrix of similarities, read from the shared
+# gene-pair cache (_go3_common.pair_similarities, groupwise BMA per gene pair)
+def _build_matrix(genes: list, ref_genes: list, pm: g3c.PairMatrix) -> pd.DataFrame:
+    return pd.DataFrame(pm.block(genes, ref_genes), index=genes, columns=ref_genes, dtype=float)
 
 
 # Distribution stats of one block of matrix cells (`values`) plus, per gene,
@@ -104,14 +91,12 @@ def _summarize(matrix: pd.DataFrame, ann_set: set, meta: dict) -> list:
     return rows
 
 
-def _gene_matrix_for_selection(results_dir: Path, selection: str, refs: dict,
-                               counter, ann: dict) -> None:
+def _gene_matrix_for_selection(results_dir: Path, selection: str, entries: list, refs: dict,
+                               pair_matrices: dict, distances: list, ann: dict) -> None:
     out_dir = output_dir(results_dir, "gene_matrix", selection)
     (out_dir / "matrices").mkdir(parents=True, exist_ok=True)
-
-    # Load the gene set of every (method, cell type)
-    entries = _collect_entries(results_dir, selection)
-    print(f"[{selection}] entries:", len(entries), "| diseases:", {d: len(g) for d, g in refs.items()})
+    print(f"[{selection}] entries:", len(entries), "| diseases:", {d: len(g) for d, g in refs.items()},
+          flush=True)
 
     # Group entries variable by cell_type so every method's matrix for that cell_type
     # can be stacked into one file below
@@ -121,10 +106,9 @@ def _gene_matrix_for_selection(results_dir: Path, selection: str, refs: dict,
 
     # Iterate though references, ontologies and distances
     summary_rows = []
-    for ont, distance in product(ONTOLOGIES, DEFAULT_DISTANCES):
-        # One lookup per (ontology, distance) covers every cell_type/disease pair below
-        lut = _similarity_lookup(entries, refs, ont, distance, counter)
-        print(f"[{selection}, {ont}, {distance}] {len(lut)} unique pairs")
+    for ont, distance in product(ONTOLOGIES, distances):
+        # One cached gene-pair matrix per (ontology, distance) covers every cell_type/disease pair below
+        pm = pair_matrices[(ont, distance)]
         for cell_type, ents in groups.items():
             for disease, ref_genes in refs.items():
                 # Stack each method's (n_genes x n_ref_genes) block into one matrix,
@@ -132,7 +116,7 @@ def _gene_matrix_for_selection(results_dir: Path, selection: str, refs: dict,
                 blocks = []
                 for e in ents:
                     # Create the matrix of our method genes vs the GWAS disease reference gene-set
-                    mat = _build_matrix(e["genes"], ref_genes, lut)
+                    mat = _build_matrix(e["genes"], ref_genes, pm)
                     mat.index = pd.MultiIndex.from_product([[e["method"]], mat.index], names=["method", "gene"])
                     blocks.append(mat)
                 full = pd.concat(blocks)
@@ -154,7 +138,7 @@ def _gene_matrix_for_selection(results_dir: Path, selection: str, refs: dict,
     plot_gwas_similarity(results_dir, selection)
 
 
-def task_gene_matrix(results_dir: Path, selections=SELECTIONS) -> None:
+def task_gene_matrix(results_dir: Path, selections=SELECTIONS, distances=DEFAULT_DISTANCES) -> None:
     refs = _load_refs(results_dir / "gwas_similarity" / "refs", DEFAULT_DISEASES)
 
     # Loading the GO ontology
@@ -162,5 +146,14 @@ def task_gene_matrix(results_dir: Path, selections=SELECTIONS) -> None:
     sym_by_go = g3c.gaf_symbols_by_go_source()
     ann = {ont: sym_by_go[f"GO:{ont}"] for ont in ONTOLOGIES}
 
-    for selection in selections:
-        _gene_matrix_for_selection(results_dir, selection, refs, counter, ann)
+    # Gene pairs of every selection at once; after gwas_similarity.py they are
+    # all in the shared cache already, so nothing is recomputed here
+    entries_by_selection = {s: _collect_entries(results_dir, s) for s in selections}
+    all_genes = sorted({g for entries in entries_by_selection.values() for e in entries for g in e["genes"]})
+    all_refs = sorted({g for genes in refs.values() for g in genes})
+    cache_dir = g3c.pair_cache_dir(results_dir)
+    pair_matrices = {(ont, dist): g3c.pair_similarities(all_genes, all_refs, ont, dist, counter, cache_dir)
+                     for ont in ONTOLOGIES for dist in distances}
+
+    for selection, entries in entries_by_selection.items():
+        _gene_matrix_for_selection(results_dir, selection, entries, refs, pair_matrices, distances, ann)

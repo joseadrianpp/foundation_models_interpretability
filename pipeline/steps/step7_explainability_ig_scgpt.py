@@ -47,7 +47,8 @@ def _pd_logit(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 # Integrated Gradients of the PD logit w.r.t. the input expression, one row per cell
 # Baseline is a zero vector
 def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
-              mask: torch.Tensor, device: torch.device, n_steps: int) -> np.ndarray:
+              mask: torch.Tensor, device: torch.device, n_steps: int,
+              internal_batch_size: int = IG_INTERNAL_BATCH_SIZE) -> np.ndarray:
 
     # Function for forward the model
     def forward_fn(v: torch.Tensor, gids_: torch.Tensor, mask_: torch.Tensor) -> torch.Tensor:
@@ -62,7 +63,7 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
         additional_forward_args=(gids, mask),
         n_steps=n_steps,
         method="gausslegendre",
-        internal_batch_size=IG_INTERNAL_BATCH_SIZE,
+        internal_batch_size=internal_batch_size,
     )
     return attrs.detach().float().cpu().numpy()
 
@@ -72,13 +73,14 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 def _compute_ig_importance(
     model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
     device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
-    classify_batch_size: int = 64,
+    classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
 ) -> Tuple[Dict[str, float], dict]:
 
     # Number of cells and special tokens
     n_cells = pt["gene_ids"].shape[0]
     pad_id = vocab[C.PAD_TOKEN]
     special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
+    special_arr = np.array(sorted(special_ids | {pad_id}))
 
     # We only need gradients w.r.t. the input values, not the (frozen) weights.
     for p in model.parameters():
@@ -104,8 +106,10 @@ def _compute_ig_importance(
     n_used = len(correct_idx)
 
     # Pass 2: Integrated Gradients, only on the correctly classified subset.
-    # Initialize variables
-    sum_abs: Dict[int, float] = {}
+    # Initialize variables: per token id, summed |IG| and whether it was seen
+    n_ids = len(vocab)
+    sum_abs = np.zeros(n_ids)
+    seen = np.zeros(n_ids, dtype=bool)
 
     # Iterate over the correctly classified cells in batches, computing IG for each
     for start in range(0, n_used, batch_size):
@@ -123,27 +127,26 @@ def _compute_ig_importance(
         mask = gids.eq(pad_id)
 
         # Compute IG for the batch of correctly classified cells
-        ig = _ig_batch(model, gids, vals, mask, device, n_steps)
+        ig = _ig_batch(model, gids, vals, mask, device, n_steps, internal_batch_size)
         gids_np = gids.cpu().numpy()
 
-        # We have the IG by cell, like in attention, but we want the 
-        # mean absolute IG per gene over only correctly classified cells
-        for i in range(end - start):
-            for pos in range(1, gids_np.shape[1]):
-                gid = int(gids_np[i, pos])
-                if gid == pad_id or gid in special_ids:
-                    continue
-                sum_abs[gid] = sum_abs.get(gid, 0.0) + abs(float(ig[i, pos]))
+        # We have the IG by cell, like in attention, but we want the
+        # mean absolute IG per gene over only correctly classified cells.
+        # Every gene token of the batch at once (position 0 is the CLS)
+        keep = ~np.isin(gids_np, special_arr)
+        keep[:, 0] = False
+        sum_abs += np.bincount(gids_np[keep], weights=np.abs(ig[keep]), minlength=n_ids)
+        seen[gids_np[keep]] = True
 
     # Compute the mean IG per gene over every correctly classified cell, a cell
     # without the gene adds 0, so a gene seen in a handful of cells cannot
     # outrank one seen in all of them
     mean_abs: Dict[str, float] = {}
-    for gid, s in sum_abs.items():
-        name = vocab.lookup_tokens([gid])[0]
+    seen_ids = np.where(seen)[0]
+    for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist())):
         if name in C.SPECIAL_TOKENS:
             continue
-        mean_abs[name] = s / n_used
+        mean_abs[name] = float(sum_abs[gid]) / n_used
 
     # Safe case for 100% or 0% accuracy
     ok = n_used > 0

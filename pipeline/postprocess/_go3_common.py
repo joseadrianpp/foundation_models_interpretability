@@ -9,9 +9,14 @@ expects them symlinked under data/go3_refs/ rather than duplicated, since
 data/ is gitignored here.
 """
 
+from contextlib import contextmanager
+import fcntl
+import os
 from pathlib import Path
+from typing import Optional
 
 import gseapy
+import numpy as np
 import pandas as pd
 
 import go3
@@ -85,8 +90,119 @@ def gaf_symbols_by_go_source() -> dict:
     return {go_source: set(gaf.loc[gaf["aspect"] == aspect, "symbol"])
             for aspect, go_source in ASPECT_TO_GO_SOURCE.items()}
 
-# Load the GO ontology and build the annotation counter used by every go3
-def init_go3(threads: int = 16):
+# Load the GO ontology and build the annotation counter used by every go3.
+# Every available core by default (GO3_THREADS overrides it)
+def init_go3(threads: Optional[int] = None):
+    threads = threads or int(os.environ.get("GO3_THREADS", 0)) or os.cpu_count() or 16
     go3.set_num_threads(threads)
     go3.load_go_terms(str(OBO_PATH))
     return go3.build_term_counter(go3.load_gaf(str(GAF_PATH)))
+
+
+# ---------------------------------------------------------------------------
+# Gene-pair similarity cache
+# ---------------------------------------------------------------------------
+# Gene-to-gene GO similarity only depends on the GO files, not on the dataset,
+# selection or method, while the same pairs come up again and again (pooled and
+# CSSI sets overlap, elbow sets sit inside z-score sets, gene_matrix compares the
+# same genes as gwas_similarity). Every pair is computed once per
+# (ontology, distance) and kept on disk, one matrix per file:
+#   <results root>/go3_pair_cache/<ontology>__<distance>.npz
+# A set-level BMA similarity is then rebuilt exactly from its gene x gene block
+# (see bma), the same aggregation go3.compare_gene_set_pairs_batch does.
+PAIR_GROUPWISE = "bma"
+PAIR_CHUNK = 250_000
+
+
+def pair_cache_dir(results_dir: Path) -> Path:
+    # results_dir is results/dataset_<x>; both datasets share one cache
+    return Path(results_dir).parent / "go3_pair_cache"
+
+
+@contextmanager
+def _locked(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _load_pairs(path: Path):
+    if not path.exists():
+        return [], [], np.zeros((0, 0))
+    with np.load(path, allow_pickle=False) as npz:
+        return npz["genes"].tolist(), npz["refs"].tolist(), npz["values"]
+
+
+# Put `values` (rows `genes`, columns `refs`) into a NaN matrix over the union axes
+def _embed(genes: list, refs: list, values: np.ndarray, all_genes: list, all_refs: list) -> np.ndarray:
+    out = np.full((len(all_genes), len(all_refs)), np.nan)
+    if len(genes) and len(refs):
+        gi = {g: i for i, g in enumerate(all_genes)}
+        ri = {r: j for j, r in enumerate(all_refs)}
+        out[np.ix_([gi[g] for g in genes], [ri[r] for r in refs])] = values
+    return out
+
+
+class PairMatrix:
+    """Gene x reference-gene similarities of one (ontology, distance)."""
+
+    def __init__(self, genes: list, refs: list, values: np.ndarray):
+        self.values = values
+        self._gi = {g: i for i, g in enumerate(genes)}
+        self._ri = {r: j for j, r in enumerate(refs)}
+
+    def block(self, genes: list, refs: list) -> np.ndarray:
+        return self.values[np.ix_([self._gi[g] for g in genes], [self._ri[r] for r in refs])]
+
+
+def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_dir: Path) -> PairMatrix:
+    """Similarity of every (gene, ref gene) pair, computing only the pairs not cached yet."""
+    path = Path(cache_dir) / f"{ontology}__{distance}.npz"
+    lock = path.with_suffix(".lock")
+    with _locked(lock):
+        old_genes, old_refs, old_values = _load_pairs(path)
+    want_genes, want_refs = sorted(set(genes)), sorted(set(refs))
+    all_genes = sorted(set(old_genes) | set(want_genes))
+    all_refs = sorted(set(old_refs) | set(want_refs))
+    values = _embed(old_genes, old_refs, old_values, all_genes, all_refs)
+
+    gi = {g: i for i, g in enumerate(all_genes)}
+    ri = {r: j for j, r in enumerate(all_refs)}
+    rows = np.array([gi[g] for g in want_genes], dtype=int)
+    cols = np.array([ri[r] for r in want_refs], dtype=int)
+    missing = np.argwhere(np.isnan(values[np.ix_(rows, cols)]))
+    n_total = rows.size * cols.size
+    if len(missing):
+        print(f"[go3 {ontology} {distance}] {len(missing):,} new gene pairs to compute "
+              f"({n_total - len(missing):,} of {n_total:,} cached)", flush=True)
+        for start in range(0, len(missing), PAIR_CHUNK):
+            chunk = missing[start:start + PAIR_CHUNK]
+            pairs = [(all_genes[rows[i]], all_refs[cols[j]]) for i, j in chunk]
+            sims = go3.compare_gene_pairs_batch(pairs, ontology, distance, PAIR_GROUPWISE, counter)
+            values[rows[chunk[:, 0]], cols[chunk[:, 1]]] = sims
+            print(f"[go3 {ontology} {distance}] {min(start + PAIR_CHUNK, len(missing)):,}"
+                  f"/{len(missing):,} pairs", flush=True)
+        # Another run may have added pairs meanwhile: merge the file on disk under the lock
+        with _locked(lock):
+            disk_genes, disk_refs, disk_values = _load_pairs(path)
+            all_genes = sorted(set(all_genes) | set(disk_genes))
+            all_refs = sorted(set(all_refs) | set(disk_refs))
+            merged = _embed(disk_genes, disk_refs, disk_values, all_genes, all_refs)
+            ours = _embed(list(gi), list(ri), values, all_genes, all_refs)
+            values = np.where(np.isnan(merged), ours, merged)
+            tmp = path.with_name(path.stem + ".tmp.npz")
+            np.savez(tmp, genes=np.asarray(all_genes), refs=np.asarray(all_refs), values=values)
+            os.replace(tmp, path)
+    return PairMatrix(all_genes, all_refs, values)
+
+
+# Best-match average of a gene x gene block: every gene's best match in the
+# other set, averaged over both sets' genes, exactly as go3 groupwise "bma"
+def bma(block: np.ndarray) -> float:
+    if block.size == 0:
+        return float("nan")
+    return float((block.max(axis=1).sum() + block.max(axis=0).sum()) / (block.shape[0] + block.shape[1]))

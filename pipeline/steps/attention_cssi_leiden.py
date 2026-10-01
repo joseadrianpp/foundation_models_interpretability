@@ -57,6 +57,9 @@ class AttentionCache:
     embeddings: np.ndarray    # (n_cells, d) float32, residual-stream CLS embedding
     genes: np.ndarray         # (n_genes,) gene symbols
     embedding_source: str
+    # (n_cells,) True where a fine-tuned classifier predicts the true label;
+    # None for zero-shot models (no classification head)
+    correct: Optional[np.ndarray] = None
     _token_cells: Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
@@ -77,16 +80,19 @@ class _CacheBuilder:
 
     def __init__(self):
         self._gids, self._attn, self._lens = [], [], []
-        self._labels, self._embs = [], []
+        self._labels, self._embs, self._preds = [], [], []
 
-    # gids/attn: (B, L) arrays; keep: (B, L) True on the gene tokens to store
+    # gids/attn: (B, L) arrays; keep: (B, L) True on the gene tokens to store;
+    # preds: (B,) predicted labels of a fine-tuned classifier, if any
     def add(self, gids: np.ndarray, attn: np.ndarray, keep: np.ndarray,
-            labels: np.ndarray, embeddings: np.ndarray) -> None:
+            labels: np.ndarray, embeddings: np.ndarray, preds: Optional[np.ndarray] = None) -> None:
         self._gids.append(gids[keep].astype(np.int64))
         self._attn.append(attn[keep].astype(np.float32))
         self._lens.append(keep.sum(axis=1))
         self._labels.append(np.asarray(labels, dtype=int))
         self._embs.append(np.asarray(embeddings, dtype=np.float32))
+        if preds is not None:
+            self._preds.append(np.asarray(preds, dtype=int))
 
     # `order[p]` is the original index of the p-th cell added (cells batched
     # out of order, e.g. by length); the cache is put back in original order
@@ -97,6 +103,7 @@ class _CacheBuilder:
         lens = np.concatenate(self._lens)
         labels = np.concatenate(self._labels)
         embs = np.concatenate(self._embs)
+        preds = np.concatenate(self._preds) if self._preds else None
         if order is not None:
             back = np.argsort(order)
             starts = np.concatenate([[0], np.cumsum(lens)])[:-1][back]
@@ -104,6 +111,7 @@ class _CacheBuilder:
             new_starts = np.concatenate([[0], np.cumsum(lens)])[:-1]
             tokens = np.repeat(starts - new_starts, lens) + np.arange(lens.sum())
             gids, attn, labels, embs = gids[tokens], attn[tokens], labels[back], embs[back]
+            preds = None if preds is None else preds[back]
         # Compact gene index: the cache only knows the genes it has seen
         uniq, inv = np.unique(gids, return_inverse=True)
         return AttentionCache(
@@ -114,6 +122,7 @@ class _CacheBuilder:
             embeddings=embs,
             genes=np.asarray([str(g) for g in id_to_gene(uniq)]),
             embedding_source=embedding_source,
+            correct=None if preds is None else preds == labels,
         )
 
 
@@ -176,8 +185,12 @@ def _forward_cls_attention_with_embedding(
     return cls_attn, preds, cell_embeddings
 
 
+SCGPT_ATTN_BATCH_SIZE = 16
+
+
 def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
-                  device: torch.device, n_cls: int = 2, batch_size: int = 16) -> AttentionCache:
+                  device: torch.device, n_cls: int = 2,
+                  batch_size: int = SCGPT_ATTN_BATCH_SIZE) -> AttentionCache:
     """One scGPT forward pass over the tokenised cells of one cell type."""
     special_ids = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}))
     builder = _CacheBuilder()
@@ -201,11 +214,14 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
 
 
 def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
-                       device: torch.device, batch_size: int = gf.ATTN_BATCH_SIZE) -> AttentionCache:
+                       device: torch.device, batch_size: int = gf.ATTN_BATCH_SIZE,
+                       use_predictions: bool = False) -> AttentionCache:
     """One Geneformer forward pass over the tokenised cells of one cell type.
 
     Cells are batched by length so each batch carries little padding (cells
     have 165-4096 tokens); the cache comes back in the original cell order.
+    With `use_predictions` (LoRA classifier) the cache also records which
+    cells the classifier gets right (`cache.correct`).
     """
     # <pad>, <mask>, <cls> and <eos> are not genes
     special_ids = np.array(sorted(v for k, v in token_dict.items() if k.startswith("<")))
@@ -216,11 +232,12 @@ def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
     for start in range(0, len(order), batch_size):
         idx = order[start:start + batch_size]
         ids, attn = gf._pad_batch([pt["input_ids"][i] for i in idx], pad_id, device)
-        cls_attn, _, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, False)
+        cls_attn, preds, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, use_predictions)
         gids = ids.cpu().numpy()
         keep = ~np.isin(gids, special_ids)
         keep[:, 0] = False
-        builder.add(gids, cls_attn.cpu().numpy(), keep, labels[idx], embeddings.cpu().numpy())
+        builder.add(gids, cls_attn.cpu().numpy(), keep, labels[idx], embeddings.cpu().numpy(),
+                    None if preds is None else preds.cpu().numpy())
     return builder.build(
         lambda ids: [gene_names[int(i)] for i in ids],
         f"Geneformer residual-stream CLS embedding entering encoder layer {gf.NUM_ATTN_LAYER}",
