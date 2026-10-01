@@ -29,6 +29,10 @@ from .. import config as C
 # backward pass per step, so the batch is smaller than the attention path's.
 IG_STEPS = 24
 IG_BATCH_SIZE = 8
+# Captum runs IG_BATCH_SIZE * IG_STEPS interpolated cells per forward/backward;
+# splitting them into chunks of this size keeps an 8 GB GPU from running out of
+# memory and does not change the attributions (the gradients are just summed)
+IG_INTERNAL_BATCH_SIZE = 32
 
 # ---------------------------------------------------------------------------
 # Integrated Gradients of the PD logit w.r.t. the input expression
@@ -58,6 +62,7 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
         additional_forward_args=(gids, mask),
         n_steps=n_steps,
         method="gausslegendre",
+        internal_batch_size=IG_INTERNAL_BATCH_SIZE,
     )
     return attrs.detach().float().cpu().numpy()
 
