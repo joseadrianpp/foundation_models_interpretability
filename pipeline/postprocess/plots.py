@@ -270,6 +270,7 @@ REFERENCE_MARKERS = [  # (reference, marker, filled, legend label)
     ("parkinsonsuk_ucl", "s", True, "vs PD ParkinsonsUK-UCL GO"),
     ("alzheimer", "o", False, "vs Alzheimer (control)"),
     ("cad", "x", True, "vs CAD (control)"),
+    ("kidney", "D", False, "vs CKD (control)"),
 ]
 
 

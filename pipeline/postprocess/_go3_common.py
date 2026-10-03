@@ -30,7 +30,8 @@ GAF_PATH = REFS_DIR / "goa_human.gaf"
 GWAS_LIBRARY = "GWAS_Catalog_2025"
 GWAS_TRAITS = {"parkinson": "Parkinsons Disease",
                "alzheimer": "Alzheimers Disease",
-               "cad": "Coronary Artery Disease"}
+               "cad": "Coronary Artery Disease",
+               "kidney": "Chronic Kidney Disease"}
 ASPECT_TO_GO_SOURCE = {"P": "GO:BP", "C": "GO:CC", "F": "GO:MF"}
 
 # Two curated Parkinson's references besides the GWAS one: the PanelApp

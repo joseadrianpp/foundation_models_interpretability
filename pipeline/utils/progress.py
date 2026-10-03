@@ -35,7 +35,7 @@ class _LineStream:
         line = text.replace("\r", "").rstrip()
         # Closing a finished bar redraws it: skip a line whose count (the part
         # before the [elapsed<remaining, rate] stats) did not change
-        count = line.split(" [")[0]
+        count = line.rsplit(" [", 1)[0]
         if line and count != self._last:
             self._stream.write(line + "\n")
             self._last = count

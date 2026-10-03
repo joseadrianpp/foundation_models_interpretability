@@ -1,7 +1,7 @@
 """
 Gene-level GO3 semantic similarity (groupwise BMA, as
 go3.compare_gene_set_pairs_batch) between each method's gene set (one per
-selection) and three GWAS Catalog diseases reference gene sets plus two
+selection) and four GWAS Catalog diseases reference gene sets plus two
 curated Parkinson's panels (PanelApp and ParkinsonsUK-UCL), per cell type /
 ontology / distance measure.
 
@@ -66,13 +66,13 @@ def task_gwas_similarity(results_dir: Path, selections=SELECTIONS, distances=DEF
     refs_dir = results_dir / "gwas_similarity" / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fetch (or reuse the cached) GWAS Catalog gene sets for PD/AD/CAD, plus the two PD panels
+    # Fetch (or reuse the cached) GWAS Catalog gene sets for PD/AD/CAD/CKD, plus the two PD panels
     refs = {**g3c.fetch_all_gwas(refs_dir), **g3c.load_pd_panels(refs_dir)}
     print("Reference sizes:", {k: len(v) for k, v in refs.items()}, flush=True)
 
     # Loading the GO ontology
     counter = g3c.init_go3()
-    # Record how many genes in each reference (i.e., PD/AD/CAD and the PD panels) are annotated in each sub-ontology
+    # Record how many genes in each reference (i.e., PD/AD/CAD/CKD and the PD panels) are annotated in each sub-ontology
     _annotated_counts(refs, refs_dir / "annotated_counts.csv")
 
     # Load the gene set of every (selection, method, cell type)

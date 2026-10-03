@@ -76,7 +76,7 @@ Run in this order, or all at once with `--task postprocess`. `enrichment` (g:Pro
 |---|---|---|
 | `enrichment` | g:Profiler GO:BP/MF/CC, KEGG and Reactome enrichment of every gene set | `enrichment/` |
 | `enrichment_summary` | term count, information content, intersection size and functional abundance per gene set, plus pairwise Mann-Whitney tests between the methods of each model (BH-adjusted) | `enrichment_summary/` |
-| `gwas_similarity` | GO3 set-level similarity (lin/SimRel/wang, BMA) of every gene set to the PD/AD/CAD GWAS Catalog gene sets and the two PD panels | `gwas_similarity/` |
+| `gwas_similarity` | GO3 set-level similarity (lin/SimRel/wang, BMA) of every gene set to the PD/AD/CAD/CKD GWAS Catalog gene sets and the two PD panels | `gwas_similarity/` |
 | `gene_matrix` | gene x gene GO3 similarity matrices vs the three PD references (GWAS, PanelApp, ParkinsonsUK-UCL) | `gene_matrix/` |
 | `plots` | every comparison figure, one per model (also drawn by the tasks above) | `plots/` |
 
@@ -125,7 +125,7 @@ nohup bash scripts/run_full.sh > /dev/null 2>&1 &
 tail -f logs/run_full.log
 ```
 
-`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS`, `LOG_DIR` and `PROGRESS_INTERVAL` override its defaults (see the script header). `watch -n 30 bash scripts/progress.sh` shows the latest progress line of every running bar.
+`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS`, `LOG_DIR` and `PROGRESS_INTERVAL` override its defaults (see the script header). `watch -n 30 bash scripts/progress.sh` shows the latest progress line of every running bar. When the run ends, `python scripts/check_run.py` checks logs, cell counts, CSSI strata, every experiment's gene list and every post-hoc output, and writes the experiment inventory to `results/run_check/experiments.csv`.
 
 A quick end-to-end check before a full run: `--task all --max-cells-per-type 200`, then `--task postprocess --selection top30 --distances SimRel` (~20 min on 24 cores).
 
@@ -151,7 +151,7 @@ Measured on 2x RTX 2070 (8 GB) and 24 cores, a full run takes ~11-14 h: model ta
 All attention scores use the CLS-token attention of one encoder layer (scGPT layer 11, Geneformer layer 10), computed from Q·Kᵀ of the CLS row, rank-normalised over each cell's genes and averaged over heads. One forward pass per cell type feeds every ranking.
 
 - **Pooled attention** (`attention_zero_shot_<model>`): `mean_attention_pd - mean_attention_control` per gene. Each mean is over every cell of the condition, a cell without the gene counting as 0, so a gene seen in only a few cells cannot rank above one seen in all of them. The sign shows which condition attends to the gene more.
-- **CSSI-max** (`attention_cssi_<model>`): the cells are split into ~6 strata by Leiden clustering (cosine k-NN graph, k = 15) of the residual-stream CLS embedding entering the attention layer; the same PD - control score is computed inside every stratum with at least 20 cells per condition, and each gene keeps its maximum. Without any valid stratum it falls back to the pooled score.
+- **CSSI-max** (`attention_cssi_<model>`): the cells are split into ~6 strata by Leiden clustering (cosine k-NN graph, k = 15) of the residual-stream CLS embedding entering the attention layer, at the resolution (of 25 between 0.1 and 2.5, tried in increasing order and stopping after 3 in a row with more than 6 clusters; `resolution_sweep` in `cssi_metadata.json`) whose number of clusters is closest to 6; the same PD - control score is computed inside every stratum with at least 20 cells per condition, and each gene keeps its maximum. Without any valid stratum it falls back to the pooled score.
 - **OLS-residualized** (`attention_residualized_ols_<model>`): across genes, the pooled score is regressed on three gene-level covariates of the same cells (mean expression, expression variance, dropout rate); the residual is the part of the attention not explained by how much / how often a gene is expressed.
   - scGPT: the covariates come from the h5ad expression matrix.
   - Geneformer: cells are rank-value encoded (no expression values), so the covariates use a rank pseudo-expression, `v = 1 - (p - 1) / (n - 1)` for the gene at position `p` of a cell's `n` genes (1 = the cell's most expressed gene) and `v = 0` when the gene is absent.
@@ -174,7 +174,7 @@ Each zero-shot ranking is cut three ways (files `top30.csv`, `z-score.csv`, `elb
 ### Gene-set metrics
 
 - **Enrichment** (g:Profiler, significant terms only): number of terms, information content `-log2(term_size / domain_size)`, intersection size, functional abundance `intersection_size / term_size`.
-- **GO semantic similarity** (GO3, BP/CC/MF, lin/SimRel/wang): set-level BMA similarity to the PD GWAS gene set (GWAS Catalog), the PanelApp PD panel (green genes) and the ParkinsonsUK-UCL GO-annotated genes, with Alzheimer and coronary artery disease GWAS sets as controls; gene x gene matrices vs the three PD references.
+- **GO semantic similarity** (GO3, BP/CC/MF, lin/SimRel/wang): set-level BMA similarity to the PD GWAS gene set (GWAS Catalog), the PanelApp PD panel (green genes) and the ParkinsonsUK-UCL GO-annotated genes, with Alzheimer, coronary artery disease and chronic kidney disease GWAS sets as controls; gene x gene matrices vs the three PD references.
 
 ### Reproducibility
 
