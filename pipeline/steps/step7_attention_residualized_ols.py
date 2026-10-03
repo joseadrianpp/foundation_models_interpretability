@@ -30,7 +30,7 @@ attention task saved with --permutation.
 """
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import csv
 import json
@@ -306,15 +306,21 @@ def residualize_cell_type(
     features: Dict[str, Dict[str, float]],
     n_cells: int,
     permutation: bool = False,
+    source: Optional[str] = None,
+    target: Optional[str] = None,
 ) -> None:
-    """OLS-residualize one cell type's pooled attention against its gene features.
+    """OLS-residualize one cell type's pooled score against its gene features.
 
-    The attention score is read from the attention task output
-    (attention_zero_shot_<model>/<slug>/csv/all_genes.csv), so this runs on
-    CPU and is exactly the pooled score the attention task ranked. `n_cells`
-    must match the cells that task used (same --max-cells-per-type).
+    The score is read from a model task's output, <source>/<slug>/csv/all_genes.csv
+    (source: attention_zero_shot_<model> by default; ig_lora_scgpt or
+    attention_lora_geneformer for the LoRA scores), so this runs on CPU and is
+    exactly the pooled score that task ranked. `n_cells` must match the cells
+    that task used (same --max-cells-per-type). The outputs go to
+    <target>/<slug> (attention_residualized_ols_<model> by default).
     """
-    attention_dir = results_dir / f"attention_zero_shot_{model}" / slug
+    source = source or f"attention_zero_shot_{model}"
+    target = target or f"attention_residualized_ols_{model}"
+    attention_dir = results_dir / source / slug
     scores_csv = attention_dir / "csv" / "all_genes.csv"
     if not scores_csv.exists():
         print(f"  skipped: {scores_csv} missing (run the attention task first)", flush=True)
@@ -333,7 +339,7 @@ def residualize_cell_type(
     metadata["attention_source"] = str(scores_csv.relative_to(results_dir))
     metadata["n_cells"] = int(n_cells)
 
-    out_dir = results_dir / f"attention_residualized_ols_{model}" / slug
+    out_dir = results_dir / target / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Preserve the detailed all-gene audit output.

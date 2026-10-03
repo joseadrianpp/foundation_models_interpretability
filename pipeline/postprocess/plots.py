@@ -24,20 +24,24 @@ from .gene_sets import (ALL_SCORE_PATHS, CELL_TYPES, METHOD_META, METHODS, MODEL
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer"}
 
 
-# Zero-shot rankings are colored by ranking; both LoRA variants share the fine-tuned color
+# One color per ranking and model form: pooled / CSSI / OLS of the zero-shot
+# model, then the same three of the LoRA model (IG for scGPT, attention for Geneformer)
 def _color_group(method: str) -> str:
     meta = METHOD_META[method]
-    return "fine_tuned" if meta["model_form"] == "lora" else meta["ranking"]
+    ranking = meta["ranking"] if meta["ranking"] in ("cssi", "ols") else "pooled"
+    return f"lora_{ranking}" if meta["model_form"] == "lora" else ranking
 
 
-# Fixed categorical order (blue, orange, aqua, yellow): adjacent-pair CVD safe
-GROUP_COLORS = {"attention": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a", "fine_tuned": "#eda100"}
-GROUP_SHORT = {"attention": "Pooled", "cssi": "CSSI", "ols": "OLS resid."}
+# Fixed categorical order (blue, orange, aqua, yellow, magenta, green), in the
+# order the methods are drawn: adjacent-pair CVD safe (validated on the plot surface)
+GROUP_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a",
+                "lora_pooled": "#eda100", "lora_cssi": "#e87ba4", "lora_ols": "#008300"}
+GROUP_SHORT = {"pooled": "Pooled", "cssi": "CSSI", "ols": "OLS resid.",
+               "lora_pooled": "LoRA", "lora_cssi": "LoRA CSSI", "lora_ols": "LoRA OLS"}
 METHOD_COLORS = {m: GROUP_COLORS[_color_group(m)] for m in METHODS}
 # Labels inside a figure: the model is already in the title
 METHOD_LABELS = {m: METHOD_META[m]["label"] for m in METHODS}
-METHOD_SHORT = {m: GROUP_SHORT.get(_color_group(m), "IG LoRA" if m == "ig_lora_scgpt" else "LoRA attn")
-                for m in METHODS}
+METHOD_SHORT = {m: GROUP_SHORT[_color_group(m)] for m in METHODS}
 
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                     "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
@@ -401,7 +405,7 @@ def plot_gene_set_sizes(results_dir: Path) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Dynamic cut-offs on each attention method's ranked score curve
+# Dynamic cut-offs on each method's ranked score curve
 # ---------------------------------------------------------------------------
 CUTOFF_STYLES = {"top30": ":", "z-score": "--", "elbow": "-"}
 MAX_RANK_SHOWN = 200
@@ -443,7 +447,7 @@ def _plot_dynamic_selection(model: str, results_dir: Path) -> Path:
             if r == len(methods) - 1:
                 ax.set_xlabel(f"Gene rank (first {MAX_RANK_SHOWN})")
             _style(ax)
-    fig.suptitle(f"{MODEL_LABELS[model]} - ranked score curves and dynamic cut-offs per attention method",
+    fig.suptitle(f"{MODEL_LABELS[model]} - ranked score curves and dynamic cut-offs per method",
                  fontsize=12)
     fig.tight_layout()
     return _save(fig, results_dir / "plots" / f"dynamic_selection_cutoffs_{model}.png")
@@ -575,8 +579,7 @@ def _plot_selection_comparison(model: str, results_dir: Path, df: pd.DataFrame, 
         labels.append(SELECTION_LABELS[selection])
     fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False, fontsize=9,
                bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle(f"{MODEL_LABELS[model]} - gene sets per method and selection "
-                 "(LoRA variants only have a top-30 set)", fontsize=12)
+    fig.suptitle(f"{MODEL_LABELS[model]} - gene sets per method and selection", fontsize=12)
     fig.tight_layout(rect=[0, 0.03, 1, 1])
     return _save(fig, results_dir / "plots" / f"selection_comparison_{model}.png")
 

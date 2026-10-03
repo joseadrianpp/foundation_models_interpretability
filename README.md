@@ -8,7 +8,7 @@ For every (model, dataset, cell type) the pipeline ranks genes with three method
 |---|---|
 | Ranking | pooled attention difference (PD - control), CSSI-max attention, OLS-residualized attention |
 | Selection (top-N) | top-30, z-score, elbow |
-| Model | scGPT, Geneformer (zero-shot; the LoRA fine-tuned models are also available, top-30 only) |
+| Model | scGPT, Geneformer (zero-shot and LoRA fine-tuned) |
 | Dataset | A, B |
 | Cell type | astrocytes, DA neurons, microglia, oligodendrocytes |
 
@@ -58,15 +58,17 @@ Each dataset writes to its own folder, `results/dataset_a/` or `results/dataset_
 |---|---|---|
 | `attention_scgpt` | zero-shot scGPT: pooled attention, CSSI and their selections | `attention_zero_shot_scgpt/` |
 | `attention_geneformer` | the same with zero-shot Geneformer | `attention_zero_shot_geneformer/` |
-| `ig_lora_scgpt` | Integrated Gradients on the LoRA scGPT classifier (correctly classified cells), top-30 | `ig_lora_scgpt/` |
-| `attention_lora_geneformer` | attention of the LoRA Geneformer classifier (correctly classified cells), top-30 | `attention_lora_geneformer/` |
+| `ig_lora_scgpt` | Integrated Gradients on the LoRA scGPT classifier (correctly classified cells): pooled, CSSI and their selections | `ig_lora_scgpt/` |
+| `attention_lora_geneformer` | attention of the LoRA Geneformer classifier (correctly classified cells): pooled, CSSI and their selections | `attention_lora_geneformer/` |
 
-### OLS tasks (CPU, after the attention tasks)
+### OLS tasks (CPU, after the model tasks)
 
 | Task | What it does | Output folder |
 |---|---|---|
 | `attention_residualized_ols_scgpt` | OLS residual of the scGPT pooled attention and its selections | `attention_residualized_ols_scgpt/` |
 | `attention_residualized_ols_geneformer` | the same for Geneformer | `attention_residualized_ols_geneformer/` |
+| `ig_residualized_ols_lora_scgpt` | the same for the LoRA scGPT IG score | `ig_residualized_ols_lora_scgpt/` |
+| `attention_residualized_ols_lora_geneformer` | the same for the LoRA Geneformer attention | `attention_residualized_ols_lora_geneformer/` |
 
 ### Post-hoc tasks (CPU, after the tasks above)
 
@@ -156,14 +158,16 @@ All attention scores use the CLS-token attention of one encoder layer (scGPT lay
   - scGPT: the covariates come from the h5ad expression matrix.
   - Geneformer: cells are rank-value encoded (no expression values), so the covariates use a rank pseudo-expression, `v = 1 - (p - 1) / (n - 1)` for the gene at position `p` of a cell's `n` genes (1 = the cell's most expressed gene) and `v = 0` when the gene is absent.
 
-Fine-tuned (LoRA) variants, top-30 only:
+Fine-tuned (LoRA) models, the same three rankings on their correctly classified cells:
 
 - **Integrated Gradients** (`ig_lora_scgpt`): mean absolute attribution to the PD logit of the LoRA scGPT classifier over every correctly classified cell (0 where the gene is absent).
 - **LoRA attention** (`attention_lora_geneformer`): the pooled attention score of the LoRA Geneformer classifier, on its correctly classified cells.
+- **CSSI-max** (`ig_cssi_lora_scgpt`, `attention_cssi_lora_geneformer`): Leiden strata (as above) of the LoRA model's own CLS embedding, over every cell; each gene keeps its maximum over the strata with at least 20 correctly classified cells per condition of the stratum's score: mean |IG| over the stratum's correctly classified cells, or their PD - control attention.
+- **OLS-residualized** (`ig_residualized_ols_lora_scgpt`, `attention_residualized_ols_lora_geneformer`): the same OLS on the pooled score, with the covariates of every cell of the cell type.
 
 ### Gene-set selections
 
-Each zero-shot ranking is cut three ways (files `top30.csv`, `z-score.csv`, `elbow.csv`, columns `rank, gene, score`):
+Each ranking is cut three ways (files `top30.csv`, `z-score.csv`, `elbow.csv`, columns `rank, gene, score`):
 
 - **top30**: the 30 highest scores.
 - **z-score**: genes with score > mean + 2.5 sd of all the gene scores. With ~17k genes, Geneformer z-score sets are much larger than scGPT's (1000 HVG).
@@ -197,8 +201,10 @@ attention_residualized_ols_<model>/<ct>/
 ├── csv/ols.csv                  residual ranking, every gene
 ├── csv/{top30,z-score,elbow}.csv + selection_summary.json
 └── ols_summary.json             R², coefficients, F-test
-ig_lora_scgpt/<ct>/top30_genes.csv
-attention_lora_geneformer/<ct>/top30_genes.csv
+ig_lora_scgpt/<ct>/, attention_lora_geneformer/<ct>/
+                                 the same files as attention_zero_shot_<model>/<ct>/
+ig_residualized_ols_lora_scgpt/<ct>/, attention_residualized_ols_lora_geneformer/<ct>/
+                                 the same files as attention_residualized_ols_<model>/<ct>/
 enrichment/[<selection>/]<method>/<ct>.csv, manifest.csv
 enrichment_summary/[<selection>/]summary_table.csv, pairwise_tests.csv
 gwas_similarity/refs/            reference gene sets (GWAS Catalog cached on first use)
@@ -209,6 +215,6 @@ plots/<figure>_<model>[_<selection>].png
 
 `results/go3_pair_cache/<ontology>__<distance>.npz` holds the cached gene-to-gene GO3 similarities shared by both datasets.
 
-The top-30 outputs of the post-hoc tasks have no `<selection>/` subfolder. A method name in those outputs is `<ranking>_<model>` (`attention_zero_shot_*`, `attention_cssi_*`, `attention_residualized_ols_*`, `ig_lora_scgpt`, `attention_lora_geneformer`); `pipeline/postprocess/gene_sets.py` maps every method to its files and to its (ranking, model, model form). So one experiment (ranking, selection, model, dataset, cell type) is one row of `enrichment_summary/[<selection>/]summary_table.csv` in `results/dataset_<x>/`.
+The top-30 outputs of the post-hoc tasks have no `<selection>/` subfolder. A method name in those outputs is `<ranking>_<model>` (`attention_zero_shot_*`, `attention_cssi_*`, `attention_residualized_ols_*`, and for the LoRA models `ig_lora_scgpt`, `ig_cssi_lora_scgpt`, `ig_residualized_ols_lora_scgpt`, `attention_lora_geneformer`, `attention_cssi_lora_geneformer`, `attention_residualized_ols_lora_geneformer`); `pipeline/postprocess/gene_sets.py` maps every method to its files and to its (ranking, model, model form). So one experiment (ranking, selection, model, dataset, cell type) is one row of `enrichment_summary/[<selection>/]summary_table.csv` in `results/dataset_<x>/`.
 
 `results/legacy_v0/` holds the results of the earlier pipeline (old Dataset A balanced to 5261 cells per type, train + val only, old LoRA checkpoint, attention means over the cells expressing each gene); they are kept for reference and are not comparable with the current results.

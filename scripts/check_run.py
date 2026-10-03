@@ -85,7 +85,10 @@ def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
     tasks = list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS) + ["postprocess"]
     for d in datasets:
         for t in tasks:
-            if (d, t) not in started:
+            if (d, t) not in started and t in rt.DERIVED_TASKS:
+                # Possibly run by hand; its outputs are checked below
+                rep.warn(f"{d} {t}: not in run_full.log")
+            elif (d, t) not in started:
                 rep.fail(f"{d} {t}: never started")
             elif (d, t) not in ended:
                 rep.fail(f"{d} {t}: started but did not end (still running or killed)")
@@ -104,29 +107,38 @@ def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
         rep.warn("run_full.log has no 'all done' line")
 
 
+# (model, model task folder with the pooled/CSSI outputs, its OLS folder)
+SCORE_FOLDERS = [("scgpt", "attention_zero_shot_scgpt", "attention_residualized_ols_scgpt"),
+                 ("scgpt", "ig_lora_scgpt", "ig_residualized_ols_lora_scgpt"),
+                 ("geneformer", "attention_zero_shot_geneformer", "attention_residualized_ols_geneformer"),
+                 ("geneformer", "attention_lora_geneformer", "attention_residualized_ols_lora_geneformer")]
+
+
 def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report) -> None:
     _section(f"{dataset}: cells, CSSI strata and OLS")
     data_dir = rt.DATASET_DIRS[dataset]
-    rows = []
-    for model in MODELS:
-        counts = rt._cell_type_counts(f"attention_{model}", data_dir, max_cells)
-        expected = {_slug_cell_type(ct): n for ct, n in counts.items()}
+    rows, expected = [], {}
+    for model, folder, ols_folder in SCORE_FOLDERS:
+        if model not in expected:
+            counts = rt._cell_type_counts(f"attention_{model}", data_dir, max_cells)
+            expected[model] = {_slug_cell_type(ct): n for ct, n in counts.items()}
         for ct in CELL_TYPES:
-            meta = _read_json(results_dir / f"attention_zero_shot_{model}" / ct / "cssi_metadata.json")
-            ols = _read_json(results_dir / f"attention_residualized_ols_{model}" / ct / "ols_summary.json")
+            meta = _read_json(results_dir / folder / ct / "cssi_metadata.json")
+            ols = _read_json(results_dir / ols_folder / ct / "ols_summary.json")
             if meta is None:
-                rep.fail(f"{model} {ct}: cssi_metadata.json missing")
+                rep.fail(f"{folder} {ct}: cssi_metadata.json missing")
                 continue
-            if meta["n_cells"] != expected.get(ct):
-                rep.fail(f"{model} {ct}: attention used {meta['n_cells']} cells, the data has {expected.get(ct)}")
+            if meta["n_cells"] != expected[model].get(ct):
+                rep.fail(f"{folder} {ct}: used {meta['n_cells']} cells, the data has {expected[model].get(ct)}")
             if meta["valid_strata"] == 0:
-                rep.warn(f"{model} {ct}: no Leiden stratum with >= {rt.CSSI_MIN_CELLS_PER_CONDITION} cells "
-                         "per condition, the CSSI score is the pooled one")
+                rep.warn(f"{folder} {ct}: no Leiden stratum with >= {rt.CSSI_MIN_CELLS_PER_CONDITION} scored "
+                         "cells per condition, the CSSI score is the pooled one")
             if ols is None:
-                rep.fail(f"{model} {ct}: ols_summary.json missing")
+                rep.fail(f"{ols_folder} {ct}: ols_summary.json missing")
             elif ols["n_cells"] != meta["n_cells"]:
-                rep.fail(f"{model} {ct}: OLS used {ols['n_cells']} cells, attention {meta['n_cells']}")
-            rows.append({"model": model, "cell_type": ct, "n_cells": meta["n_cells"],
+                rep.fail(f"{ols_folder} {ct}: OLS used {ols['n_cells']} cells, the scores {meta['n_cells']}")
+            rows.append({"scores": folder, "cell_type": ct, "n_cells": meta["n_cells"],
+                         "n_scored": meta.get("n_cells_scored", meta["n_cells"]),
                          "leiden_strata": meta["n_clusters"], "valid_strata": meta["valid_strata"],
                          "ols_r2": None if ols is None else round(ols["r_squared"], 3)})
     if rows:

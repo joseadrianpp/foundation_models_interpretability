@@ -404,14 +404,19 @@ def compute_attention_cssi(
     min_cells_per_condition: int = 20,
     random_state: int = 42,
     desc: str = "Leiden",
+    cell_mask: Optional[np.ndarray] = None,
 ):
     """Pooled means, CSSI-max gene scores and Leiden labels from one cache.
 
-    Returns (pooled_means, cssi_scores, gate, strata, metadata).
+    Leiden clusters every cell; the scores only use the cells in `cell_mask`
+    (all by default; the correctly classified ones for a fine-tuned
+    classifier), and a stratum needs min_cells_per_condition of them per
+    condition. Returns (pooled_means, cssi_scores, gate, strata, metadata).
     """
     n_cells = cache.n_cells
     labels = cache.labels
-    n_per_cond = {c: int(np.sum(labels == c)) for c in (0, 1)}
+    scored = np.ones(n_cells, dtype=bool) if cell_mask is None else np.asarray(cell_mask, dtype=bool)
+    n_per_cond = {c: int(np.sum(scored & (labels == c))) for c in (0, 1)}
     if n_per_cond[0] == 0 or n_per_cond[1] == 0:
         gate = {
             "ok": False,
@@ -429,12 +434,12 @@ def compute_attention_cssi(
         desc=desc,
     )
 
-    pooled_means = condition_means(cache)
+    pooled_means = condition_means(cache, cell_mask)
     cssi_scores = {}
     valid_strata = 0
 
     for stratum in np.unique(strata):
-        in_stratum = strata == stratum
+        in_stratum = (strata == stratum) & scored
         cells_control = int(np.sum(in_stratum & (labels == 0)))
         cells_pd = int(np.sum(in_stratum & (labels == 1)))
         if min(cells_control, cells_pd) < min_cells_per_condition:
@@ -453,6 +458,8 @@ def compute_attention_cssi(
 
     cluster_meta["valid_strata"] = valid_strata
     cluster_meta["n_cells"] = int(n_cells)
+    if cell_mask is not None:
+        cluster_meta["n_cells_scored"] = int(scored.sum())
     cluster_meta["n_embedding_dims"] = int(cache.embeddings.shape[1])
     return pooled_means, cssi_scores, {
         "ok": True,

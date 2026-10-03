@@ -204,11 +204,14 @@ def _split_cell_types(counts: dict, n_workers: int):
     return workers, loads
 
 
-def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_ids=None) -> None:
+def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_ids=None,
+                             cell_mask=None) -> None:
     """Pooled + CSSI scores, dynamic selections and Leiden artifacts of one cell type.
 
     Model independent: it only reads the AttentionCache. With `donor_ids`
-    the donor-level permutation selector also runs (--permutation).
+    the donor-level permutation selector also runs (--permutation). With
+    `cell_mask` the scores only use those cells (the correctly classified
+    ones of a fine-tuned classifier); Leiden still clusters every cell.
     """
     means, cssi_scores, gate, strata, meta = cssi.compute_attention_cssi(
         cache,
@@ -217,31 +220,44 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
         min_cells_per_condition=CSSI_MIN_CELLS_PER_CONDITION,
         random_state=SEED,
         desc=f"{out_dir.parent.name} {out_dir.name} Leiden",
+        cell_mask=cell_mask,
     )
     if not gate["ok"]:
         print(f"  skipped: {gate['reason']}", flush=True)
         return
+
+    pooled_scores = common._gene_scores(means, _signed_score)
+    donor_data = None
+    if donor_ids is not None:
+        donor_data = dynamic.donor_attention_data(cache, donor_ids, strata)
+        # The OLS task residualizes this matrix for its own permutation selector
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out_dir / "donor_attention.npz", donors=np.asarray(donor_data["donors"]),
+                            labels=donor_data["labels"], genes=np.asarray(donor_data["genes"]),
+                            scores=donor_data["scores"])
+    _write_score_outputs(pooled_scores, cssi_scores, strata, meta, cache.embeddings, out_dir, donor_data)
+
+
+def _write_score_outputs(pooled_scores: dict, cssi_scores: dict, strata: np.ndarray, meta: dict,
+                         embeddings: np.ndarray, out_dir: Path, donor_data=None) -> None:
+    """Write one cell type's pooled and CSSI gene scores, their selections and the Leiden artifacts.
+
+    Shared by every score (attention, LoRA attention, IG): top30_genes.csv,
+    csv/all_genes.csv and csv/<selection>.csv (pooled), cssi_genes.csv and
+    cssi/csv/<selection>.csv (CSSI), cell_embeddings.npy, leiden_clusters.csv
+    and cssi_metadata.json.
+    """
     print(
         f"  CSSI: {meta.get('n_clusters', 1)} Leiden strata "
         f"(resolution={meta.get('resolution', 0):.4g}), "
-        f"{cache.embeddings.shape[1]}-D embeddings",
+        f"{embeddings.shape[1]}-D embeddings",
         flush=True,
     )
-
-    pooled_scores = common._gene_scores(means, _signed_score)
 
     # Preserve the original baseline/output consumed by downstream tasks.
     _write_top_n(pooled_scores, out_dir / "top30_genes.csv")
     _write_all_scores(cssi_scores, out_dir / "cssi_genes.csv")
     _write_all_scores(pooled_scores, out_dir / "csv" / "all_genes.csv")
-
-    donor_data = None
-    if donor_ids is not None:
-        donor_data = dynamic.donor_attention_data(cache, donor_ids, strata)
-        # The OLS task residualizes this matrix for its own permutation selector
-        np.savez_compressed(out_dir / "donor_attention.npz", donors=np.asarray(donor_data["donors"]),
-                            labels=donor_data["labels"], genes=np.asarray(donor_data["genes"]),
-                            scores=donor_data["scores"])
 
     # Dynamic top-N: pooled attention and CSSI separately. Permutation is
     # donor-level and therefore uses the same donor identities in both.
@@ -259,7 +275,7 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
             permutation_effect_size=DYNAMIC_PERMUTATION_EFFECT_SIZE,
         )
 
-    np.save(out_dir / "cell_embeddings.npy", cache.embeddings)
+    np.save(out_dir / "cell_embeddings.npy", embeddings)
     pd.DataFrame({"cell_index": np.arange(len(strata)), "leiden": strata}).to_csv(
         out_dir / "leiden_clusters.csv", index=False
     )
@@ -315,16 +331,27 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 
         pt = common._tokenise(sub, vocab)
 
-        mean_abs, gate = ig._compute_ig_importance(
+        result = ig._compute_ig_result(
             model, pt, vocab, device, batch_size=ig.IG_BATCH_SIZE * scale,
             internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale,
             desc=f"ig_lora_scgpt {slug} [{device}]")
 
-        if not gate["ok"]:
-            print(f"  skipped: {gate['reason']}", flush=True)
+        if not result.gate["ok"]:
+            print(f"  skipped: {result.gate['reason']}", flush=True)
             continue
 
-        _write_top_n(mean_abs, results_dir / "ig_lora_scgpt" / slug / "top30_genes.csv")
+        # CSSI: Leiden strata of the LoRA model's own cell embedding, each
+        # gene scored by its largest mean |IG| over the valid strata
+        strata, meta = cssi._leiden_from_embeddings(
+            result.embeddings, n_neighbors=CSSI_N_NEIGHBORS, target_k=CSSI_TARGET_K, random_state=SEED,
+            embedding_source=f"scGPT LoRA residual-stream CLS embedding entering transformer layer "
+                             f"{common.NUM_ATTN_LAYERS}",
+            desc=f"ig_lora_scgpt {slug} Leiden")
+        cssi_scores, valid_strata = ig.stratified_ig_scores(result, strata, vocab, CSSI_MIN_CELLS_PER_CONDITION)
+        meta.update(valid_strata=valid_strata, n_cells=int(result.labels.size),
+                    n_cells_scored=int(result.correct.sum()), n_embedding_dims=int(result.embeddings.shape[1]))
+        _write_score_outputs(result.mean_abs, cssi_scores, strata, meta, result.embeddings,
+                             results_dir / "ig_lora_scgpt" / slug)
 
     del model
     torch.cuda.empty_cache()
@@ -356,8 +383,8 @@ def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.d
 
 def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: torch.device,
                                    cell_types=None, opts=None) -> None:
-    # Pooled attention score of the LoRA classifier, only on the cells it
-    # classifies correctly (the same convention as upstream), top-30
+    # Attention scores of the LoRA classifier (pooled, CSSI, selections) only
+    # on the cells it classifies correctly (the same convention as upstream)
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
     token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
@@ -375,8 +402,8 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
             print(f"  skipped: correctly-classified counts: control={n_correct[0]}, pd={n_correct[1]}",
                   flush=True)
             continue
-        scores = common._gene_scores(cssi.condition_means(cache, cache.correct), _signed_score)
-        _write_top_n(scores, results_dir / "attention_lora_geneformer" / slug / "top30_genes.csv")
+        # Pooled, CSSI (strata of the LoRA model's own embedding) and selections
+        _write_attention_outputs(cache, results_dir / "attention_lora_geneformer" / slug, cell_mask=cache.correct)
 
     del model
     torch.cuda.empty_cache()
@@ -384,27 +411,44 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
 
 # OLS residualization of the attention task output (CPU, no model). The cells
 # (and --max-cells-per-type subset) are the same the attention task used
-def task_attention_residualized_ols_scgpt(data_dir: Path, results_dir: Path, opts=None) -> None:
+def task_attention_residualized_ols_scgpt(data_dir: Path, results_dir: Path, opts=None,
+                                          source="attention_zero_shot_scgpt",
+                                          target="attention_residualized_ols_scgpt") -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
     vocab = load_vocab()
     adata = _load_full_dataset_scgpt(data_dir)
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, None, opts["max_cells_per_type"]):
-        print(f"\n# attention_residualized_ols_scgpt | {ct} | {sub.n_obs:,} cells #", flush=True)
+        print(f"\n# {target} | {ct} | {sub.n_obs:,} cells #", flush=True)
         genes, features = residualized_ols.scgpt_gene_features(sub, vocab)
         residualized_ols.residualize_cell_type(results_dir, "scgpt", slug, genes, features,
-                                               sub.n_obs, opts["permutation"])
+                                               sub.n_obs, opts["permutation"], source=source, target=target)
 
 
-def task_attention_residualized_ols_geneformer(data_dir: Path, results_dir: Path, opts=None) -> None:
+def task_attention_residualized_ols_geneformer(data_dir: Path, results_dir: Path, opts=None,
+                                               source="attention_zero_shot_geneformer",
+                                               target="attention_residualized_ols_geneformer") -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
     token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
     ds = _load_full_dataset_geneformer(data_dir)
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, None, opts["max_cells_per_type"]):
-        print(f"\n# attention_residualized_ols_geneformer | {ct} | {sub.num_rows:,} cells #", flush=True)
+        print(f"\n# {target} | {ct} | {sub.num_rows:,} cells #", flush=True)
         genes, features = residualized_ols.geneformer_rank_features(
             gf._to_inputs(sub)["input_ids"], token_dict, gene_names)
         residualized_ols.residualize_cell_type(results_dir, "geneformer", slug, genes, features,
-                                               sub.num_rows, opts["permutation"])
+                                               sub.num_rows, opts["permutation"], source=source, target=target)
+
+
+# The same OLS for the LoRA scores: IG of the LoRA scGPT model (expression
+# features from the h5ad) and attention of the LoRA Geneformer model (rank
+# pseudo-expression). The features cover every cell of the cell type
+def task_ig_residualized_ols_lora_scgpt(data_dir: Path, results_dir: Path, opts=None) -> None:
+    task_attention_residualized_ols_scgpt(data_dir, results_dir, opts, source="ig_lora_scgpt",
+                                          target="ig_residualized_ols_lora_scgpt")
+
+
+def task_attention_residualized_ols_lora_geneformer(data_dir: Path, results_dir: Path, opts=None) -> None:
+    task_attention_residualized_ols_geneformer(data_dir, results_dir, opts, source="attention_lora_geneformer",
+                                               target="attention_residualized_ols_lora_geneformer")
 
 
 MODEL_TASKS = {
@@ -418,6 +462,8 @@ MODEL_TASKS = {
 DERIVED_TASKS = {
     "attention_residualized_ols_scgpt": task_attention_residualized_ols_scgpt,
     "attention_residualized_ols_geneformer": task_attention_residualized_ols_geneformer,
+    "ig_residualized_ols_lora_scgpt": task_ig_residualized_ols_lora_scgpt,
+    "attention_residualized_ols_lora_geneformer": task_attention_residualized_ols_lora_geneformer,
 }
 
 POSTPROCESS_TASKS = {

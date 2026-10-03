@@ -15,14 +15,18 @@ How it works:
   - We keep only correctly classified cells and score each gene by the MEAN
     ABSOLUTE attribution over all of them, a cell without the gene counting
     as 0 (non-negative, like RF importance).
+  - The CSSI version (stratified_ig_scores) takes, per gene, the maximum of
+    that mean over the Leiden strata of the LoRA model's own cell embedding.
 """
 
+from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
 from captum.attr import IntegratedGradients
 
+from . import _step7_common as common
 from .. import config as C
 from ..utils.progress import progress
 
@@ -70,6 +74,19 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 
 
 
+@dataclass
+class IGResult:
+    """Pooled IG scores of one cell type, plus what the stratified (CSSI) score needs."""
+    mean_abs: Dict[str, float]  # mean |IG| per gene over the correctly classified cells
+    gate: dict
+    embeddings: np.ndarray      # (n_cells, d) residual-stream CLS embedding entering layer NUM_ATTN_LAYERS
+    labels: np.ndarray          # (n_cells,) 0 = control, 1 = PD
+    correct: np.ndarray         # (n_cells,) True where the classifier predicts the true label
+    token_cells: np.ndarray     # (n_tokens,) cell of every gene token of the correctly classified cells
+    token_gids: np.ndarray      # (n_tokens,) its token id
+    token_abs_ig: np.ndarray    # (n_tokens,) its |IG|
+
+
 # Mean absolute integrated gradient per gene over correctly classified cells
 def _compute_ig_importance(
     model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
@@ -77,6 +94,18 @@ def _compute_ig_importance(
     classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
     desc: str = "IG",
 ) -> Tuple[Dict[str, float], dict]:
+    result = _compute_ig_result(model, pt, vocab, device, n_steps, batch_size, classify_batch_size,
+                                internal_batch_size, desc)
+    return result.mean_abs, result.gate
+
+
+# The same, keeping every cell's embedding and every token's |IG| (IGResult)
+def _compute_ig_result(
+    model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
+    device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
+    classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
+    desc: str = "IG",
+) -> IGResult:
 
     # Number of cells and special tokens
     n_cells = pt["gene_ids"].shape[0]
@@ -92,15 +121,23 @@ def _compute_ig_importance(
     # Initialize variables
     labels_all = pt["condition_labels"].numpy()
     preds_all = np.empty(n_cells, dtype=np.int64)
-    # Iterate over cells and classified them
-    for start in progress(range(0, n_cells, classify_batch_size), desc=f"{desc} classify", unit="batch"):
-        # Special case for last batch
-        end = min(start + classify_batch_size, n_cells)
-        gids = pt["gene_ids"][start:end].to(device)
-        vals = pt["values"][start:end].to(device).float()
-        mask = gids.eq(pad_id)
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            preds_all[start:end] = (_pd_logit(model, gids, vals, mask) > 0).long().cpu().numpy()
+    # The same pass keeps each cell's CLS embedding entering the attention
+    # layer (as the zero-shot attention task does), for the CSSI strata
+    embeddings = []
+    capture = common._LayerInputCapture(model.transformer_encoder.layers[common.NUM_ATTN_LAYERS])
+    try:
+        # Iterate over cells and classified them
+        for start in progress(range(0, n_cells, classify_batch_size), desc=f"{desc} classify", unit="batch"):
+            # Special case for last batch
+            end = min(start + classify_batch_size, n_cells)
+            gids = pt["gene_ids"][start:end].to(device)
+            vals = pt["values"][start:end].to(device).float()
+            mask = gids.eq(pad_id)
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                preds_all[start:end] = (_pd_logit(model, gids, vals, mask) > 0).long().cpu().numpy()
+            embeddings.append(capture.captured[:, 0, :].float().cpu().numpy())
+    finally:
+        capture.remove()
 
     # Filter the correctly classified cells
     correct_mask = preds_all == labels_all
@@ -112,6 +149,7 @@ def _compute_ig_importance(
     n_ids = len(vocab)
     sum_abs = np.zeros(n_ids)
     seen = np.zeros(n_ids, dtype=bool)
+    token_cells, token_gids, token_abs_ig = [], [], []
 
     # Iterate over the correctly classified cells in batches, computing IG for each
     bar = progress(total=n_used, desc=desc, unit="cell")
@@ -140,6 +178,9 @@ def _compute_ig_importance(
         keep[:, 0] = False
         sum_abs += np.bincount(gids_np[keep], weights=np.abs(ig[keep]), minlength=n_ids)
         seen[gids_np[keep]] = True
+        token_cells.append(np.repeat(idx.numpy(), keep.sum(axis=1)).astype(np.int32))
+        token_gids.append(gids_np[keep].astype(np.int32))
+        token_abs_ig.append(np.abs(ig[keep]).astype(np.float32))
         bar.update(end - start)
     bar.close()
 
@@ -158,4 +199,40 @@ def _compute_ig_importance(
     gate = {"ok": bool(ok),
             "reason": "" if ok else "no correctly-classified cells",
             "mode": "ig_predictions"}
-    return mean_abs, gate
+    cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)
+    return IGResult(mean_abs=mean_abs, gate=gate, embeddings=np.concatenate(embeddings), labels=labels_all,
+                    correct=correct_mask, token_cells=cat(token_cells, np.int32),
+                    token_gids=cat(token_gids, np.int32), token_abs_ig=cat(token_abs_ig, np.float32))
+
+
+def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
+                         min_cells_per_condition: int = 20) -> Tuple[Dict[str, float], int]:
+    """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
+
+    The mean is over the stratum's correctly classified cells (a cell without
+    the gene adding 0), and a stratum needs min_cells_per_condition of them
+    per condition, as the attention CSSI. Returns (scores, number of valid
+    strata); without any valid stratum the scores are the pooled ones.
+    """
+    n_ids = len(vocab)
+    best = np.zeros(n_ids)
+    seen = np.zeros(n_ids, dtype=bool)
+    token_strata = strata[result.token_cells]
+    valid = 0
+    for stratum in np.unique(strata):
+        cells = (strata == stratum) & result.correct
+        counts = [int(np.sum(cells & (result.labels == c))) for c in (0, 1)]
+        if min(counts) < min_cells_per_condition:
+            continue
+        valid += 1
+        tokens = token_strata == stratum
+        gids = result.token_gids[tokens]
+        means = np.bincount(gids, weights=result.token_abs_ig[tokens], minlength=n_ids) / cells.sum()
+        present = np.bincount(gids, minlength=n_ids) > 0
+        best[present] = np.where(seen[present], np.maximum(best[present], means[present]), means[present])
+        seen |= present
+    if valid == 0:
+        return dict(result.mean_abs), 0
+    seen_ids = np.where(seen)[0]
+    return {name: float(best[gid]) for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist()))
+            if name not in C.SPECIAL_TOKENS}, valid

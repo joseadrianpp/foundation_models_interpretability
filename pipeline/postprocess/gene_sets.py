@@ -5,16 +5,20 @@ A method is one gene ranking of one model, `<ranking>_<model>`:
   * attention_zero_shot_<model>        - pooled CLS attention, PD - control (baseline)
   * attention_cssi_<model>             - CSSI-max attention over Leiden strata (method 2.1)
   * attention_residualized_ols_<model> - OLS residual of the pooled attention (method 2.3)
-for model in scgpt / geneformer, plus the fine-tuned (LoRA) variants:
-  * ig_lora_scgpt                      - Integrated Gradients on the LoRA scGPT model
-  * attention_lora_geneformer          - CLS attention of the LoRA Geneformer model
+for model in scgpt / geneformer, plus the same three rankings of the
+fine-tuned (LoRA) models, on their correctly classified cells:
+  * ig_lora_scgpt / ig_cssi_lora_scgpt / ig_residualized_ols_lora_scgpt
+      - mean |Integrated Gradients| of the LoRA scGPT model: pooled, CSSI-max
+        over the strata of its own embedding, OLS residual
+  * attention_lora_geneformer / attention_cssi_lora_geneformer /
+    attention_residualized_ols_lora_geneformer
+      - CLS attention (PD - control) of the LoRA Geneformer model, the same three
 
 Selections:
   * top30   - static top-30 ranking
   * z-score - genes with score > mean + 2.5 * std (variable size)
   * elbow   - Kneedle elbow on the descending score curve (variable size)
 
-The LoRA variants only write a top-30, so they have no z-score/elbow gene set.
 METHOD_META gives each method's (ranking, model, model form, label), the
 columns that identify an experiment.
 
@@ -68,12 +72,20 @@ for _model in MODELS:
     _register(f"attention_residualized_ols_{_model}", "ols", _model, "zero-shot", "OLS-residual attention (2.3)",
               _dynamic_lists(f"{_ols}/csv/top30.csv", f"{_ols}/csv"),
               f"{_ols}/csv/ols.csv", f"{_ols}/csv/selection_summary.json")
-    if _model == "scgpt":
-        _register("ig_lora_scgpt", "integrated_gradients", "scgpt", "lora", "LoRA (Integrated Gradients)",
-                  {"top30": "ig_lora_scgpt/{ct}/top30_genes.csv"})
-    else:
-        _register("attention_lora_geneformer", "attention", "geneformer", "lora", "LoRA (attention)",
-                  {"top30": "attention_lora_geneformer/{ct}/top30_genes.csv"})
+    # LoRA: the same output layout, pooled + CSSI in one folder and OLS in another
+    _base, _signal = ("ig", "integrated_gradients") if _model == "scgpt" else ("attention", "attention")
+    _label = "LoRA IG" if _model == "scgpt" else "LoRA attention"
+    _lora = f"{_base}_lora_{_model}/{{ct}}"
+    _lora_ols = f"{_base}_residualized_ols_lora_{_model}/{{ct}}"
+    _register(f"{_base}_lora_{_model}", _signal, _model, "lora", f"{_label} (pooled)",
+              _dynamic_lists(f"{_lora}/top30_genes.csv", f"{_lora}/csv"),
+              f"{_lora}/csv/all_genes.csv", f"{_lora}/csv/selection_summary.json")
+    _register(f"{_base}_cssi_lora_{_model}", "cssi", _model, "lora", f"{_label}, CSSI-max",
+              _dynamic_lists(f"{_lora}/cssi/csv/top30.csv", f"{_lora}/cssi/csv"),
+              f"{_lora}/cssi_genes.csv", f"{_lora}/cssi/csv/selection_summary.json")
+    _register(f"{_base}_residualized_ols_lora_{_model}", "ols", _model, "lora", f"{_label}, OLS residual",
+              _dynamic_lists(f"{_lora_ols}/csv/top30.csv", f"{_lora_ols}/csv"),
+              f"{_lora_ols}/csv/ols.csv", f"{_lora_ols}/csv/selection_summary.json")
 
 METHODS = list(GENE_LIST_PATHS)
 
