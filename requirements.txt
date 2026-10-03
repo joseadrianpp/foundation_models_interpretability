@@ -18,3 +18,4 @@ statsmodels==0.15.0
 matplotlib==3.10.8
 go3==1.0.0
 kneed==0.8.6
+tqdm==4.70.1

@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import skew as scipy_skew
 
+from ..utils.progress import progress
 from . import _go3_common as g3c
 from .gene_sets import CELL_TYPES, SELECTIONS, load_genes, methods_for, output_dir
 from .gwas_similarity import DEFAULT_DISTANCES
@@ -106,7 +107,8 @@ def _gene_matrix_for_selection(results_dir: Path, selection: str, entries: list,
 
     # Iterate though references, ontologies and distances
     summary_rows = []
-    for ont, distance in product(ONTOLOGIES, distances):
+    for ont, distance in progress(list(product(ONTOLOGIES, distances)), desc=f"gene_matrix {selection}",
+                                  unit="matrix set"):
         # One cached gene-pair matrix per (ontology, distance) covers every cell_type/disease pair below
         pm = pair_matrices[(ont, distance)]
         for cell_type, ents in groups.items():

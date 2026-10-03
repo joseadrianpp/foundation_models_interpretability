@@ -24,6 +24,7 @@ import torch
 from captum.attr import IntegratedGradients
 
 from .. import config as C
+from ..utils.progress import progress
 
 # Gauss-Legendre interpolation points and forward batch size. IG needs a
 # backward pass per step, so the batch is smaller than the attention path's.
@@ -74,6 +75,7 @@ def _compute_ig_importance(
     model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
     device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
     classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
+    desc: str = "IG",
 ) -> Tuple[Dict[str, float], dict]:
 
     # Number of cells and special tokens
@@ -91,7 +93,7 @@ def _compute_ig_importance(
     labels_all = pt["condition_labels"].numpy()
     preds_all = np.empty(n_cells, dtype=np.int64)
     # Iterate over cells and classified them
-    for start in range(0, n_cells, classify_batch_size):
+    for start in progress(range(0, n_cells, classify_batch_size), desc=f"{desc} classify", unit="batch"):
         # Special case for last batch
         end = min(start + classify_batch_size, n_cells)
         gids = pt["gene_ids"][start:end].to(device)
@@ -112,6 +114,7 @@ def _compute_ig_importance(
     seen = np.zeros(n_ids, dtype=bool)
 
     # Iterate over the correctly classified cells in batches, computing IG for each
+    bar = progress(total=n_used, desc=desc, unit="cell")
     for start in range(0, n_used, batch_size):
         # Special case for last batch
         end = min(start + batch_size, n_used)
@@ -137,6 +140,8 @@ def _compute_ig_importance(
         keep[:, 0] = False
         sum_abs += np.bincount(gids_np[keep], weights=np.abs(ig[keep]), minlength=n_ids)
         seen[gids_np[keep]] = True
+        bar.update(end - start)
+    bar.close()
 
     # Compute the mean IG per gene over every correctly classified cell, a cell
     # without the gene adds 0, so a gene seen in a handful of cells cannot

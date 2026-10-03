@@ -34,6 +34,7 @@ from einops import rearrange
 from . import _step7_common as common
 from . import _step7_geneformer as gf
 from .. import config as C
+from ..utils.progress import progress
 
 DEFAULT_N_NEIGHBORS = 15
 DEFAULT_TARGET_K = 6
@@ -190,23 +191,25 @@ SCGPT_ATTN_BATCH_SIZE = 16
 
 def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
                   device: torch.device, n_cls: int = 2,
-                  batch_size: int = SCGPT_ATTN_BATCH_SIZE) -> AttentionCache:
+                  batch_size: int = SCGPT_ATTN_BATCH_SIZE, desc: str = "attention") -> AttentionCache:
     """One scGPT forward pass over the tokenised cells of one cell type."""
     special_ids = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}))
     builder = _CacheBuilder()
     n_cells = pt["gene_ids"].shape[0]
-    for start in range(0, n_cells, batch_size):
-        end = min(start + batch_size, n_cells)
-        batch = {k: v[start:end] for k, v in pt.items()}
-        cls_attn, _, embeddings = _forward_cls_attention_with_embedding(
-            model, batch, vocab, n_head, device, n_cls
-        )
-        gids = batch["gene_ids"].numpy()
-        # Position 0 is the CLS itself; pads and special tokens are not genes
-        keep = ~np.isin(gids, special_ids)
-        keep[:, 0] = False
-        builder.add(gids, cls_attn.cpu().numpy(), keep,
-                    batch["condition_labels"].numpy(), embeddings.cpu().numpy())
+    with progress(total=n_cells, desc=desc, unit="cell") as bar:
+        for start in range(0, n_cells, batch_size):
+            end = min(start + batch_size, n_cells)
+            batch = {k: v[start:end] for k, v in pt.items()}
+            cls_attn, _, embeddings = _forward_cls_attention_with_embedding(
+                model, batch, vocab, n_head, device, n_cls
+            )
+            gids = batch["gene_ids"].numpy()
+            # Position 0 is the CLS itself; pads and special tokens are not genes
+            keep = ~np.isin(gids, special_ids)
+            keep[:, 0] = False
+            builder.add(gids, cls_attn.cpu().numpy(), keep,
+                        batch["condition_labels"].numpy(), embeddings.cpu().numpy())
+            bar.update(end - start)
     return builder.build(
         lambda ids: vocab.lookup_tokens([int(i) for i in ids]),
         f"scGPT residual-stream CLS embedding entering transformer layer {common.NUM_ATTN_LAYERS}",
@@ -215,7 +218,7 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
 
 def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
                        device: torch.device, batch_size: int = gf.ATTN_BATCH_SIZE,
-                       use_predictions: bool = False) -> AttentionCache:
+                       use_predictions: bool = False, desc: str = "attention") -> AttentionCache:
     """One Geneformer forward pass over the tokenised cells of one cell type.
 
     Cells are batched by length so each batch carries little padding (cells
@@ -229,15 +232,18 @@ def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
     labels = pt["condition_labels"].numpy()
     order = np.argsort([len(s) for s in pt["input_ids"]], kind="stable")
     builder = _CacheBuilder()
-    for start in range(0, len(order), batch_size):
-        idx = order[start:start + batch_size]
-        ids, attn = gf._pad_batch([pt["input_ids"][i] for i in idx], pad_id, device)
-        cls_attn, preds, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, use_predictions)
-        gids = ids.cpu().numpy()
-        keep = ~np.isin(gids, special_ids)
-        keep[:, 0] = False
-        builder.add(gids, cls_attn.cpu().numpy(), keep, labels[idx], embeddings.cpu().numpy(),
-                    None if preds is None else preds.cpu().numpy())
+    # Shortest cells first, so the rate falls as the batches get longer
+    with progress(total=len(order), desc=desc, unit="cell") as bar:
+        for start in range(0, len(order), batch_size):
+            idx = order[start:start + batch_size]
+            ids, attn = gf._pad_batch([pt["input_ids"][i] for i in idx], pad_id, device)
+            cls_attn, preds, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, use_predictions)
+            gids = ids.cpu().numpy()
+            keep = ~np.isin(gids, special_ids)
+            keep[:, 0] = False
+            builder.add(gids, cls_attn.cpu().numpy(), keep, labels[idx], embeddings.cpu().numpy(),
+                        None if preds is None else preds.cpu().numpy())
+            bar.update(len(idx))
     return builder.build(
         lambda ids: [gene_names[int(i)] for i in ids],
         f"Geneformer residual-stream CLS embedding entering encoder layer {gf.NUM_ATTN_LAYER}",
@@ -281,6 +287,7 @@ def _leiden_from_embeddings(
     resolutions=DEFAULT_RESOLUTIONS,
     random_state: int = 42,
     embedding_source: str = "",
+    desc: str = "Leiden",
 ):
     """Build cosine k-NN graph and choose Leiden resolution closest to target_k."""
     embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -302,7 +309,7 @@ def _leiden_from_embeddings(
     )
 
     candidates = []
-    for resolution in resolutions:
+    for resolution in progress(resolutions, desc=desc, unit="resolution"):
         sc.tl.leiden(
             graph_adata,
             resolution=float(resolution),
@@ -336,6 +343,7 @@ def compute_attention_cssi(
     target_k: int = DEFAULT_TARGET_K,
     min_cells_per_condition: int = 20,
     random_state: int = 42,
+    desc: str = "Leiden",
 ):
     """Pooled means, CSSI-max gene scores and Leiden labels from one cache.
 
@@ -358,6 +366,7 @@ def compute_attention_cssi(
         target_k=target_k,
         random_state=random_state,
         embedding_source=cache.embedding_source,
+        desc=desc,
     )
 
     pooled_means = condition_means(cache)

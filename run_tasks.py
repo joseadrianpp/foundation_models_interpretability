@@ -51,6 +51,7 @@ from pipeline.steps import attention_cssi_leiden as cssi
 from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.steps import step7_attention_residualized_ols as residualized_ols
 from pipeline.steps import step7_explainability_ig_scgpt as ig
+from pipeline.utils import progress
 from pipeline.utils.geneformer_model import load_gene_names, load_token_dictionary
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 
@@ -215,6 +216,7 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
         target_k=CSSI_TARGET_K,
         min_cells_per_condition=CSSI_MIN_CELLS_PER_CONDITION,
         random_state=SEED,
+        desc=f"{out_dir.parent.name} {out_dir.name} Leiden",
     )
     if not gate["ok"]:
         print(f"  skipped: {gate['reason']}", flush=True)
@@ -290,7 +292,8 @@ def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device
 
         # One forward pass; pooled, CSSI and donor-level scores all read this cache
         cache = cssi.collect_scgpt(model, pt, vocab, model_configs["nheads"], device, n_cls=2,
-                                   batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale)
+                                   batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale,
+                                   desc=f"attention_scgpt {slug} [{device}]")
         _write_attention_outputs(cache, results_dir / "attention_zero_shot_scgpt" / slug, donor_ids)
 
     del model
@@ -314,7 +317,8 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 
         mean_abs, gate = ig._compute_ig_importance(
             model, pt, vocab, device, batch_size=ig.IG_BATCH_SIZE * scale,
-            internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale)
+            internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale,
+            desc=f"ig_lora_scgpt {slug} [{device}]")
 
         if not gate["ok"]:
             print(f"  skipped: {gate['reason']}", flush=True)
@@ -342,7 +346,8 @@ def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.d
         print(f"\n# attention_geneformer | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #",
               flush=True)
         cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device,
-                                        batch_size=gf.ATTN_BATCH_SIZE * scale)
+                                        batch_size=gf.ATTN_BATCH_SIZE * scale,
+                                        desc=f"attention_geneformer {slug} [{device}]")
         _write_attention_outputs(cache, results_dir / "attention_zero_shot_geneformer" / slug)
 
     del model
@@ -363,7 +368,8 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
         print(f"\n# attention_lora_geneformer | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #",
               flush=True)
         cache = cssi.collect_geneformer(model, gf._to_inputs(sub), token_dict, gene_names, device,
-                                        batch_size=gf.ATTN_BATCH_SIZE * scale, use_predictions=True)
+                                        batch_size=gf.ATTN_BATCH_SIZE * scale, use_predictions=True,
+                                        desc=f"attention_lora_geneformer {slug} [{device}]")
         n_correct = {c: int(np.sum(cache.correct & (cache.labels == c))) for c in (0, 1)}
         if min(n_correct.values()) == 0:
             print(f"  skipped: correctly-classified counts: control={n_correct[0]}, pd={n_correct[1]}",
@@ -441,6 +447,8 @@ def _gpu_worker(task_name, gpu_id, cell_types, data_dir, results_dir, opts):
     # Prevent each worker from consuming all CPU threads.
     torch.set_num_threads(1)
     np.random.seed(SEED)
+    # The workers share one output: progress as lines, not redrawn bars
+    progress.use_line_mode()
 
     print(
         f"[worker GPU {gpu_id}] starting {task_name}; "

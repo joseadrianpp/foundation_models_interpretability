@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pandas as pd
 from gprofiler import GProfiler
+from tqdm import tqdm
 
+from ..utils.progress import progress
 from .gene_sets import CELL_TYPES, SELECTIONS, load_genes, methods_for, output_dir
 from .plots import plot_gene_set_overview
 
@@ -31,26 +33,26 @@ def _enrichment_for_selection(gp: GProfiler, results_dir: Path, selection: str) 
     out_dir = output_dir(results_dir, "enrichment", selection)
     manifest_rows = []
 
-    # Iterate over methods and cell types
-    for method in methods_for(selection):
-        for cell_type in CELL_TYPES:
-            genes = load_genes(results_dir, method, selection, cell_type)
-            if not genes:
-                continue
-            sig_df = _run_enrichment(gp, genes)
+    # Iterate over methods and cell types (one g:Profiler query per pair)
+    pairs = [(m, c) for m in methods_for(selection) for c in CELL_TYPES]
+    for method, cell_type in progress(pairs, desc=f"g:Profiler {selection}", unit="set"):
+        genes = load_genes(results_dir, method, selection, cell_type)
+        if not genes:
+            continue
+        sig_df = _run_enrichment(gp, genes)
 
-            # Write the significant terms of this (method, cell type) pair
-            method_dir = out_dir / method
-            method_dir.mkdir(parents=True, exist_ok=True)
-            sig_df.to_csv(method_dir / f"{cell_type}.csv", index=False)
+        # Write the significant terms of this (method, cell type) pair
+        method_dir = out_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        sig_df.to_csv(method_dir / f"{cell_type}.csv", index=False)
 
-            # Track number of terms counts across all pairs
-            # This will be saved in manifest.csv
-            manifest_rows.append({
-                "method": method, "cell_type": cell_type,
-                "n_query_genes": len(genes), "n_significant_terms": len(sig_df),
-            })
-            print(f"[{selection}/{method}/{cell_type}] {len(genes)} genes -> {len(sig_df)} significant terms")
+        # Track number of terms counts across all pairs
+        # This will be saved in manifest.csv
+        manifest_rows.append({
+            "method": method, "cell_type": cell_type,
+            "n_query_genes": len(genes), "n_significant_terms": len(sig_df),
+        })
+        tqdm.write(f"[{selection}/{method}/{cell_type}] {len(genes)} genes -> {len(sig_df)} significant terms")
 
     # One-row-per-pair summary of how many genes went in and terms came out
     manifest = pd.DataFrame(manifest_rows)

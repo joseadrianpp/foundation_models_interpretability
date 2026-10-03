@@ -98,6 +98,8 @@ Run in this order, or all at once with `--task postprocess`. `enrichment` (g:Pro
 
 Set `GO3_THREADS` to limit the CPU threads of the GO3 tasks (default: every core). Run with `python -u` (or `PYTHONUNBUFFERED=1`) when the output goes to a log file, so progress shows up as it happens.
 
+The long loops (model forward passes, IG, Leiden resolutions, GO3 gene pairs, g:Profiler queries, gene matrices) show tqdm progress bars. When the output goes to a file, or with `--gpus` (several workers share one output), each bar is printed as one line every 30 s (`PROGRESS_INTERVAL` changes it) instead of being redrawn, so the logs stay readable; follow one task with e.g. `tail -f logs/B_attention_geneformer.log`.
+
 ### Run time
 
 The GO3 similarity of `gwas_similarity` and `gene_matrix` dominates the post-hoc time: it grows with (genes in the gene sets) x (genes in the references, 1646 in total, 799 of them in the ParkinsonsUK-UCL panel), and the Geneformer z-score/elbow sets hold hundreds of genes. Every gene-to-gene similarity is therefore computed once per (ontology, distance) and cached in `results/go3_pair_cache/` (shared by both datasets, every selection and both tasks; it only depends on the GO files, delete it if `data/go3_refs/` changes). For the gene sets of a 200-cells-per-type run, the first post-hoc run is estimated at ~2.3 h on 24 cores with three distances and ~0.8 h with `--distances SimRel` (~9-11 h before the cache); later runs only compute pairs of genes not seen before.
@@ -123,7 +125,7 @@ nohup bash scripts/run_full.sh > /dev/null 2>&1 &
 tail -f logs/run_full.log
 ```
 
-`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS` and `LOG_DIR` override its defaults (see the script header).
+`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS`, `LOG_DIR` and `PROGRESS_INTERVAL` override its defaults (see the script header). `watch -n 30 bash scripts/progress.sh` shows the latest progress line of every running bar.
 
 A quick end-to-end check before a full run: `--task all --max-cells-per-type 200`, then `--task postprocess --selection top30 --distances SimRel` (~20 min on 24 cores).
 

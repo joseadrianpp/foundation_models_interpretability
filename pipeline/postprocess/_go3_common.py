@@ -21,6 +21,8 @@ import pandas as pd
 
 import go3
 
+from ..utils.progress import progress
+
 REFS_DIR = Path(__file__).resolve().parents[2] / "data" / "go3_refs"
 OBO_PATH = REFS_DIR / "go-basic.obo"
 GAF_PATH = REFS_DIR / "goa_human.gaf"
@@ -179,13 +181,14 @@ def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_
     if len(missing):
         print(f"[go3 {ontology} {distance}] {len(missing):,} new gene pairs to compute "
               f"({n_total - len(missing):,} of {n_total:,} cached)", flush=True)
-        for start in range(0, len(missing), PAIR_CHUNK):
-            chunk = missing[start:start + PAIR_CHUNK]
-            pairs = [(all_genes[rows[i]], all_refs[cols[j]]) for i, j in chunk]
-            sims = go3.compare_gene_pairs_batch(pairs, ontology, distance, PAIR_GROUPWISE, counter)
-            values[rows[chunk[:, 0]], cols[chunk[:, 1]]] = sims
-            print(f"[go3 {ontology} {distance}] {min(start + PAIR_CHUNK, len(missing)):,}"
-                  f"/{len(missing):,} pairs", flush=True)
+        with progress(total=len(missing), desc=f"go3 {ontology} {distance}", unit="pair",
+                      unit_scale=True) as bar:
+            for start in range(0, len(missing), PAIR_CHUNK):
+                chunk = missing[start:start + PAIR_CHUNK]
+                pairs = [(all_genes[rows[i]], all_refs[cols[j]]) for i, j in chunk]
+                sims = go3.compare_gene_pairs_batch(pairs, ontology, distance, PAIR_GROUPWISE, counter)
+                values[rows[chunk[:, 0]], cols[chunk[:, 1]]] = sims
+                bar.update(len(chunk))
         # Another run may have added pairs meanwhile: merge the file on disk under the lock
         with _locked(lock):
             disk_genes, disk_refs, disk_values = _load_pairs(path)
