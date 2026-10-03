@@ -21,8 +21,10 @@ _step7_common._compute_attn_per_gene_per_condition: a gene seen in a handful
 of cells cannot outrank one seen in all of them.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 import json
+import multiprocessing as mp
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import anndata as ad
@@ -45,6 +47,15 @@ DEFAULT_RESOLUTIONS = tuple(np.geomspace(0.1, 2.5, 25))
 # every resolution. On scGPT astrocytes of Dataset A (24k cells) it gives the
 # same strata as the full sweep in about a third of the time
 LEIDEN_PATIENCE = 3
+# Leiden is single-threaded, so on cell types of at least
+# LEIDEN_PARALLEL_MIN_CELLS cells the resolutions run in batches of
+# LEIDEN_PROCESSES parallel processes. Each process takes ~40 s to start
+# (imports), so smaller cell types run one resolution at a time. Every Leiden
+# call is deterministic, so the strata are the same either way (scGPT
+# astrocytes of Dataset A, 24k cells: 3.9 min instead of 7.7; the gain grows
+# with the time per resolution, i.e. with the cell type)
+LEIDEN_PROCESSES = 8
+LEIDEN_PARALLEL_MIN_CELLS = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +297,24 @@ def condition_means(cache: AttentionCache,
     return means
 
 
+# k-NN graph of the Leiden worker processes, set once per process
+_LEIDEN_GRAPH = None
+
+
+def _set_leiden_graph(graph) -> None:
+    global _LEIDEN_GRAPH
+    _LEIDEN_GRAPH = graph
+
+
+def _leiden_labels(resolution: float, random_state: int, graph=None) -> np.ndarray:
+    """Leiden cluster of every cell at one resolution (graph: the worker's if None)."""
+    graph = _LEIDEN_GRAPH if graph is None else graph
+    adata = ad.AnnData(X=np.zeros((graph.shape[0], 1), dtype=np.float32))
+    sc.tl.leiden(adata, adjacency=graph, resolution=float(resolution), random_state=random_state,
+                 key_added="_leiden", directed=False)
+    return adata.obs["_leiden"].astype(int).to_numpy()
+
+
 def _leiden_from_embeddings(
     embeddings: np.ndarray,
     n_neighbors: int = DEFAULT_N_NEIGHBORS,
@@ -299,7 +328,8 @@ def _leiden_from_embeddings(
     """Build cosine k-NN graph and choose Leiden resolution closest to target_k.
 
     Resolutions are tried in increasing order, stopping early after
-    `patience` consecutive resolutions above target_k clusters.
+    `patience` consecutive resolutions above target_k clusters, in parallel
+    batches on large cell types (LEIDEN_PROCESSES).
     """
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2 or embeddings.shape[0] < 3:
@@ -318,23 +348,36 @@ def _leiden_from_embeddings(
         metric="cosine",
         random_state=random_state,
     )
+    graph = graph_adata.obsp["connectivities"]
 
-    candidates, sweep, above = [], [], 0
-    for resolution in progress(sorted(resolutions), desc=desc, unit="resolution"):
-        sc.tl.leiden(
-            graph_adata,
-            resolution=float(resolution),
-            random_state=random_state,
-            key_added="_leiden",
-            directed=False,
-        )
-        labels = graph_adata.obs["_leiden"].astype(int).to_numpy()
-        n_clusters = int(np.unique(labels).size)
-        candidates.append((abs(n_clusters - target_k), -n_clusters, float(resolution), labels.copy()))
-        sweep.append([float(resolution), n_clusters])
-        above = above + 1 if n_clusters > target_k else 0
-        if patience and above >= patience:
-            break
+    # Results are read in resolution order, so the early stop and the choice
+    # below see exactly what a one-at-a-time sweep sees
+    resolutions = sorted(resolutions)
+    n_proc = LEIDEN_PROCESSES if embeddings.shape[0] >= LEIDEN_PARALLEL_MIN_CELLS else 1
+    # spawn, not fork: the calling process may hold a CUDA context
+    pool = (ProcessPoolExecutor(n_proc, mp_context=mp.get_context("spawn"),
+                                initializer=_set_leiden_graph, initargs=(graph,)) if n_proc > 1 else None)
+    candidates, sweep, above, stop = [], [], 0, False
+    try:
+        with progress(total=len(resolutions), desc=desc, unit="resolution") as bar:
+            for start in range(0, len(resolutions), n_proc):
+                batch = resolutions[start:start + n_proc]
+                results = (pool.map(_leiden_labels, batch, [random_state] * len(batch)) if pool
+                           else (_leiden_labels(r, random_state, graph) for r in batch))
+                for resolution, labels in zip(batch, results):
+                    n_clusters = int(np.unique(labels).size)
+                    candidates.append((abs(n_clusters - target_k), -n_clusters, float(resolution), labels))
+                    sweep.append([float(resolution), n_clusters])
+                    bar.update(1)
+                    above = above + 1 if n_clusters > target_k else 0
+                    if patience and above >= patience:
+                        stop = True
+                        break
+                if stop:
+                    break
+    finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
 
     _, _, best_resolution, best_labels = min(candidates, key=lambda x: (x[0], x[1], x[2]))
     meta = {
