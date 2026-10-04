@@ -24,6 +24,7 @@ tasks' output, so they need 1 / 3 to have run first with the same
 
 import argparse
 import csv
+import json
 import sys
 from multiprocessing import get_context
 from pathlib import Path
@@ -204,14 +205,43 @@ def _split_cell_types(counts: dict, n_workers: int):
     return workers, loads
 
 
+def _saved_strata(out_dir: Path, embeddings: np.ndarray, embedding_source: str):
+    """(strata, metadata) an earlier run left in `out_dir` for these exact embeddings, or None.
+
+    Leiden is deterministic, so with bit-identical embeddings and the same
+    Leiden settings the strata of a rerun are the saved ones; reusing them
+    skips the sweep (an hour on Dataset B oligodendrocytes).
+    """
+    try:
+        saved = np.load(out_dir / "cell_embeddings.npy")
+        meta = json.loads((out_dir / "cssi_metadata.json").read_text())
+        strata = pd.read_csv(out_dir / "leiden_clusters.csv")["leiden"].to_numpy()
+    except (FileNotFoundError, ValueError, KeyError):
+        return None
+    sweep = meta.get("resolution_sweep")
+    if not (sweep and saved.shape == embeddings.shape and np.array_equal(saved, embeddings)
+            and strata.size == len(embeddings)
+            and meta.get("n_neighbors") == min(CSSI_N_NEIGHBORS, len(embeddings) - 1)
+            and meta.get("target_k") == CSSI_TARGET_K and meta.get("embedding_source") == embedding_source
+            and meta.get("leiden_patience", cssi.LEIDEN_PATIENCE) == cssi.LEIDEN_PATIENCE
+            and np.allclose([r for r, _ in sweep], cssi.DEFAULT_RESOLUTIONS[:len(sweep)])):
+        return None
+    print("  Leiden: same embeddings as the saved run, reusing its strata", flush=True)
+    keys = ["n_neighbors", "resolution", "n_clusters", "target_k", "metric", "embedding_source",
+            "resolution_sweep"]
+    return strata, {**{k: meta[k] for k in keys}, "leiden_patience": cssi.LEIDEN_PATIENCE}
+
+
 def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_ids=None,
-                             cell_mask=None) -> None:
+                             cell_mask=None, save_cells: bool = False) -> None:
     """Pooled + CSSI scores, dynamic selections and Leiden artifacts of one cell type.
 
     Model independent: it only reads the AttentionCache. With `donor_ids`
     the donor-level permutation selector also runs (--permutation). With
     `cell_mask` the scores only use those cells (the correctly classified
-    ones of a fine-tuned classifier); Leiden still clusters every cell.
+    ones of a fine-tuned classifier); Leiden still clusters every cell. With
+    `save_cells` the per-cell token scores go to cell_scores.npz, so CSSI can
+    be recomputed without the model.
     """
     means, cssi_scores, gate, strata, meta = cssi.compute_attention_cssi(
         cache,
@@ -221,6 +251,7 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
         random_state=SEED,
         desc=f"{out_dir.parent.name} {out_dir.name} Leiden",
         cell_mask=cell_mask,
+        precomputed_strata=_saved_strata(out_dir, cache.embeddings, cache.embedding_source),
     )
     if not gate["ok"]:
         print(f"  skipped: {gate['reason']}", flush=True)
@@ -236,6 +267,8 @@ def _write_attention_outputs(cache: cssi.AttentionCache, out_dir: Path, donor_id
                             labels=donor_data["labels"], genes=np.asarray(donor_data["genes"]),
                             scores=donor_data["scores"])
     _write_score_outputs(pooled_scores, cssi_scores, strata, meta, cache.embeddings, out_dir, donor_data)
+    if save_cells:
+        cache.save(out_dir / "cell_scores.npz")
 
 
 def _write_score_outputs(pooled_scores: dict, cssi_scores: dict, strata: np.ndarray, meta: dict,
@@ -342,16 +375,18 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 
         # CSSI: Leiden strata of the LoRA model's own cell embedding, each
         # gene scored by its largest mean |IG| over the valid strata
-        strata, meta = cssi._leiden_from_embeddings(
+        out_dir = results_dir / "ig_lora_scgpt" / slug
+        source = f"scGPT LoRA residual-stream CLS embedding entering transformer layer {common.NUM_ATTN_LAYERS}"
+        saved = _saved_strata(out_dir, result.embeddings, source)
+        strata, meta = saved if saved is not None else cssi._leiden_from_embeddings(
             result.embeddings, n_neighbors=CSSI_N_NEIGHBORS, target_k=CSSI_TARGET_K, random_state=SEED,
-            embedding_source=f"scGPT LoRA residual-stream CLS embedding entering transformer layer "
-                             f"{common.NUM_ATTN_LAYERS}",
-            desc=f"ig_lora_scgpt {slug} Leiden")
+            embedding_source=source, desc=f"ig_lora_scgpt {slug} Leiden")
         cssi_scores, valid_strata = ig.stratified_ig_scores(result, strata, vocab, CSSI_MIN_CELLS_PER_CONDITION)
         meta.update(valid_strata=valid_strata, n_cells=int(result.labels.size),
                     n_cells_scored=int(result.correct.sum()), n_embedding_dims=int(result.embeddings.shape[1]))
-        _write_score_outputs(result.mean_abs, cssi_scores, strata, meta, result.embeddings,
-                             results_dir / "ig_lora_scgpt" / slug)
+        _write_score_outputs(result.mean_abs, cssi_scores, strata, meta, result.embeddings, out_dir)
+        # Per-cell |IG| of every token, so CSSI can be recomputed without the model
+        result.save(out_dir / "cell_scores.npz")
 
     del model
     torch.cuda.empty_cache()
@@ -403,7 +438,8 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
                   flush=True)
             continue
         # Pooled, CSSI (strata of the LoRA model's own embedding) and selections
-        _write_attention_outputs(cache, results_dir / "attention_lora_geneformer" / slug, cell_mask=cache.correct)
+        _write_attention_outputs(cache, results_dir / "attention_lora_geneformer" / slug, cell_mask=cache.correct,
+                                 save_cells=True)
 
     del model
     torch.cuda.empty_cache()

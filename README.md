@@ -162,7 +162,7 @@ Fine-tuned (LoRA) models, the same three rankings on their correctly classified 
 
 - **Integrated Gradients** (`ig_lora_scgpt`): mean absolute attribution to the PD logit of the LoRA scGPT classifier over every correctly classified cell (0 where the gene is absent).
 - **LoRA attention** (`attention_lora_geneformer`): the pooled attention score of the LoRA Geneformer classifier, on its correctly classified cells.
-- **CSSI-max** (`ig_cssi_lora_scgpt`, `attention_cssi_lora_geneformer`): Leiden strata (as above) of the LoRA model's own CLS embedding, over every cell; each gene keeps its maximum over the strata with at least 20 correctly classified cells per condition of the stratum's score: mean |IG| over the stratum's correctly classified cells, or their PD - control attention.
+- **CSSI-max** (`ig_cssi_lora_scgpt`, `attention_cssi_lora_geneformer`): Leiden strata (as above) of the LoRA model's own CLS embedding, over every cell; each gene keeps its maximum over the valid strata of the stratum's score: mean |IG| over the stratum's correctly classified cells, or their PD - control attention. A stratum is valid with at least 20 cells per condition counting every cell, and at least one correctly classified cell (of each condition for attention): the fine-tuned embedding groups cells by the model's prediction, so its correctly classified controls gather in one or two strata. The per-cell scores are kept in `cell_scores.npz`, so CSSI can be recomputed on CPU (`AttentionCache.load`, `IGResult.load`).
 - **OLS-residualized** (`ig_residualized_ols_lora_scgpt`, `attention_residualized_ols_lora_geneformer`): the same OLS on the pooled score, with the covariates of every cell of the cell type.
 
 ### Gene-set selections
@@ -196,6 +196,7 @@ attention_zero_shot_<model>/<ct>/
 ├── cssi_genes.csv               CSSI ranking, every gene
 ├── cssi/csv/{top30,z-score,elbow}.csv + selection_summary.json
 ├── cell_embeddings.npy, leiden_clusters.csv, cssi_metadata.json
+├── cell_scores.npz              LoRA folders only: per-cell token scores
 attention_residualized_ols_<model>/<ct>/
 ├── residualized_genes.csv       score, OLS fit, residual and covariates of every gene
 ├── csv/ols.csv                  residual ranking, every gene

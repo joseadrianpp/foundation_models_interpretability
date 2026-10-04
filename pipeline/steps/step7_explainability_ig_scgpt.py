@@ -86,6 +86,25 @@ class IGResult:
     token_gids: np.ndarray      # (n_tokens,) its token id
     token_abs_ig: np.ndarray    # (n_tokens,) its |IG|
 
+    def save(self, path) -> None:
+        """Per-cell token |IG| to one .npz (embeddings excluded: cell_embeddings.npy)."""
+        np.savez(path, labels=self.labels, correct=self.correct, token_cells=self.token_cells,
+                 token_gids=self.token_gids, token_abs_ig=self.token_abs_ig)
+
+    @classmethod
+    def load(cls, path, embeddings: np.ndarray, vocab) -> "IGResult":
+        """A saved IGResult; the pooled mean |IG| is recomputed (equal up to summation order)."""
+        with np.load(path, allow_pickle=False) as npz:
+            data = {k: npz[k] for k in npz.files}
+        n_used = int(data["correct"].sum())
+        sums = np.bincount(data["token_gids"], weights=data["token_abs_ig"], minlength=len(vocab))
+        seen_ids = np.unique(data["token_gids"])
+        mean_abs = {name: float(sums[gid]) / n_used
+                    for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist()))
+                    if name not in C.SPECIAL_TOKENS}
+        return cls(mean_abs=mean_abs, gate={"ok": n_used > 0, "reason": "", "mode": "ig_predictions"},
+                   embeddings=embeddings, **data)
+
 
 # Mean absolute integrated gradient per gene over correctly classified cells
 def _compute_ig_importance(
@@ -210,9 +229,12 @@ def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
     """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
 
     The mean is over the stratum's correctly classified cells (a cell without
-    the gene adding 0), and a stratum needs min_cells_per_condition of them
-    per condition, as the attention CSSI. Returns (scores, number of valid
-    strata); without any valid stratum the scores are the pooled ones.
+    the gene adding 0). A stratum is valid with min_cells_per_condition cells
+    per condition counting every cell, as the attention CSSI, and at least one
+    correctly classified cell (the LoRA embedding groups cells by the
+    model's prediction, so its correctly classified controls gather in one
+    or two strata). Returns (scores, number of valid strata); without any
+    valid stratum the scores are the pooled ones.
     """
     n_ids = len(vocab)
     best = np.zeros(n_ids)
@@ -220,9 +242,10 @@ def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
     token_strata = strata[result.token_cells]
     valid = 0
     for stratum in np.unique(strata):
-        cells = (strata == stratum) & result.correct
-        counts = [int(np.sum(cells & (result.labels == c))) for c in (0, 1)]
-        if min(counts) < min_cells_per_condition:
+        in_stratum = strata == stratum
+        cells = in_stratum & result.correct
+        counts = [int(np.sum(in_stratum & (result.labels == c))) for c in (0, 1)]
+        if min(counts) < min_cells_per_condition or not cells.any():
             continue
         valid += 1
         tokens = token_strata == stratum

@@ -84,6 +84,21 @@ class AttentionCache:
     def n_cells(self) -> int:
         return int(self.labels.size)
 
+    def save(self, path) -> None:
+        """Per-cell token scores to one .npz (embeddings excluded: cell_embeddings.npy)."""
+        np.savez(path, gene_idx=self.gene_idx, attn=self.attn, cell_ptr=self.cell_ptr, labels=self.labels,
+                 genes=self.genes.astype(str), embedding_source=np.asarray(self.embedding_source),
+                 correct=np.zeros(0, bool) if self.correct is None else self.correct)
+
+    @classmethod
+    def load(cls, path, embeddings: np.ndarray) -> "AttentionCache":
+        with np.load(path, allow_pickle=False) as npz:
+            correct = npz["correct"]
+            return cls(gene_idx=npz["gene_idx"], attn=npz["attn"], cell_ptr=npz["cell_ptr"],
+                       labels=npz["labels"], embeddings=embeddings, genes=npz["genes"],
+                       embedding_source=str(npz["embedding_source"]),
+                       correct=correct if correct.size else None)
+
     # Cell index of every token
     @property
     def token_cells(self) -> np.ndarray:
@@ -389,6 +404,7 @@ def _leiden_from_embeddings(
         "embedding_source": embedding_source,
         # [resolution, number of clusters] of every resolution tried
         "resolution_sweep": sweep,
+        "leiden_patience": patience,
     }
     return best_labels.astype(int), meta
 
@@ -405,13 +421,18 @@ def compute_attention_cssi(
     random_state: int = 42,
     desc: str = "Leiden",
     cell_mask: Optional[np.ndarray] = None,
+    precomputed_strata: Optional[Tuple[np.ndarray, dict]] = None,
 ):
     """Pooled means, CSSI-max gene scores and Leiden labels from one cache.
 
-    Leiden clusters every cell; the scores only use the cells in `cell_mask`
+    Leiden clusters every cell (or `precomputed_strata` = (strata, metadata)
+    of an earlier run is used); the scores only use the cells in `cell_mask`
     (all by default; the correctly classified ones for a fine-tuned
-    classifier), and a stratum needs min_cells_per_condition of them per
-    condition. Returns (pooled_means, cssi_scores, gate, strata, metadata).
+    classifier). A stratum is valid with min_cells_per_condition cells per
+    condition counting every cell, and at least one scored cell per
+    condition (a fine-tuned model's embedding groups cells by its prediction,
+    so its correctly classified controls gather in one or two strata).
+    Returns (pooled_means, cssi_scores, gate, strata, metadata).
     """
     n_cells = cache.n_cells
     labels = cache.labels
@@ -425,28 +446,32 @@ def compute_attention_cssi(
         }
         return {}, {}, gate, np.zeros(n_cells, dtype=int), {}
 
-    strata, cluster_meta = _leiden_from_embeddings(
-        cache.embeddings,
-        n_neighbors=n_neighbors,
-        target_k=target_k,
-        random_state=random_state,
-        embedding_source=cache.embedding_source,
-        desc=desc,
-    )
+    if precomputed_strata is not None:
+        strata, cluster_meta = precomputed_strata[0], dict(precomputed_strata[1])
+    else:
+        strata, cluster_meta = _leiden_from_embeddings(
+            cache.embeddings,
+            n_neighbors=n_neighbors,
+            target_k=target_k,
+            random_state=random_state,
+            embedding_source=cache.embedding_source,
+            desc=desc,
+        )
 
     pooled_means = condition_means(cache, cell_mask)
     cssi_scores = {}
     valid_strata = 0
 
     for stratum in np.unique(strata):
-        in_stratum = (strata == stratum) & scored
+        in_stratum = strata == stratum
         cells_control = int(np.sum(in_stratum & (labels == 0)))
         cells_pd = int(np.sum(in_stratum & (labels == 1)))
-        if min(cells_control, cells_pd) < min_cells_per_condition:
+        scored_counts = [int(np.sum(in_stratum & scored & (labels == c))) for c in (0, 1)]
+        if min(cells_control, cells_pd) < min_cells_per_condition or min(scored_counts) == 0:
             continue
         valid_strata += 1
 
-        scores = common._gene_scores(condition_means(cache, in_stratum), _signed)
+        scores = common._gene_scores(condition_means(cache, in_stratum & scored), _signed)
         for gene, score in scores.items():
             # CSSI-max is the maximum signed stratum-specific contrast.
             if gene not in cssi_scores or score > cssi_scores[gene]:

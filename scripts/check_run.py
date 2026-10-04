@@ -131,8 +131,8 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
             if meta["n_cells"] != expected[model].get(ct):
                 rep.fail(f"{folder} {ct}: used {meta['n_cells']} cells, the data has {expected[model].get(ct)}")
             if meta["valid_strata"] == 0:
-                rep.warn(f"{folder} {ct}: no Leiden stratum with >= {rt.CSSI_MIN_CELLS_PER_CONDITION} scored "
-                         "cells per condition, the CSSI score is the pooled one")
+                rep.warn(f"{folder} {ct}: no valid Leiden stratum (>= {rt.CSSI_MIN_CELLS_PER_CONDITION} cells "
+                         "per condition), the CSSI score is the pooled one")
             if ols is None:
                 rep.fail(f"{ols_folder} {ct}: ols_summary.json missing")
             elif ols["n_cells"] != meta["n_cells"]:

@@ -36,7 +36,8 @@ models() {  # $1 = dataset
     $RUN --task $T --dataset $1 --gpus "$GPUS" > "$LOG_DIR/$1_$T.log" 2>&1
     stamp "end $1 $T (exit $?)"
   done
-  for T in attention_residualized_ols_scgpt attention_residualized_ols_geneformer; do
+  for T in attention_residualized_ols_scgpt attention_residualized_ols_geneformer \
+           ig_residualized_ols_lora_scgpt attention_residualized_ols_lora_geneformer; do
     stamp "start $1 $T -> $LOG_DIR/$1_$T.log"
     $RUN --task $T --dataset $1 > "$LOG_DIR/$1_$T.log" 2>&1
     stamp "end $1 $T (exit $?)"
