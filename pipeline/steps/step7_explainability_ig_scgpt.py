@@ -229,12 +229,10 @@ def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
     """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
 
     The mean is over the stratum's correctly classified cells (a cell without
-    the gene adding 0). A stratum is valid with min_cells_per_condition cells
-    per condition counting every cell, as the attention CSSI, and at least one
-    correctly classified cell (the LoRA embedding groups cells by the
-    model's prediction, so its correctly classified controls gather in one
-    or two strata). Returns (scores, number of valid strata); without any
-    valid stratum the scores are the pooled ones.
+    the gene adding 0), and a stratum needs min_cells_per_condition of them
+    per condition, as the attention CSSI (the LoRA embedding groups cells by
+    the model's prediction, so few strata qualify). Returns (scores, number
+    of valid strata); without any valid stratum the scores are the pooled ones.
     """
     n_ids = len(vocab)
     best = np.zeros(n_ids)
@@ -242,10 +240,9 @@ def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
     token_strata = strata[result.token_cells]
     valid = 0
     for stratum in np.unique(strata):
-        in_stratum = strata == stratum
-        cells = in_stratum & result.correct
-        counts = [int(np.sum(in_stratum & (result.labels == c))) for c in (0, 1)]
-        if min(counts) < min_cells_per_condition or not cells.any():
+        cells = (strata == stratum) & result.correct
+        counts = [int(np.sum(cells & (result.labels == c))) for c in (0, 1)]
+        if min(counts) < min_cells_per_condition:
             continue
         valid += 1
         tokens = token_strata == stratum

@@ -428,10 +428,10 @@ def compute_attention_cssi(
     Leiden clusters every cell (or `precomputed_strata` = (strata, metadata)
     of an earlier run is used); the scores only use the cells in `cell_mask`
     (all by default; the correctly classified ones for a fine-tuned
-    classifier). A stratum is valid with min_cells_per_condition cells per
-    condition counting every cell, and at least one scored cell per
-    condition (a fine-tuned model's embedding groups cells by its prediction,
-    so its correctly classified controls gather in one or two strata).
+    classifier), and a stratum needs min_cells_per_condition of them per
+    condition, so every mean it contributes rests on enough cells. A
+    fine-tuned model's embedding groups cells by its prediction, so few of
+    its strata hold enough correctly classified cells of both conditions.
     Returns (pooled_means, cssi_scores, gate, strata, metadata).
     """
     n_cells = cache.n_cells
@@ -463,15 +463,14 @@ def compute_attention_cssi(
     valid_strata = 0
 
     for stratum in np.unique(strata):
-        in_stratum = strata == stratum
+        in_stratum = (strata == stratum) & scored
         cells_control = int(np.sum(in_stratum & (labels == 0)))
         cells_pd = int(np.sum(in_stratum & (labels == 1)))
-        scored_counts = [int(np.sum(in_stratum & scored & (labels == c))) for c in (0, 1)]
-        if min(cells_control, cells_pd) < min_cells_per_condition or min(scored_counts) == 0:
+        if min(cells_control, cells_pd) < min_cells_per_condition:
             continue
         valid_strata += 1
 
-        scores = common._gene_scores(condition_means(cache, in_stratum & scored), _signed)
+        scores = common._gene_scores(condition_means(cache, in_stratum), _signed)
         for gene, score in scores.items():
             # CSSI-max is the maximum signed stratum-specific contrast.
             if gene not in cssi_scores or score > cssi_scores[gene]:

@@ -144,7 +144,7 @@ Measured on 2x RTX 2070 (8 GB) and 24 cores, a full run takes ~11-14 h: model ta
 3. flash-attention 1.x (scGPT's attention backend) compiles from source against the local CUDA toolkit: `pip install flash-attn==1.0.4 --no-build-isolation`, with `nvcc` from a CUDA 12.x toolkit on the PATH (torch is built for CUDA 12.1). Ada (L40) runs Ampere kernels. On Hopper (H100, H200) the build must include sm_90 kernels; if scGPT fails with a "no kernel image" CUDA error, rebuild it with sm_90 added to the architectures in flash-attn's `setup.py`. Geneformer uses PyTorch SDPA and does not need it.
 4. Check: `python -c "import flash_attn, go3, scgpt, transformers, peft"`, then the quick end-to-end check above on dataset A, then `scripts/run_full.sh`.
 
-`visualize_cssi_embeddings.py --dataset <A|B>` draws the cell embeddings and Leiden strata CSSI used, per cell type, from the attention output (no inference).
+`visualize_cssi_embeddings.py --dataset <A|B> [--scores ...]` draws, per score with CSSI (zero-shot attention of both models, IG and attention of the LoRA models) and cell type, the cell embeddings and Leiden strata CSSI used, colored by stratum and by condition, with each stratum's cells per condition (no inference; `plots/cssi_embeddings/<scores>/<ct>.png`).
 
 ## Methods
 
@@ -162,7 +162,7 @@ Fine-tuned (LoRA) models, the same three rankings on their correctly classified 
 
 - **Integrated Gradients** (`ig_lora_scgpt`): mean absolute attribution to the PD logit of the LoRA scGPT classifier over every correctly classified cell (0 where the gene is absent).
 - **LoRA attention** (`attention_lora_geneformer`): the pooled attention score of the LoRA Geneformer classifier, on its correctly classified cells.
-- **CSSI-max** (`ig_cssi_lora_scgpt`, `attention_cssi_lora_geneformer`): Leiden strata (as above) of the LoRA model's own CLS embedding, over every cell; each gene keeps its maximum over the valid strata of the stratum's score: mean |IG| over the stratum's correctly classified cells, or their PD - control attention. A stratum is valid with at least 20 cells per condition counting every cell, and at least one correctly classified cell (of each condition for attention): the fine-tuned embedding groups cells by the model's prediction, so its correctly classified controls gather in one or two strata. The per-cell scores are kept in `cell_scores.npz`, so CSSI can be recomputed on CPU (`AttentionCache.load`, `IGResult.load`).
+- **CSSI-max** (`ig_cssi_lora_scgpt`, `attention_cssi_lora_geneformer`): Leiden strata (as above) of the LoRA model's own CLS embedding, over every cell; each gene keeps its maximum over the valid strata of the stratum's score: mean |IG| over the stratum's correctly classified cells, or their PD - control attention. A stratum is valid with at least 20 correctly classified cells per condition, so every mean rests on enough cells; the fine-tuned embedding groups cells by the model's prediction, so only 1-3 strata qualify on Dataset B. The per-cell scores are kept in `cell_scores.npz`, so CSSI can be recomputed on CPU (`AttentionCache.load`, `IGResult.load`).
 - **OLS-residualized** (`ig_residualized_ols_lora_scgpt`, `attention_residualized_ols_lora_geneformer`): the same OLS on the pooled score, with the covariates of every cell of the cell type.
 
 ### Gene-set selections
