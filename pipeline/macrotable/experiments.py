@@ -22,10 +22,11 @@ RANKING_LABELS = {"attention": "attention", "cssi": "CSSI", "ols": "residuals",
                   "integrated_gradients": "IG"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer"}
+MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "lora": "LoRA"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
 
-DEFAULT_MODEL_FORMS = ("zero-shot",)
+DEFAULT_MODEL_FORMS = tuple(MODEL_FORM_LABELS)
 
 
 @dataclass
@@ -44,7 +45,7 @@ class Settings:
 
 
 def dataset_dirs(results_root: Path, datasets: Optional[Sequence[str]] = None) -> dict:
-    """{dataset label: results folder} of results/dataset_<x>, e.g. A -> results/dataset_a."""
+    """{dataset label: results folder} of results/dataset_<x>, e.g. A -> results/dataset_a, A+B -> results/dataset_a+b."""
     found = {p.name[len("dataset_"):].upper(): p for p in sorted(Path(results_root).glob("dataset_*"))
              if p.is_dir()}
     return {d: p for d, p in found.items() if datasets is None or d in datasets}
@@ -61,9 +62,10 @@ def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = Non
 
     Besides KEY: method, selection, model and cell_type (gene_sets.py names),
     results_dir (the dataset's results folder), gene_list (path) and genes
-    (highest score first). Missing gene lists are reported and left out.
+    (highest score first). Missing gene lists are left out and counted per
+    dataset and method (A+B only has the Geneformer zero-shot ones).
     """
-    rows = []
+    rows, missing = [], {}
     for dataset, results_dir in dataset_dirs(results_root, datasets).items():
         for method in gs.METHODS:
             meta = gs.METHOD_META[method]
@@ -73,20 +75,22 @@ def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = Non
                 for cell_type in gs.CELL_TYPES:
                     path = gs.gene_list_path(results_dir, method, selection, cell_type)
                     if not path.exists():
-                        print(f"  [macrotable] no gene list: {path}", flush=True)
+                        missing[(dataset, method)] = missing.get((dataset, method), 0) + 1
                         continue
                     df = pd.read_csv(path).sort_values("score", ascending=False, kind="stable")
                     rows.append({
                         "Ranking": RANKING_LABELS[meta["ranking"]],
                         "TopN": TOPN_LABELS[selection],
                         "Model": MODEL_LABELS[meta["model"]],
-                        "ModelForm": meta["model_form"],
+                        "ModelForm": MODEL_FORM_LABELS[meta["model_form"]],
                         "Dataset": dataset,
                         "CellType": CELL_TYPE_LABELS[cell_type],
                         "method": method, "selection": selection, "model": meta["model"],
                         "cell_type": cell_type, "results_dir": results_dir, "gene_list": path,
                         "genes": df["gene"].astype(str).tolist(),
                     })
+    for (dataset, method), n in missing.items():
+        print(f"  [macrotable] {dataset} {method}: {n} gene lists missing", flush=True)
     if not rows:
         raise SystemExit(f"No gene lists found under {results_root}/dataset_*")
     return pd.DataFrame(rows).set_index(KEY)

@@ -1,7 +1,13 @@
 """Random-forest accuracy of the experiment's genes at telling PD from control cells.
 
   Accuracy, BalancedAccuracy  mean over the cross-validation folds
+  AUC                         mean ROC AUC over the folds (PD probability)
+  MajorityAccuracy            accuracy of always predicting the majority class
+                              of each test fold: the reference Accuracy must beat
   nFeaturesRF                 genes of the list used as features
+
+The forest weighs both classes equally (class_weight="balanced"): in Dataset
+B ~80% of the cells are PD, and an unweighted forest mostly predicts PD.
 
 Features: the rank pseudo-expression of each selected gene in the cell's
 Geneformer tokens, v = 1 - (p - 1) / (n - 1) for the gene at position p of
@@ -28,7 +34,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from ... import config as C
@@ -36,14 +42,14 @@ from ...utils.progress import progress
 from ...utils.splits import labels_to_int
 from ..experiments import KEY, genes_hash
 
-METRICS = ["Accuracy", "BalancedAccuracy", "nFeaturesRF"]
+METRICS = ["Accuracy", "BalancedAccuracy", "AUC", "MajorityAccuracy", "nFeaturesRF"]
 DONOR_COL = "donor"
 FEATURES = "geneformer_rank_v1"
 
 
 def _settings_tag(settings) -> str:
     return f"{FEATURES}|cells={settings.rf_max_cells}|trees={settings.rf_trees}|" \
-           f"folds={settings.rf_folds}:donor-stratified|seed={settings.seed}"
+           f"folds={settings.rf_folds}:donor-stratified|seed={settings.seed}|weights=balanced"
 
 
 class CellTypeData:
@@ -124,16 +130,24 @@ class CellTypeData:
 def _fit(data: CellTypeData, genes: list, settings) -> dict:
     X = data.features(genes)
     if X.shape[1] == 0:
-        return {"Accuracy": np.nan, "BalancedAccuracy": np.nan, "nFeaturesRF": 0}
-    acc, bacc = [], []
+        return {"Accuracy": np.nan, "BalancedAccuracy": np.nan, "AUC": np.nan,
+                "MajorityAccuracy": _majority_accuracy(data), "nFeaturesRF": 0}
+    acc, bacc, auc = [], [], []
     for train, test in data.folds:
         rf = RandomForestClassifier(n_estimators=settings.rf_trees, n_jobs=settings.n_jobs,
-                                    random_state=settings.seed)
-        pred = rf.fit(X[train], data.labels[train]).predict(X[test])
+                                    random_state=settings.seed, class_weight="balanced")
+        rf.fit(X[train], data.labels[train])
+        pred = rf.predict(X[test])
         acc.append(accuracy_score(data.labels[test], pred))
         bacc.append(balanced_accuracy_score(data.labels[test], pred))
+        auc.append(roc_auc_score(data.labels[test], rf.predict_proba(X[test])[:, 1]))
     return {"Accuracy": float(np.mean(acc)), "BalancedAccuracy": float(np.mean(bacc)),
-            "nFeaturesRF": X.shape[1]}
+            "AUC": float(np.mean(auc)), "MajorityAccuracy": _majority_accuracy(data), "nFeaturesRF": X.shape[1]}
+
+
+def _majority_accuracy(data: CellTypeData) -> float:
+    """Mean over the folds of the accuracy of predicting the test fold's majority class."""
+    return float(np.mean([max(data.labels[te].mean(), 1 - data.labels[te].mean()) for _, te in data.folds]))
 
 
 def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
@@ -141,7 +155,7 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     tag = _settings_tag(settings)
     cache = (pd.read_csv(cache_path, dtype={c: str for c in KEY + ["genes_hash", "settings"]})
              if cache_path.exists() else pd.DataFrame(columns=KEY + ["genes_hash", "settings"] + METRICS))
-    cached = {tuple(r[KEY + ["genes_hash", "settings"]]): {m: r[m] for m in METRICS} for _, r in cache.iterrows()}
+    cached = {tuple(r[KEY + ["genes_hash", "settings"]]): {m: r.get(m, np.nan) for m in METRICS} for _, r in cache.iterrows()}
 
     hashes = [genes_hash(g) for g in experiments["genes"]]
     todo = [i for i, (k, h) in enumerate(zip(experiments.index, hashes)) if (*k, h, tag) not in cached]

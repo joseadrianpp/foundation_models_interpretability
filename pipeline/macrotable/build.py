@@ -16,7 +16,7 @@ import re
 import pandas as pd
 
 from ..postprocess.gwas_similarity import DEFAULT_DISTANCES
-from .columns import classifier, enrichment, overlap, similarity
+from .columns import classifier, context, enrichment, overlap, similarity
 from .experiments import KEY, Settings, load_experiments
 
 # Column modules in table order
@@ -25,17 +25,18 @@ MODULES = {
     "enrichment": enrichment,
     "similarity": similarity,
     "classifier": classifier,
+    "context": context,
 }
 
 
 def _read_part(path: Path) -> pd.DataFrame:
     part = pd.read_csv(path, dtype={c: str for c in KEY}).set_index(KEY)
     # Counts (nGenes*, *TermCount, nFeaturesRF) stay integers next to NaN
-    counts = [c for c in part.columns if re.match(r"n[A-Z]", c) or c.endswith("TermCount")]
+    counts = [c for c in part.columns if re.match(r"n[A-Z]", c) or c.endswith("TermCount") or c.startswith("CSSI")]
     return part.astype({c: "Int64" for c in counts})
 
 
-def build(settings: Settings, modules=None, datasets=None, model_forms=("zero-shot",)) -> pd.DataFrame:
+def build(settings: Settings, modules=None, datasets=None, model_forms=("zero-shot", "lora")) -> pd.DataFrame:
     experiments = load_experiments(settings.results_root, datasets, model_forms)
     print(f"[macrotable] {len(experiments)} experiments", flush=True)
     parts_dir = Path(settings.results_root) / "macrotable" / "parts"
@@ -53,6 +54,10 @@ def build(settings: Settings, modules=None, datasets=None, model_forms=("zero-sh
             print(f"[macrotable] no {name} part yet, its columns are left out", flush=True)
             continue
         part = _read_part(path)
+        uncovered = len(experiments.index.difference(part.index))
+        if uncovered:
+            print(f"[macrotable] WARNING: the saved {name} part lacks {uncovered} experiments (empty in the "
+                  f"table); recompute it with --modules {name}", flush=True)
         table = table.join(part.reindex(experiments.index))
     out = parts_dir.parent / "macrotable.csv"
     table.reset_index().to_csv(out, index=False)
@@ -66,7 +71,7 @@ def main():
     p.add_argument("--modules", nargs="+", choices=list(MODULES), default=None,
                    help="Modules to (re)compute; the others are read from their saved parts (default: all).")
     p.add_argument("--datasets", nargs="+", default=None, help="Dataset labels, e.g. A B (default: every one).")
-    p.add_argument("--include-lora", action="store_true", help="Also the LoRA experiments.")
+    p.add_argument("--zero-shot-only", action="store_true", help="Leave out the LoRA experiments.")
     p.add_argument("--distances", nargs="+", choices=DEFAULT_DISTANCES, default=["SimRel"],
                    help="GO3 distances of the similarity columns; the first has no suffix (default: SimRel).")
     p.add_argument("--rf-max-cells", type=int, default=20000, help="Cells per dataset and cell type for the RF.")
@@ -77,7 +82,7 @@ def main():
 
     settings = Settings(results_root=args.results_dir, distances=args.distances, rf_max_cells=args.rf_max_cells,
                         rf_trees=args.rf_trees, rf_folds=args.rf_folds, n_jobs=args.n_jobs)
-    forms = ("zero-shot", "lora") if args.include_lora else ("zero-shot",)
+    forms = ("zero-shot",) if args.zero_shot_only else ("zero-shot", "lora")
     build(settings, args.modules, args.datasets, forms)
 
 
