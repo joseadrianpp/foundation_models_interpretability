@@ -60,7 +60,11 @@ from pipeline.utils.scgpt_model import load_model_configs, load_vocab
 DATA_DIR = _HERE / "data"
 # The two datasets have the same four cell types and the same kind of split,
 # and each folder holds its own cells and LoRA models
-DATASET_DIRS = {"A": DATA_DIR / "dataset_a", "B": DATA_DIR / "dataset_b"}
+DATASET_DIRS = {"A": DATA_DIR / "dataset_a", "B": DATA_DIR / "dataset_b",
+                # "A+B" pools the cells of both, A first. Geneformer only: the scGPT
+                # h5ad files of A and B keep different HVG (309 shared), and the LoRA
+                # models are trained per dataset
+                "A+B": (DATA_DIR / "dataset_a", DATA_DIR / "dataset_b")}
 
 # scGPT files inside a dataset folder
 SCGPT_H5ADS = [Path("mixed_split_scgpt") / f"Mixed_HVG_1000_pc_noXY_noMT_mixed_{split}.h5ad"
@@ -109,12 +113,35 @@ def _write_all_scores(score_map: dict, out_csv: Path) -> None:
             w.writerow([r, g, s])
 
 
-def _load_full_dataset_scgpt(data_dir: Path) -> ad.AnnData:
+def _dirs(data_dir) -> tuple:
+    """The data folders of a dataset (two for "A+B")."""
+    return tuple(data_dir) if isinstance(data_dir, (tuple, list)) else (data_dir,)
+
+
+def _single_dir(data_dir, what: str) -> Path:
+    dirs = _dirs(data_dir)
+    if len(dirs) != 1:
+        raise SystemExit(f"{what} cannot run on pooled datasets (A+B): only the Geneformer zero-shot "
+                         "tasks can (the scGPT h5ad files keep different HVG per dataset and the LoRA "
+                         "models are trained per dataset)")
+    return dirs[0]
+
+
+def _load_full_dataset_scgpt(data_dir) -> ad.AnnData:
+    data_dir = _single_dir(data_dir, "scGPT")
     return ad.concat([sc.read_h5ad(data_dir / p) for p in SCGPT_H5ADS])
 
 
-def _load_full_dataset_geneformer(data_dir: Path):
-    return concatenate_datasets([load_from_disk(str(data_dir / p)) for p in GENEFORMER_DATASETS])
+def _load_full_dataset_geneformer(data_dir):
+    return concatenate_datasets([load_from_disk(str(d / p)) for d in _dirs(data_dir) for p in GENEFORMER_DATASETS])
+
+
+def _load_gene_names(data_dir) -> dict:
+    """Token id -> gene symbol of every gene in the dataset(s); token ids are global."""
+    names = {}
+    for d in _dirs(data_dir):
+        names.update(load_gene_names(d))
+    return names
 
 
 # Default task options; main() overrides them from the command line
@@ -175,9 +202,10 @@ def _cell_type_counts(task_name: str, data_dir: Path, max_cells=None) -> dict:
     """Cells per cell type, read without loading expression values or tokens."""
     counts = {}
     if task_name.endswith("geneformer"):
-        columns = [load_from_disk(str(data_dir / p))[C.CELL_TYPE_COL] for p in GENEFORMER_DATASETS]
+        columns = [load_from_disk(str(d / p))[C.CELL_TYPE_COL] for d in _dirs(data_dir)
+                   for p in GENEFORMER_DATASETS]
     else:
-        columns = [ad.read_h5ad(data_dir / p, backed="r").obs[C.CELL_TYPE_COL].astype(str)
+        columns = [ad.read_h5ad(_single_dir(data_dir, "scGPT") / p, backed="r").obs[C.CELL_TYPE_COL].astype(str)
                    for p in SCGPT_H5ADS]
     for col in columns:
         for ct, n in pd.Series(col).value_counts().items():
@@ -357,7 +385,8 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
     adata = _load_full_dataset_scgpt(data_dir)
 
     print(f"[{device}] loading LoRA model...", flush=True)
-    model = common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
+    model = common._load_lora_model(_single_dir(data_dir, "The LoRA scGPT model") / LORA_FULL_MODEL_SCGPT,
+                                    vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
         print(f"\n=== ig_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
@@ -400,7 +429,7 @@ def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.d
     scale = _batch_scale(device, opts)
     if opts["permutation"]:
         print("  --permutation ignored: the Geneformer datasets have no donor column", flush=True)
-    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    token_dict, gene_names = load_token_dictionary(), _load_gene_names(data_dir)
     ds = _load_full_dataset_geneformer(data_dir)
     model = gf._load_zero_shot_model(device)
 
@@ -422,9 +451,9 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
     # on the cells it classifies correctly (the same convention as upstream)
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
-    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    token_dict, gene_names = load_token_dictionary(), _load_gene_names(data_dir)
     ds = _load_full_dataset_geneformer(data_dir)
-    model = gf._load_lora_model(data_dir / LORA_DIR_GENEFORMER, device)
+    model = gf._load_lora_model(_single_dir(data_dir, "The LoRA Geneformer model") / LORA_DIR_GENEFORMER, device)
 
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
         print(f"\n# attention_lora_geneformer | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #",
@@ -464,7 +493,7 @@ def task_attention_residualized_ols_geneformer(data_dir: Path, results_dir: Path
                                                source="attention_zero_shot_geneformer",
                                                target="attention_residualized_ols_geneformer") -> None:
     opts = {**DEFAULT_OPTS, **(opts or {})}
-    token_dict, gene_names = load_token_dictionary(), load_gene_names(data_dir)
+    token_dict, gene_names = load_token_dictionary(), _load_gene_names(data_dir)
     ds = _load_full_dataset_geneformer(data_dir)
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, None, opts["max_cells_per_type"]):
         print(f"\n# {target} | {ct} | {sub.num_rows:,} cells #", flush=True)

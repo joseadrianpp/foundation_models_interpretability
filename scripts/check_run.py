@@ -11,8 +11,7 @@
   * post-hoc outputs: enrichment, enrichment summary, GO3 similarity, gene
     matrices, reference gene sets and plots, for every selection.
 
-Prints FAIL / WARN lines and the gene-set sizes, writes the experiment
-inventory to <results-dir>/run_check/experiments.csv and exits 1 if anything
+Prints FAIL / WARN lines and the gene-set sizes, and exits 1 if anything
 failed.
 
   venv/bin/python scripts/check_run.py
@@ -73,6 +72,26 @@ def _read_json(path: Path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
+# Pooled A+B only has the Geneformer zero-shot experiments (see run_tasks.DATASET_DIRS)
+DATASET_SCOPE = {"A+B": {("geneformer", "zero-shot")}}
+
+
+def _in_scope(dataset: str, model: str, model_form: str) -> bool:
+    scope = DATASET_SCOPE.get(dataset)
+    return scope is None or (model, model_form) in scope
+
+
+def _methods(dataset: str) -> list:
+    return [m for m in METHODS if _in_scope(dataset, METHOD_META[m]["model"], METHOD_META[m]["model_form"])]
+
+
+def _tasks(dataset: str) -> list:
+    """Model, OLS and post-hoc tasks a dataset's run should have."""
+    if dataset in DATASET_SCOPE:
+        return ["attention_geneformer", "attention_residualized_ols_geneformer", "postprocess"]
+    return list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS) + ["postprocess"]
+
+
 def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
     _section(f"logs ({log_dir})")
     main_log = log_dir / "run_full.log"
@@ -82,9 +101,8 @@ def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
     text = main_log.read_text()
     started = set(re.findall(r" start (\S+) (\S+)", text))
     ended = {(d, t): int(code) for d, t, code in re.findall(r" end (\S+) (\S+) \(exit (\d+)\)", text)}
-    tasks = list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS) + ["postprocess"]
     for d in datasets:
-        for t in tasks:
+        for t in _tasks(d):
             if (d, t) not in started and t in rt.DERIVED_TASKS:
                 # Possibly run by hand; its outputs are checked below
                 rep.warn(f"{d} {t}: not in run_full.log")
@@ -107,18 +125,20 @@ def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
         rep.warn("run_full.log has no 'all done' line")
 
 
-# (model, model task folder with the pooled/CSSI outputs, its OLS folder)
-SCORE_FOLDERS = [("scgpt", "attention_zero_shot_scgpt", "attention_residualized_ols_scgpt"),
-                 ("scgpt", "ig_lora_scgpt", "ig_residualized_ols_lora_scgpt"),
-                 ("geneformer", "attention_zero_shot_geneformer", "attention_residualized_ols_geneformer"),
-                 ("geneformer", "attention_lora_geneformer", "attention_residualized_ols_lora_geneformer")]
+# (model, model form, model task folder with the pooled/CSSI outputs, its OLS folder)
+SCORE_FOLDERS = [("scgpt", "zero-shot", "attention_zero_shot_scgpt", "attention_residualized_ols_scgpt"),
+                 ("scgpt", "lora", "ig_lora_scgpt", "ig_residualized_ols_lora_scgpt"),
+                 ("geneformer", "zero-shot", "attention_zero_shot_geneformer", "attention_residualized_ols_geneformer"),
+                 ("geneformer", "lora", "attention_lora_geneformer", "attention_residualized_ols_lora_geneformer")]
 
 
 def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report) -> None:
     _section(f"{dataset}: cells, CSSI strata and OLS")
     data_dir = rt.DATASET_DIRS[dataset]
     rows, expected = [], {}
-    for model, folder, ols_folder in SCORE_FOLDERS:
+    for model, form, folder, ols_folder in SCORE_FOLDERS:
+        if not _in_scope(dataset, model, form):
+            continue
         if model not in expected:
             counts = rt._cell_type_counts(f"attention_{model}", data_dir, max_cells)
             expected[model] = {_slug_cell_type(ct): n for ct, n in counts.items()}
@@ -148,7 +168,7 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
 def gene_list_inventory(results_dir: Path, dataset: str, rep: Report) -> pd.DataFrame:
     _section(f"{dataset}: gene lists")
     rows = []
-    for method in METHODS:
+    for method in _methods(dataset):
         summaries = {ct: _read_json(results_dir / SUMMARY_PATHS[method].format(ct=ct))
                      for ct in CELL_TYPES} if method in SUMMARY_PATHS else {}
         for selection in GENE_LIST_PATHS[method]:
@@ -182,7 +202,7 @@ def gene_list_inventory(results_dir: Path, dataset: str, rep: Report) -> pd.Data
                 rows.append(row)
     inv = pd.DataFrame(rows)
     sizes = inv.pivot_table(index="method", columns=["selection", "cell_type"], values="n_genes",
-                            aggfunc="first").reindex(index=METHODS, columns=SELECTIONS, level=0)
+                            aggfunc="first").reindex(index=_methods(dataset), columns=SELECTIONS, level=0)
     sizes.columns = [f"{s[:2]}:{ct[:5]}" for s, ct in sizes.columns]
     print(sizes.to_string(na_rep="-", float_format=lambda v: f"{v:.0f}"))
     return inv
@@ -244,12 +264,12 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
             rep.fail(f"{selection}: {n_matrices} gene matrices, expected {expected}")
 
         for model in MODELS:
-            if not methods_for(selection, model):
+            if not any(_in_scope(dataset, model, METHOD_META[m]["model_form"]) for m in methods_for(selection, model)):
                 continue
             for name in PLOTS_PER_SELECTION:
                 if not plot_path(results_dir, f"{name}_{model}", selection).exists():
                     rep.fail(f"plot {plot_path(results_dir, f'{name}_{model}', selection).name} missing")
-    for model in MODELS:
+    for model in [m for m in MODELS if any(_in_scope(dataset, m, f) for f in ("zero-shot", "lora"))]:
         for name in PLOTS_FIXED:
             if not (results_dir / "plots" / f"{name}_{model}.png").exists():
                 rep.fail(f"plot {name}_{model}.png missing")
@@ -257,7 +277,8 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--datasets", nargs="+", choices=list(rt.DATASET_DIRS), default=list(rt.DATASET_DIRS))
+    p.add_argument("--datasets", nargs="+", choices=list(rt.DATASET_DIRS), default=["A", "B"],
+                   help="Datasets to check (default: A B; A+B only when it was run).")
     p.add_argument("--results-dir", type=Path, default=ROOT / "results")
     p.add_argument("--log-dir", type=Path, default=ROOT / "logs")
     p.add_argument("--max-cells-per-type", type=int, default=None)
@@ -281,11 +302,8 @@ def main():
 
     if inventories:
         inv = pd.concat(inventories, ignore_index=True)
-        out_csv = args.results_dir / "run_check" / "experiments.csv"
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        inv.to_csv(out_csv, index=False)
         n_ok = int((inv["status"] == "ok").sum())
-        print(f"\nExperiments with a gene list: {n_ok}/{len(inv)} -> {out_csv}")
+        print(f"\nExperiments with a gene list: {n_ok}/{len(inv)}")
     print(f"{len(rep.fails)} FAIL, {len(rep.warns)} WARN")
     sys.exit(1 if rep.fails else 0)
 

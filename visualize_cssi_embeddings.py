@@ -166,7 +166,7 @@ def _condition_labels(data_dir: Path) -> dict:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", type=Path, default=HERE / "results")
-    p.add_argument("--dataset", choices=["A", "B"], default="A")
+    p.add_argument("--dataset", choices=["A", "B", "A+B"], default="A")
     p.add_argument("--scores", default=",".join(SCORES),
                    help="Comma-separated model task folders (default: all four with CSSI).")
     p.add_argument("--cell-types", default=",".join(CELL_TYPES))
@@ -179,7 +179,9 @@ def main():
     args = p.parse_args()
 
     results_dir = args.results_dir / f"dataset_{args.dataset.lower()}"
-    labels = _condition_labels(HERE / "data" / f"dataset_{args.dataset.lower()}")
+    # A+B pools the cells of A and B, in that order (run_tasks.DATASET_DIRS)
+    per_dataset = [_condition_labels(HERE / "data" / f"dataset_{d.lower()}") for d in args.dataset.split("+")]
+    labels = {slug: np.concatenate([lab[slug] for lab in per_dataset]) for slug in per_dataset[0]}
     cell_types = [x.strip() for x in args.cell_types.split(",") if x.strip()]
     jobs = [(results_dir / scores / ct, labels.get(ct),
              results_dir / "plots" / "cssi_embeddings" / scores / f"{ct}.png")
