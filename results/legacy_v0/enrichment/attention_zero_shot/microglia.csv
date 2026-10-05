@@ -1,2 +1,0 @@
-source,native,name,p_value,significant,description,term_size,query_size,intersection_size,effective_domain_size,precision,recall,query,parents
-KEGG,KEGG:05146,Amoebiasis,0.023407474383359536,True,Amoebiasis,102,13,3,8716,0.23076923076923078,0.029411764705882353,query_1,['KEGG:00000']

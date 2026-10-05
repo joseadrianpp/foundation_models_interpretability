@@ -38,8 +38,7 @@ data/
 │   │                            and gene_names.csv (token -> gene symbol)
 │   ├── step5_1_lora_scgpt/      LoRA fine-tuned scGPT classifier (adapters merged, best_full_model.pt)
 │   └── step5_1_lora_geneformer/ LoRA fine-tuned Geneformer classifier (best_lora/ + best_head.pt)
-├── dataset_b/                   same layout as dataset_a
-└── legacy_v0/                   inputs of the old Dataset A runs (not used by the pipeline)
+└── dataset_b/                   same layout as dataset_a
 ```
 
 In each dataset both models see the same cells and the same train / validation / test split (cell level, 80/10/10). Every cell has a `cell_type` and a binary `diagnosis`; the scGPT h5ad files also have a `donor` column (used only by `--permutation`). The pipeline always uses train + val + test together.
@@ -47,7 +46,7 @@ In each dataset both models see the same cells and the same train / validation /
 ## Running
 
 ```
-python run_tasks.py --task <task> --dataset <A|B> [options]
+python run_tasks.py --task <task> --dataset <A|B|A+B> [options]
 ```
 
 Each dataset writes to its own folder, `results/dataset_a/` or `results/dataset_b/`, so the post-hoc analyses never mix them.
@@ -87,7 +86,7 @@ Run in this order, or all at once with `--task postprocess`. `enrichment` (g:Pro
 | Option | Meaning |
 |---|---|
 | `--task all` (default) | the four model tasks, then the two OLS tasks |
-| `--dataset A\|B` | dataset (default A) |
+| `--dataset A\|B\|A+B` | dataset (default A). `A+B` pools the cells of both (A first) into `results/dataset_a+b/`; only the Geneformer zero-shot tasks run on it, since the scGPT h5ad files of A and B keep different HVG (309 shared) and the LoRA models are trained per dataset |
 | `--gpus 0,1` | model tasks only: one worker per GPU, whole cell types balanced by cell count |
 | `--device cuda:0` | GPU for single-GPU runs |
 | `--selection top30\|z-score\|elbow\|all` | gene-set selections used by the post-hoc tasks (default all) |
@@ -127,11 +126,15 @@ nohup bash scripts/run_full.sh > /dev/null 2>&1 &
 tail -f logs/run_full.log
 ```
 
-`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS`, `LOG_DIR` and `PROGRESS_INTERVAL` override its defaults (see the script header). `watch -n 30 bash scripts/progress.sh` shows the latest progress line of every running bar. When the run ends, `python scripts/check_run.py` checks logs, cell counts, CSSI strata, every experiment's gene list and every post-hoc output, and writes the experiment inventory to `results/run_check/experiments.csv`.
+`PYTHON`, `GPUS`, `DISTANCES`, `GO3_THREADS`, `LOG_DIR` and `PROGRESS_INTERVAL` override its defaults (see the script header). `watch -n 30 bash scripts/progress.sh` shows the latest progress line of every running bar. When the run ends, `python scripts/check_run.py` checks logs, cell counts, CSSI strata, every experiment's gene list and every post-hoc output.
 
 A quick end-to-end check before a full run: `--task all --max-cells-per-type 200`, then `--task postprocess --selection top30 --distances SimRel` (~20 min on 24 cores).
 
 Measured on 2x RTX 2070 (8 GB) and 24 cores, a full run takes ~11-14 h: model tasks ~3.5 h for A and ~5.5-6 h for B (Geneformer and the LoRA tasks dominate; B's oligodendrocytes, 172k cells, keep one GPU busy the longest), post-hoc ~2.5 h for A and ~1.5 h for B with three distances. Larger GPUs shorten the model tasks; the post-hoc time depends on the CPU cores.
+
+### Experiment table
+
+`python -m pipeline.macrotable.build` joins every experiment (ranking x selection x model x model form x dataset x cell type) into `results/macrotable/macrotable.csv`, one row per gene list, from the outputs already computed (no inference). Each group of columns comes from one module of `pipeline/macrotable/columns/` and is saved to `results/macrotable/parts/<module>.csv`; `--modules <module>` recomputes only those parts and joins the table again, and the random forest results are cached per gene list in `parts/classifier_cache.csv`.
 
 ### Moving to another server
 
@@ -144,7 +147,7 @@ Measured on 2x RTX 2070 (8 GB) and 24 cores, a full run takes ~11-14 h: model ta
 3. flash-attention 1.x (scGPT's attention backend) compiles from source against the local CUDA toolkit: `pip install flash-attn==1.0.4 --no-build-isolation`, with `nvcc` from a CUDA 12.x toolkit on the PATH (torch is built for CUDA 12.1). Ada (L40) runs Ampere kernels. On Hopper (H100, H200) the build must include sm_90 kernels; if scGPT fails with a "no kernel image" CUDA error, rebuild it with sm_90 added to the architectures in flash-attn's `setup.py`. Geneformer uses PyTorch SDPA and does not need it.
 4. Check: `python -c "import flash_attn, go3, scgpt, transformers, peft"`, then the quick end-to-end check above on dataset A, then `scripts/run_full.sh`.
 
-`visualize_cssi_embeddings.py --dataset <A|B> [--scores ...]` draws, per score with CSSI (zero-shot attention of both models, IG and attention of the LoRA models) and cell type, the cell embeddings and Leiden strata CSSI used, colored by stratum and by condition, with each stratum's cells per condition (no inference; `plots/cssi_embeddings/<scores>/<ct>.png`).
+`visualize_cssi_embeddings.py --dataset <A|B|A+B> [--scores ...]` draws, per score with CSSI (zero-shot attention of both models, IG and attention of the LoRA models) and cell type, the cell embeddings and Leiden strata CSSI used, colored by stratum and by condition, with each stratum's cells per condition (no inference; `plots/cssi_embeddings/<scores>/<ct>.png`).
 
 ## Methods
 
@@ -186,7 +189,7 @@ scGPT's binning breaks ties randomly, so tokenisation is seeded (`BINNING_SEED =
 
 ## Results layout
 
-Inside `results/dataset_<a|b>/` (`<ct>` = cell type, `<model>` = `scgpt` / `geneformer`):
+Inside `results/dataset_<a|b|a+b>/` (`<ct>` = cell type, `<model>` = `scgpt` / `geneformer`):
 
 ```
 attention_zero_shot_<model>/<ct>/
@@ -217,5 +220,3 @@ plots/<figure>_<model>[_<selection>].png
 `results/go3_pair_cache/<ontology>__<distance>.npz` holds the cached gene-to-gene GO3 similarities shared by both datasets.
 
 The top-30 outputs of the post-hoc tasks have no `<selection>/` subfolder. A method name in those outputs is `<ranking>_<model>` (`attention_zero_shot_*`, `attention_cssi_*`, `attention_residualized_ols_*`, and for the LoRA models `ig_lora_scgpt`, `ig_cssi_lora_scgpt`, `ig_residualized_ols_lora_scgpt`, `attention_lora_geneformer`, `attention_cssi_lora_geneformer`, `attention_residualized_ols_lora_geneformer`); `pipeline/postprocess/gene_sets.py` maps every method to its files and to its (ranking, model, model form). So one experiment (ranking, selection, model, dataset, cell type) is one row of `enrichment_summary/[<selection>/]summary_table.csv` in `results/dataset_<x>/`.
-
-`results/legacy_v0/` holds the results of the earlier pipeline (old Dataset A balanced to 5261 cells per type, train + val only, old LoRA checkpoint, attention means over the cells expressing each gene); they are kept for reference and are not comparable with the current results.

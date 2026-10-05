@@ -6,4 +6,5 @@ CLAUDE.md
 venv
 .claude
 logs/
-results/go3_pair_cache/
+results/
+docs/
