@@ -8,3 +8,5 @@ venv
 logs/
 results/
 docs/
+*.zip
+scripts/slurm/
