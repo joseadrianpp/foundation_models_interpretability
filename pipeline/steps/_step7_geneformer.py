@@ -1,11 +1,15 @@
 """
 Attention-based interpretability for Geneformer: the same CLS attention per
-condition as the scGPT attention task (steps/_step7_common.py).
+condition as the scGPT attention task (steps/_step7_common.py). scCello runs
+through the same code: it is also a BERT over rank value encoded cells, only
+smaller, with its own vocabulary and its cell embedding in the last block.
 
 Pipeline:
-  1. The cells come already tokenized (rank value encoding, <cls> first and
-     <eos> last), so each batch only has to be padded to its longest cell.
-  2. Forward-pass through the model, capturing the input to encoder layer 10
+  1. The cells come already tokenized (rank value encoding, <cls> first and,
+     in Geneformer, <eos> last), so each batch only has to be padded to its
+     longest cell.
+  2. Forward-pass through the model, capturing the input to the encoder block
+     that outputs the cell embedding (Geneformer: 10 of 12, scCello: 5 of 6)
      via a forward pre-hook.
   3. Compute CLS-row attention scores from Q.Kt (per head), rank-normalise
      across the gene axis (ignoring padding), average across heads.
@@ -30,11 +34,6 @@ from ..utils.geneformer_model import GeneformerClassifier
 from ..utils.scgpt_model import FlexMLP
 from ..utils.splits import labels_to_int
 from ._step7_common import _LayerInputCapture, _cls_attn_rank_norm_head_avg
-
-# 0-indexed transformer encoder layer for attention. Geneformer's cell embedding
-# is the output of the second-to-last layer (EMB_HIDDEN_LAYER = -2), so layer
-# 10 of 12 is the last one that shapes what the head classifies
-NUM_ATTN_LAYER = 10
 
 # Geneformer cells have up to 4096 tokens, so the batch is smaller than scGPT's
 ATTN_BATCH_SIZE = 8
@@ -63,35 +62,39 @@ def _pad_batch(seqs: List[np.ndarray], pad_id: int,
     return ids.to(device), attn.to(device)
 
 
-# Geneformer zero-shot model load, only the encoder since attention needs no head
-def _load_zero_shot_model(device: torch.device) -> nn.Module:
-    model = BertModel.from_pretrained(str(C.GENEFORMER_MODEL_DIR), add_pooling_layer=False)
+# Geneformer or scCello zero-shot model load, only the encoder since attention needs no head
+def _load_zero_shot_model(model_dir, device: torch.device) -> nn.Module:
+    model = BertModel.from_pretrained(str(model_dir), add_pooling_layer=False)
     model.to(device); model.eval()
     return model
 
 
-# LoRA model load: the adapter was trained on a BertForSequenceClassification,
-# so peft needs that same model underneath (its own pooler and classifier are
-# never used); the head is the Step 4 FlexMLP
-def _load_lora_model(lora_dir, device: torch.device) -> nn.Module:
-    backbone = BertForSequenceClassification.from_pretrained(
-        str(C.GENEFORMER_MODEL_DIR), num_labels=2)
+# LoRA model load: the adapter was trained on a BertForSequenceClassification
+# (scCello: on its own subclass of it, with the same module names), so peft needs
+# that same model underneath (its own pooler and classifier are never used); the
+# head is the Step 4 FlexMLP
+def _load_lora_model(lora_dir, model_dir, head_config: dict, emb_layer: int,
+                     device: torch.device) -> nn.Module:
+    backbone = BertForSequenceClassification.from_pretrained(str(model_dir), num_labels=2)
     backbone = PeftModel.from_pretrained(backbone, str(lora_dir / "best_lora"))
-    head = FlexMLP(**C.GENEFORMER_LORA_HEAD_CONFIG)
+    head = FlexMLP(**head_config)
     head.load_state_dict(torch.load(lora_dir / "best_head.pt", map_location=device))
-    model = GeneformerClassifier(backbone, head)
+    model = GeneformerClassifier(backbone, head, emb_layer)
     model.to(device); model.eval()
     return model
 
 
 # Forward pass to compute attention for the CLS token
 def _forward_cls_attention(
-    model: nn.Module, ids: torch.Tensor, attn: torch.Tensor, use_predictions: bool,
+    model: nn.Module, ids: torch.Tensor, attn: torch.Tensor, emb_layer: int,
+    use_predictions: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     # The zero-shot model is the BERT itself, the LoRA one has it inside the classifier
     bert = model.backbone.bert if isinstance(model, GeneformerClassifier) else model
-    layer = bert.encoder.layer[NUM_ATTN_LAYER]
+    # hidden_states[emb_layer] is the output of encoder.layer[emb_layer], so this is
+    # the last block that shapes what the head classifies
+    layer = bert.encoder.layer[emb_layer]
     n_head = bert.config.num_attention_heads
 
     # True to padded positions (not all cells are equal length)
@@ -140,13 +143,13 @@ def _add_cell(sums: Dict[int, float], cell_gids: np.ndarray, row: np.ndarray,
 
 # Calculate the attention between the CLS token and the gene tokens
 def _compute_attn_per_gene_per_condition(
-    model: nn.Module, pt: Dict, token_dict: dict, gene_names: dict,
+    model: nn.Module, pt: Dict, token_dict: dict, gene_names: dict, emb_layer: int,
     device: torch.device, use_predictions: bool, batch_size: int = ATTN_BATCH_SIZE,
 ) -> Tuple[Dict[int, Dict[str, float]], dict]:
 
     n_cells = len(pt["input_ids"])
     pad_id = token_dict["<pad>"]
-    # <pad>, <mask>, <cls> and <eos> are not genes
+    # <pad>, <mask>, <cls> and <eos> (Geneformer only) are not genes
     special_ids = {v for k, v in token_dict.items() if k.startswith("<")}
 
     # Initialize variables to save attention values
@@ -158,8 +161,8 @@ def _compute_attn_per_gene_per_condition(
         end = min(start + batch_size, n_cells)
         ids, attn = _pad_batch(pt["input_ids"][start:end], pad_id, device)
 
-        # Calculate the attention AVERAGE over the 12 heads
-        cls_attn, preds = _forward_cls_attention(model, ids, attn, use_predictions)
+        # Calculate the attention AVERAGE over the heads (12 in Geneformer, 4 in scCello)
+        cls_attn, preds = _forward_cls_attention(model, ids, attn, emb_layer, use_predictions)
 
         gids = ids.cpu().numpy()
         labels = pt["condition_labels"][start:end].numpy()

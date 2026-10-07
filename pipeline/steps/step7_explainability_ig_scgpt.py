@@ -27,7 +27,8 @@ from .. import config as C
 
 # Gauss-Legendre interpolation points and forward batch size. IG needs a
 # backward pass per step, so the batch is smaller than the attention path's.
-IG_STEPS = 24
+# 50 steps, as in pipeline_unified, whose IG results are the same score
+IG_STEPS = 50
 IG_BATCH_SIZE = 8
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,9 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             return _pd_logit(model, gids_, v, mask_)
 
-    # Integrated Gradients attribution for the batch of cells
+    # Integrated Gradients attribution for the batch of cells. Without
+    # internal_batch_size Captum runs every step of every cell in one forward
+    # (8 cells x 50 steps x 1201 tokens), which does not fit in the GPU
     attributor = IntegratedGradients(forward_fn, multiply_by_inputs=True)
     attrs = attributor.attribute(
         inputs=vals,
@@ -58,6 +61,7 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
         additional_forward_args=(gids, mask),
         n_steps=n_steps,
         method="gausslegendre",
+        internal_batch_size=len(vals),
     )
     return attrs.detach().float().cpu().numpy()
 
@@ -65,7 +69,7 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 
 # Mean absolute integrated gradient per gene over correctly classified cells
 def _compute_ig_importance(
-    model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
+    model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab, gene_names: dict,
     device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
     classify_batch_size: int = 64,
 ) -> Tuple[Dict[str, float], dict]:
@@ -135,7 +139,8 @@ def _compute_ig_importance(
     # outrank one seen in all of them
     mean_abs: Dict[str, float] = {}
     for gid, s in sum_abs.items():
-        name = vocab.lookup_tokens([gid])[0]
+        # The current gene symbol, not the vocabulary's (GBA1, not GBA)
+        name = gene_names[gid]
         if name in C.SPECIAL_TOKENS:
             continue
         mean_abs[name] = s / n_used

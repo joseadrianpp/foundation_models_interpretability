@@ -8,7 +8,9 @@ from pathlib import Path
 import pandas as pd
 from gprofiler import GProfiler
 
-METHODS = ["attention_zero_shot_scgpt", "ig_lora_scgpt", "attention_zero_shot_geneformer", "attention_lora_geneformer"]
+METHODS = ["attention_zero_shot_scgpt", "attention_lora_scgpt", "ig_lora_scgpt",
+           "attention_zero_shot_geneformer", "attention_lora_geneformer", "ig_lora_geneformer",
+           "attention_zero_shot_sccello", "attention_lora_sccello", "ig_lora_sccello"]
 CELL_TYPES = ["astrocytes", "da_neurons", "microglia", "oligodendrocytes"]
 # This are ontologies of gprofiler
 GPROFILER_SOURCES = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]

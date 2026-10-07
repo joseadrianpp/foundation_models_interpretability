@@ -2,9 +2,9 @@
 
 Mirrors the subset of code/pipeline_scgpt/config.py actually read by the
 copied step modules (steps/_step7_common.py, step7_explainability_*.py) and
-their utils (utils/scgpt_model.py, utils/splits.py). The Geneformer constants
-(steps/_step7_geneformer.py, utils/geneformer_model.py) mirror
-code/pipeline_unified/config.py.
+their utils (utils/scgpt_model.py, utils/splits.py). The Geneformer and
+scCello constants (steps/_step7_geneformer.py, utils/geneformer_model.py)
+mirror code/pipeline_unified/config.py.
 """
 
 from pathlib import Path
@@ -21,6 +21,11 @@ SCGPT_MODEL_DIR = DATA_DIR / "scGPT_brain"
 SCGPT_VOCAB = SCGPT_MODEL_DIR / "vocab.json"
 SCGPT_WEIGHTS = SCGPT_MODEL_DIR / "best_model.pt"
 SCGPT_ARGS = SCGPT_MODEL_DIR / "args.json"
+
+# scGPT's vocabulary still names some genes by an older symbol (GBA for GBA1), so
+# this maps every token of our data to its current gene symbol (one file inside
+# each dataset folder, data/dataset_a or data/dataset_b)
+SCGPT_GENE_NAMES = Path("mixed_split_scgpt") / "gene_names.csv"
 
 # Head of the LoRA checkpoint: the Step 4 MLP it was warm-started from
 # (pipeline_unified Step 4 best_params.json, same shape in Dataset A and B).
@@ -50,6 +55,25 @@ GENEFORMER_LORA_HEAD_CONFIG = {
     "activation": "gelu", "mlp_type": "constant", "n_classes": 1,
 }
 
+# scCello zero-shot pretrained model (used by the zero-shot attention task and as
+# the backbone of the scCello LoRA). It is a smaller Geneformer-like BERT over the
+# same kind of rank value encoded cells, so it runs through the Geneformer code.
+# Its checkpoint is stored as a plain BERT, so transformers loads it and the
+# scCello package itself is not needed
+SCCELLO_MODEL_DIR = DATA_DIR / "scCello_zeroshot"
+
+# scCello vocabulary: Ensembl ID -> token id, plus <pad>, <mask> and <cls>
+SCCELLO_TOKEN_DICT = SCCELLO_MODEL_DIR / "token_dictionary.pkl"
+
+# Token id -> gene symbol of every token of our data, as for Geneformer
+SCCELLO_GENE_NAMES = Path("mixed_split_sccello") / "gene_names.csv"
+
+# Head of the scCello LoRA checkpoint, the Step 4 MLP on its 256-dim embedding
+SCCELLO_LORA_HEAD_CONFIG = {
+    "input_dim": 256, "n_layers": 2, "hidden_size": 64, "dropout": 0.3,
+    "activation": "gelu", "mlp_type": "constant", "n_classes": 1,
+}
+
 # Column names in the test h5ad obs
 CELL_TYPE_COL = "cell_type"
 # Binary diagnosis of each cell, the same column in Dataset A and Dataset B
@@ -70,7 +94,9 @@ PAD_TOKEN = "<pad>"
 SPECIAL_TOKENS = [PAD_TOKEN, "<cls>", "<eoc>"]
 PAD_VALUE = -2
 N_BINS = 51
-MAX_SEQ_LEN = 1001  # n_top_genes (1000) + 1, as used for this run
+# Up to 1200 expressed genes + CLS, as used for the all-genes run; a cell with
+# more expressed genes keeps a random 1200 of them (scGPT's pad_batch)
+MAX_SEQ_LEN = 1201
 
 # go3/gwas_similarity/gene_matrix postprocess steps expect the monorepo's own
 # GO ontology and gene-annotation file symlinked here (data/ is gitignored):

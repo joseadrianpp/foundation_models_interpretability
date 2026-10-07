@@ -7,11 +7,20 @@ import pandas as pd
 from .enrichment import CELL_TYPES, METHODS
 
 METHOD_LABELS = {"attention_zero_shot_scgpt": "scGPT zero-shot (attention)",
+                 "attention_lora_scgpt": "scGPT LoRA (attention)",
                  "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
                  "attention_zero_shot_geneformer": "Geneformer zero-shot (attention)",
-                 "attention_lora_geneformer": "Geneformer LoRA (attention)"}
-METHOD_COLORS = {"attention_zero_shot_scgpt": "#4878CF", "ig_lora_scgpt": "#D65F5F",
-                 "attention_zero_shot_geneformer": "#6ACC65", "attention_lora_geneformer": "#B47CC7"}
+                 "attention_lora_geneformer": "Geneformer LoRA (attention)",
+                 "ig_lora_geneformer": "Geneformer LoRA (Integrated Gradients)",
+                 "attention_zero_shot_sccello": "scCello zero-shot (attention)",
+                 "attention_lora_sccello": "scCello LoRA (attention)",
+                 "ig_lora_sccello": "scCello LoRA (Integrated Gradients)"}
+METHOD_COLORS = {"attention_zero_shot_scgpt": "#4878CF", "attention_lora_scgpt": "#77BEDB",
+                 "ig_lora_scgpt": "#D65F5F",
+                 "attention_zero_shot_geneformer": "#6ACC65", "attention_lora_geneformer": "#B47CC7",
+                 "ig_lora_geneformer": "#EE854A",
+                 "attention_zero_shot_sccello": "#C4AD66", "attention_lora_sccello": "#DC7EC0",
+                 "ig_lora_sccello": "#8C613C"}
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                      "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
 SIG_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]

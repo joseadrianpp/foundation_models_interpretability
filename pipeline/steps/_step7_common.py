@@ -30,6 +30,10 @@ from ..utils.splits import labels_to_int
 
 NUM_ATTN_LAYERS = 11        # 0-indexed transformer encoder layer for attention
 
+# With every gene, the dense binned matrix of a whole cell type does not fit in
+# memory (Dataset B has 171 780 oligodendrocytes), so cells are binned in chunks
+BIN_CHUNK = 10000
+
 
 # ---------------------------------------------------------------------------
 # Tokenisation (matches Step 6: include_zero_gene=False, no normalisation/log)
@@ -39,7 +43,7 @@ def _tokenise(adata: sc.AnnData, vocab) -> Dict[str, torch.Tensor]:
     # vocabulary is dropped before the column order is frozen into gene_ids
 
     # Normally, this is not necessary, cause the h5ad is already filtered
-    # to scGPT genes, is just for safety, this would print 1000 genes
+    # to scGPT genes, is just for safety, this would print every gene of the h5ad
     in_vocab = np.array([g in vocab for g in adata.var.index])
     adata = adata[:, in_vocab].copy()
     genes = adata.var.index.tolist()
@@ -56,9 +60,14 @@ def _tokenise(adata: sc.AnnData, vocab) -> Dict[str, torch.Tensor]:
         normalize_total=False, log1p=False, subset_hvg=False,
         binning=C.N_BINS, result_binned_key="X_binned",
     )
-    pre(adata, batch_key=None)
-    binned = adata.layers["X_binned"]
-    counts = binned.toarray() if issparse(binned) else binned
+    # The bins (0 to 50) fit in int8. Cells are still binned one after another,
+    # so the random tie-breaking draws are the same as binning all of them at once
+    counts = np.zeros(adata.shape, dtype=np.int8)
+    for start in range(0, adata.n_obs, BIN_CHUNK):
+        chunk = adata[start:start + BIN_CHUNK].copy()
+        pre(chunk, batch_key=None)
+        binned = chunk.layers["X_binned"]
+        counts[start:start + BIN_CHUNK] = binned.toarray() if issparse(binned) else binned
 
     # Tokenize and pad the batch, appending a CLS token and ignoring the zero-gene
     tok = tokenize_and_pad_batch(
@@ -207,7 +216,7 @@ def _forward_cls_attention(
 
 # Caculate the attention between the CLS token and the gene tokens
 def _compute_attn_per_gene_per_condition(
-    model: nn.Module, pt: Dict[str, torch.Tensor], vocab, n_head: int,
+    model: nn.Module, pt: Dict[str, torch.Tensor], vocab, gene_names: dict, n_head: int,
     device: torch.device, n_cls: int, use_predictions: bool, batch_size: int = 16,
 ) -> Tuple[Dict[int, Dict[str, float]], dict]:
 
@@ -273,7 +282,8 @@ def _compute_attn_per_gene_per_condition(
     means: Dict[int, Dict[str, float]] = {0: {}, 1: {}}
     for cond in (0, 1):
         for gid, s in sum_by_gid[cond].items():
-            name = vocab.lookup_tokens([gid])[0]
+            # The current gene symbol, not the vocabulary's (GBA1, not GBA)
+            name = gene_names[gid]
             if name in C.SPECIAL_TOKENS:
                 continue
             means[cond][name] = s / n_used[cond] if n_used[cond] > 0 else 0.0
