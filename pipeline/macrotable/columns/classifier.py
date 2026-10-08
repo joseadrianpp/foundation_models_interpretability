@@ -12,9 +12,9 @@ B ~80% of the cells are PD, and an unweighted forest mostly predicts PD.
 Features: the rank pseudo-expression of each selected gene in the cell's
 Geneformer tokens, v = 1 - (p - 1) / (n - 1) for the gene at position p of
 the cell's n genes and 0 when absent (as in the Geneformer OLS features).
-Every model uses it, so accuracies compare across models: most genes
-Geneformer selects are not among the 1000 HVG of the scGPT h5ad files.
-Genes without a Geneformer token are left out (nFeaturesRF).
+Every model uses it, so accuracies compare across models (scGPT and scCello
+genes are matched to Geneformer's tokens by symbol). Genes without a
+Geneformer token are left out (nFeaturesRF).
 
 Cells: at most settings.rf_max_cells random cells (seeded) per dataset and
 cell type, all splits; "A+B" pools the cells of both datasets. Folds: by
@@ -61,7 +61,7 @@ class CellTypeData:
         from ...steps._step7_common import _slug_cell_type
         from ...utils.geneformer_model import load_gene_names, load_token_dictionary
 
-        special = {v for k, v in load_token_dictionary().items() if k.startswith("<")}
+        special = {v for k, v in load_token_dictionary(C.GENEFORMER_TOKEN_DICT).items() if k.startswith("<")}
         input_ids, labels, donors, self.sym_to_ids = [], [], [], {}
         # "A+B" pools the cells of A and B
         for d in dataset.split("+"):
@@ -75,7 +75,7 @@ class CellTypeData:
             input_ids += [np.asarray(x) for x in ds.select(idx)["input_ids"]]
             labels.append(labels_to_int(obs[C.LABEL_COL].to_numpy()[idx]))
             donors.append(f"{d}:" + obs[DONOR_COL].astype(str).to_numpy()[idx].astype(object))
-            for tid, sym in load_gene_names(data_dir).items():
+            for tid, sym in load_gene_names(data_dir / C.GENEFORMER_GENE_NAMES).items():
                 self.sym_to_ids.setdefault(str(sym), set()).add(int(tid))
         labels, donors = np.concatenate(labels), np.concatenate(donors)
 
@@ -155,6 +155,10 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     tag = _settings_tag(settings)
     cache = (pd.read_csv(cache_path, dtype={c: str for c in KEY + ["genes_hash", "settings"]})
              if cache_path.exists() else pd.DataFrame(columns=KEY + ["genes_hash", "settings"] + METRICS))
+    if "Score" not in cache.columns:
+        # Cached before the Score key column: every LoRA scGPT row was IG, every other one attention
+        lora_ig = (cache["Model"] == "scGPT") & (cache["ModelForm"] == "LoRA")
+        cache.insert(KEY.index("Score"), "Score", np.where(lora_ig, "IG", "attention"))
     cached = {tuple(r[KEY + ["genes_hash", "settings"]]): {m: r.get(m, np.nan) for m in METRICS} for _, r in cache.iterrows()}
 
     hashes = [genes_hash(g) for g in experiments["genes"]]

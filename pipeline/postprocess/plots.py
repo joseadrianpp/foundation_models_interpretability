@@ -2,9 +2,11 @@
 
 Every plot is written under results/dataset_*/plots/, one figure per model
 (`<name>_<model>.png`); top-30 plots have no selection suffix and other
-selections get a `_<selection>` suffix (see gene_sets.plot_path). Colors follow
-the ranking method (pooled / CSSI / OLS / fine-tuned), never its position, so
-the same ranking has the same color in every figure, model and selection.
+selections get a `_<selection>` suffix (see gene_sets.plot_path). Each model has
+nine methods: three rankings (pooled / CSSI / OLS) of three scores (zero-shot
+attention, LoRA attention, LoRA IG). The color is the ranking and the texture
+the score (solid / //// / xxxx), never the position, so a method looks the
+same in every figure, model and selection.
 
 Every public plot_* function loops over the models and skips a model whose
 inputs are missing, so callers do not need to know which models were run.
@@ -21,27 +23,37 @@ import pandas as pd
 from .gene_sets import (ALL_SCORE_PATHS, CELL_TYPES, METHOD_META, METHODS, MODELS, SELECTIONS,
                         SUMMARY_PATHS, load_genes, methods_for, output_dir, plot_path)
 
-MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer"}
+MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
 
 
-# One color per ranking and model form: pooled / CSSI / OLS of the zero-shot
-# model, then the same three of the LoRA model (IG for scGPT, attention for Geneformer)
-def _color_group(method: str) -> str:
+# Ranking (pooled / CSSI / OLS) and score (zero-shot attention, LoRA attention,
+# LoRA IG) of a method
+def _ranking(method: str) -> str:
+    ranking = METHOD_META[method]["ranking"]
+    return ranking if ranking in ("cssi", "ols") else "pooled"
+
+
+def _family(method: str) -> str:
     meta = METHOD_META[method]
-    ranking = meta["ranking"] if meta["ranking"] in ("cssi", "ols") else "pooled"
-    return f"lora_{ranking}" if meta["model_form"] == "lora" else ranking
+    if meta["model_form"] != "lora":
+        return "zero_shot"
+    return "lora_ig" if meta["score"] == "ig" else "lora_attention"
 
 
-# Fixed categorical order (blue, orange, aqua, yellow, magenta, green), in the
-# order the methods are drawn: adjacent-pair CVD safe (validated on the plot surface)
-GROUP_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a",
-                "lora_pooled": "#eda100", "lora_cssi": "#e87ba4", "lora_ols": "#008300"}
-GROUP_SHORT = {"pooled": "Pooled", "cssi": "CSSI", "ols": "OLS resid.",
-               "lora_pooled": "LoRA", "lora_cssi": "LoRA CSSI", "lora_ols": "LoRA OLS"}
-METHOD_COLORS = {m: GROUP_COLORS[_color_group(m)] for m in METHODS}
+# Nine methods per model are more than the categorical palette holds, so the
+# encoding is composite: the first three slots of the fixed categorical order
+# (blue, orange, aqua; CVD safe for every pair, validated on the plot surface)
+# for the ranking, and a texture for the score
+RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a"}
+FAMILY_HATCH = {"zero_shot": None, "lora_attention": "////", "lora_ig": "xxxx"}
+RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS"}
+FAMILY_SHORT = {"zero_shot": "", "lora_attention": "LoRA attn.", "lora_ig": "LoRA IG"}
+METHOD_COLORS = {m: RANKING_COLORS[_ranking(m)] for m in METHODS}
+METHOD_HATCH = {m: FAMILY_HATCH[_family(m)] for m in METHODS}
 # Labels inside a figure: the model is already in the title
 METHOD_LABELS = {m: METHOD_META[m]["label"] for m in METHODS}
-METHOD_SHORT = {m: GROUP_SHORT[_color_group(m)] for m in METHODS}
+METHOD_SHORT = {m: (" ".join(x for x in (FAMILY_SHORT[_family(m)], RANKING_SHORT[_ranking(m)]) if x)
+                    or "Pooled") for m in METHODS}
 
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                     "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
@@ -79,10 +91,16 @@ def _style(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _method_handle(method: str):
+    return plt.Rectangle((0, 0), 1, 1, facecolor=METHOD_COLORS[method], hatch=METHOD_HATCH[method],
+                         edgecolor=SURFACE)
+
+
 def _method_legend(fig, methods, ncol=None) -> None:
-    handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in methods]
-    fig.legend(handles, [METHOD_LABELS[m] for m in methods], loc="lower center",
-               ncol=ncol or len(methods), frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.06))
+    # One row per score (three rankings each)
+    handles = [_method_handle(m) for m in methods]
+    fig.legend(handles, [METHOD_LABELS[m] for m in methods], loc="upper center",
+               ncol=ncol or min(3, len(methods)), frameon=False, fontsize=10, bbox_to_anchor=(0.5, 0.02))
 
 
 def _save(fig, out_path: Path) -> Path:
@@ -130,7 +148,7 @@ def _draw_enrichment_panel(ax, summary: pd.DataFrame, tests: pd.DataFrame, metho
             heights.append(val)
             tops[(cell_type, method)] = val
         ax.bar(x + off, heights, width=width * 0.92, label=METHOD_LABELS[method],
-               color=METHOD_COLORS[method])
+               color=METHOD_COLORS[method], hatch=METHOD_HATCH[method], edgecolor=SURFACE, lw=0.5)
 
     # n_significant_terms has no pairwise test (only IC/intersection_size/functional abundance do).
     # Brackets mark method pairs with BH-adjusted p < 0.05, stacked above the bars.
@@ -208,7 +226,7 @@ def _bestmatch_per_gene(results_dir: Path, selection: str, reference: str, cell_
 
 def _draw_gwas_panel(ax, results_dir: Path, selection: str, reference: str, methods: list,
                      ontology: str) -> None:
-    data, positions, colors = [], [], []
+    data, positions, colors, hatches = [], [], [], []
     tick_positions, tick_labels = [], []
     pos = 0.0
     for cell_type in CELL_TYPES:
@@ -220,6 +238,7 @@ def _draw_gwas_panel(ax, results_dir: Path, selection: str, reference: str, meth
                 data.append(vals)
                 positions.append(pos)
                 colors.append(METHOD_COLORS[method])
+                hatches.append(METHOD_HATCH[method])
             pos += 1.0
         tick_positions.append((group_start + pos - 1.0) / 2)
         tick_labels.append(CELL_TYPE_LABELS[cell_type])
@@ -228,8 +247,9 @@ def _draw_gwas_panel(ax, results_dir: Path, selection: str, reference: str, meth
     if not data:
         raise _NoData("no gene-matrix rows for this model")
     bp = ax.boxplot(data, positions=positions, widths=0.8, patch_artist=True, showfliers=False)
-    for patch, color in zip(bp["boxes"], colors):
+    for patch, color, hatch in zip(bp["boxes"], colors, hatches):
         patch.set_facecolor(color)
+        patch.set_hatch(hatch)
         patch.set_edgecolor(SURFACE)
     for median in bp["medians"]:
         median.set_color(INK)
@@ -292,7 +312,8 @@ def _plot_gwas_set_similarity(model: str, results_dir: Path, selection: str) -> 
         sub = df[df["go_source"] == f"GO:{ontology}"].set_index(["reference", "method", "cell_type"])["similarity"]
         for method, off in zip(methods, offsets):
             pd_vals = [sub.get(("parkinson", method, c), np.nan) for c in CELL_TYPES]
-            ax.bar(x + off, pd_vals, width=width * 0.92, color=METHOD_COLORS[method])
+            ax.bar(x + off, pd_vals, width=width * 0.92, color=METHOD_COLORS[method],
+                   hatch=METHOD_HATCH[method], edgecolor=SURFACE, lw=0.5)
             # Other PD references and control diseases: the PD GWAS bar only
             # means something relative to the controls
             for ref, marker, filled, _ in REFERENCE_MARKERS:
@@ -305,14 +326,14 @@ def _plot_gwas_set_similarity(model: str, results_dir: Path, selection: str) -> 
         _style(ax)
     axes[0].set_ylabel(f"Gene-set similarity to reference genes\n({DISTANCE}, BMA)", fontsize=10)
 
-    handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in methods]
+    handles = [_method_handle(m) for m in methods]
     labels = [f"{METHOD_LABELS[m]} vs PD GWAS (bar)" for m in methods]
     for _, marker, filled, label in REFERENCE_MARKERS:
         handles.append(plt.Line2D([], [], ls="", marker=marker, color=INK,
                                   mfc=INK if filled else "none", mec=INK))
         labels.append(label)
-    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=9,
-               bbox_to_anchor=(0.5, -0.12))
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, fontsize=9,
+               bbox_to_anchor=(0.5, 0.02))
     fig.suptitle(f"{MODEL_LABELS[model]} - disease gene-set similarity - {SELECTION_LABELS[selection]}",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
@@ -386,9 +407,12 @@ def _plot_gene_set_sizes(model: str, results_dir: Path) -> Path:
             for cell_type in CELL_TYPES:
                 summary = _summary(results_dir, method, cell_type)
                 vals.append(np.nan if summary is None else summary.get(rule, {}).get("n_selected", np.nan))
-            bars = ax.bar(x + off, vals, width=width * 0.92, color=METHOD_COLORS[method])
+            bars = ax.bar(x + off, vals, width=width * 0.92, color=METHOD_COLORS[method],
+                          hatch=METHOD_HATCH[method], edgecolor=SURFACE, lw=0.5)
+            # Vertical: nine bars per cell type leave no room for horizontal labels
             ax.bar_label(bars, labels=["" if pd.isna(v) else int(v) for v in vals],
-                         fontsize=7, color=INK_2, padding=1)
+                         fontsize=6, color=INK_2, padding=1, rotation=90)
+        ax.margins(y=0.12)
         ax.set_xticks(x)
         ax.set_xticklabels([CELL_TYPE_LABELS[c] for c in CELL_TYPES], rotation=20, ha="right")
         ax.set_title(SELECTION_LABELS[rule], fontsize=11, fontweight="bold")
@@ -461,7 +485,8 @@ def plot_dynamic_selection(results_dir: Path) -> list:
 # Method 2.3 diagnostics: what OLS removes from the attention score
 # ---------------------------------------------------------------------------
 OLS_COVARIATES = {"scgpt": "expression mean/variance/dropout",
-                  "geneformer": "rank pseudo-expression mean/variance/dropout"}
+                  "geneformer": "rank pseudo-expression mean/variance/dropout",
+                  "sccello": "rank pseudo-expression mean/variance/dropout"}
 
 
 def _plot_ols_residualization(model: str, results_dir: Path) -> Path:
@@ -564,15 +589,16 @@ def _plot_selection_comparison(model: str, results_dir: Path, df: pd.DataFrame, 
                     ax.bar_label(bars, labels=["" if pd.isna(v) else int(v) for v in vals],
                                  fontsize=7, color=INK_2, padding=1)
             ax.set_xticks(x)
-            ax.set_xticklabels([METHOD_SHORT[m] for m in methods], fontsize=8)
+            ax.set_xticklabels([METHOD_SHORT[m] for m in methods], fontsize=7, rotation=45, ha="right")
             if r == 0:
                 ax.set_title(CELL_TYPE_LABELS[cell_type], fontsize=11, fontweight="bold")
             if c == 0:
                 ax.set_ylabel(ylabel, fontsize=9)
             _style(ax)
 
-    handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in methods]
-    labels = [METHOD_LABELS[m] for m in methods]
+    # Bars are colored by ranking; the method of each bar is its tick label
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in RANKING_COLORS.values()]
+    labels = ["pooled score", "CSSI-max", "OLS residual"]
     for selection in selections:
         handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=SURFACE, edgecolor=INK_2,
                                      hatch=SELECTION_HATCH[selection]))

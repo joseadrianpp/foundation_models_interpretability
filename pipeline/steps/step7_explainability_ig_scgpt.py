@@ -1,5 +1,7 @@
 """
-Integrated Gradients (IG) attribution for the LoRA fine-tuned scGPT model.
+Integrated Gradients (IG) attribution for the LoRA fine-tuned scGPT model,
+plus what every model's IG shares (IGResult, the checkpointed IG loop and the
+CSSI version), used by step7_explainability_ig_geneformer.py too.
 
 We use Captum's IntegratedGradients (Gauss-Legendre quadrature,
 n_steps interpolation points)
@@ -17,30 +19,195 @@ How it works:
     as 0 (non-negative, like RF importance).
   - The CSSI version (stratified_ig_scores) takes, per gene, the maximum of
     that mean over the Leiden strata of the LoRA model's own cell embedding.
+
+The correctly classified cells and the cell embeddings come from the LoRA
+model's attention pass (attention_cssi_leiden.collect_scgpt), the same one the
+attention_lora_scgpt task runs, so the two tasks share their Leiden strata.
+IG over every correctly classified cell takes hours on the large cell types,
+so the per-token attributions computed so far are saved every
+CHECKPOINT_MINUTES (run_ig) and a rerun resumes from them.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+import os
+from pathlib import Path
+import time
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from captum.attr import IntegratedGradients
 
-from . import _step7_common as common
 from .. import config as C
 from ..utils.progress import progress
 
 # Gauss-Legendre interpolation points and forward batch size. IG needs a
 # backward pass per step, so the batch is smaller than the attention path's.
-IG_STEPS = 24
+# 50 steps, as in pipeline_unified, whose IG results are the same score
+IG_STEPS = 50
 IG_BATCH_SIZE = 8
 # Captum runs IG_BATCH_SIZE * IG_STEPS interpolated cells per forward/backward;
 # splitting them into chunks of this size keeps an 8 GB GPU from running out of
 # memory and does not change the attributions (the gradients are just summed)
 IG_INTERNAL_BATCH_SIZE = 32
 
+# Minutes between two saves of the IG computed so far (run_ig)
+CHECKPOINT_MINUTES = 15
+
+
 # ---------------------------------------------------------------------------
-# Integrated Gradients of the PD logit w.r.t. the input expression
+# Shared by the IG of every model
+# ---------------------------------------------------------------------------
+def attribute(attributor: IntegratedGradients, internal_batch_size: list, **kwargs) -> torch.Tensor:
+    """attributor.attribute, halving the internal batch while the GPU runs out of memory.
+
+    `internal_batch_size` is a one-element list, so the size that fits is kept
+    for the next batches. The chunks only split the sum over the steps, so
+    the attributions do not change.
+    """
+    while True:
+        try:
+            return attributor.attribute(internal_batch_size=internal_batch_size[0], **kwargs)
+        except torch.cuda.OutOfMemoryError:
+            if internal_batch_size[0] <= 1:
+                raise
+            torch.cuda.empty_cache()
+            internal_batch_size[0] = max(1, internal_batch_size[0] // 2)
+            print(f"  IG: out of GPU memory, internal batch -> {internal_batch_size[0]}", flush=True)
+
+
+def run_ig(order: np.ndarray, make_batches: Callable[[np.ndarray], List[np.ndarray]],
+           ig_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]],
+           checkpoint: Optional[Path] = None, desc: str = "IG") -> Tuple[np.ndarray, ...]:
+    """IG of the cells in `order`, batched by `make_batches`, saved every CHECKPOINT_MINUTES.
+
+    ig_fn(cell indices) returns the batch's token ids (B, L), |IG| (B, L) and
+    a (B, L) mask of the gene tokens to keep. Returns the cell, token id and
+    |IG| of every kept token, cell after cell in `order`. With `checkpoint`,
+    the tokens of the cells done so far go to that .npz every
+    CHECKPOINT_MINUTES; a rerun whose `order` starts with those cells resumes
+    after them (the batches may differ, e.g. on another GPU: each cell's IG
+    does not depend on the others). The checkpoint is deleted at the end.
+    """
+    cells, gids, abs_ig = [], [], []
+    n_done = 0
+    if checkpoint is not None and checkpoint.exists():
+        with np.load(checkpoint) as ck:
+            done = ck["done"]
+            if done.size <= order.size and np.array_equal(done, order[:done.size]):
+                n_done = int(done.size)
+                cells, gids, abs_ig = [ck["token_cells"]], [ck["token_gids"]], [ck["token_abs_ig"]]
+                print(f"  IG checkpoint: resuming after {n_done:,} of {order.size:,} cells", flush=True)
+            else:
+                print(f"  IG checkpoint {checkpoint.name} is for other cells, starting over", flush=True)
+
+    def save() -> None:
+        tmp = checkpoint.with_name(checkpoint.name + ".tmp")
+        with open(tmp, "wb") as f:
+            np.savez(f, done=order[:n_done], token_cells=np.concatenate(cells),
+                     token_gids=np.concatenate(gids), token_abs_ig=np.concatenate(abs_ig))
+        os.replace(tmp, checkpoint)
+
+    last_save = time.monotonic()
+    with progress(total=order.size, initial=n_done, desc=desc, unit="cell") as bar:
+        for idx in make_batches(order[n_done:]):
+            batch_gids, batch_abs, keep = ig_fn(idx)
+            cells.append(np.repeat(idx, keep.sum(axis=1)).astype(np.int32))
+            gids.append(batch_gids[keep].astype(np.int32))
+            abs_ig.append(batch_abs[keep].astype(np.float32))
+            n_done += len(idx)
+            bar.update(len(idx))
+            if checkpoint is not None and time.monotonic() - last_save > CHECKPOINT_MINUTES * 60:
+                save()
+                last_save = time.monotonic()
+
+    cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)
+    return cat(cells, np.int32), cat(gids, np.int32), cat(abs_ig, np.float32)
+
+
+def remove_checkpoint(checkpoint: Path) -> None:
+    """Delete the IG checkpoint once the cell type's outputs are written."""
+    checkpoint.unlink(missing_ok=True)
+
+
+def _named_means(gids: np.ndarray, weights: np.ndarray, n_cells: int, names: dict) -> Dict[str, float]:
+    """Sum of `weights` per token id over `n_cells` cells, named by `names` (token id -> gene)."""
+    if gids.size == 0 or n_cells == 0:
+        return {}
+    sums = np.bincount(gids, weights=weights)
+    seen_ids = np.unique(gids)
+    return {names[int(gid)]: float(sums[gid]) / n_cells for gid in seen_ids}
+
+
+@dataclass
+class IGResult:
+    """Pooled IG scores of one cell type, plus what the stratified (CSSI) score needs."""
+    mean_abs: Dict[str, float]  # mean |IG| per gene over the correctly classified cells
+    gate: dict
+    embeddings: np.ndarray      # (n_cells, d) residual-stream CLS embedding entering the attention layer
+    labels: np.ndarray          # (n_cells,) 0 = control, 1 = PD
+    correct: np.ndarray         # (n_cells,) True where the classifier predicts the true label
+    token_cells: np.ndarray     # (n_tokens,) cell of every gene token of the correctly classified cells
+    token_gids: np.ndarray      # (n_tokens,) its token id
+    token_abs_ig: np.ndarray    # (n_tokens,) its |IG|
+
+    @classmethod
+    def from_tokens(cls, token_cells, token_gids, token_abs_ig, embeddings, labels, correct,
+                    names: dict) -> "IGResult":
+        # The mean IG per gene over every correctly classified cell, a cell
+        # without the gene adds 0, so a gene seen in a handful of cells cannot
+        # outrank one seen in all of them
+        n_used = int(correct.sum())
+        ok = n_used > 0
+        gate = {"ok": ok, "reason": "" if ok else "no correctly-classified cells", "mode": "ig_predictions"}
+        return cls(mean_abs=_named_means(token_gids, token_abs_ig, n_used, names), gate=gate,
+                   embeddings=embeddings, labels=labels, correct=correct, token_cells=token_cells,
+                   token_gids=token_gids, token_abs_ig=token_abs_ig)
+
+    def save(self, path) -> None:
+        """Per-cell token |IG| to one .npz (embeddings excluded: cell_embeddings.npy)."""
+        np.savez(path, labels=self.labels, correct=self.correct, token_cells=self.token_cells,
+                 token_gids=self.token_gids, token_abs_ig=self.token_abs_ig)
+
+    @classmethod
+    def load(cls, path, embeddings: np.ndarray, names: dict) -> "IGResult":
+        """A saved IGResult; the pooled mean |IG| is recomputed (equal up to summation order)."""
+        with np.load(path, allow_pickle=False) as npz:
+            data = {k: npz[k] for k in npz.files}
+        return cls.from_tokens(embeddings=embeddings, names=names, **data)
+
+
+def stratified_ig_scores(result: IGResult, strata: np.ndarray, names: dict,
+                         min_cells_per_condition: int = 20) -> Tuple[Dict[str, float], int]:
+    """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
+
+    The mean is over the stratum's correctly classified cells (a cell without
+    the gene adding 0), and a stratum needs min_cells_per_condition of them
+    per condition, as the attention CSSI (the LoRA embedding groups cells by
+    the model's prediction, so few strata qualify). Returns (scores, number
+    of valid strata); without any valid stratum the scores are the pooled ones.
+    """
+    token_strata = strata[result.token_cells]
+    best: Dict[str, float] = {}
+    valid = 0
+    for stratum in np.unique(strata):
+        cells = (strata == stratum) & result.correct
+        counts = [int(np.sum(cells & (result.labels == c))) for c in (0, 1)]
+        if min(counts) < min_cells_per_condition:
+            continue
+        valid += 1
+        tokens = token_strata == stratum
+        means = _named_means(result.token_gids[tokens], result.token_abs_ig[tokens], int(cells.sum()), names)
+        for gene, score in means.items():
+            if gene not in best or score > best[gene]:
+                best[gene] = score
+    if valid == 0:
+        return dict(result.mean_abs), 0
+    return best, valid
+
+
+# ---------------------------------------------------------------------------
+# Integrated Gradients of the PD logit w.r.t. the input expression (scGPT)
 # ---------------------------------------------------------------------------
 def _pd_logit(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
               mask: torch.Tensor) -> torch.Tensor:
@@ -53,7 +220,7 @@ def _pd_logit(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 # Baseline is a zero vector
 def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
               mask: torch.Tensor, device: torch.device, n_steps: int,
-              internal_batch_size: int = IG_INTERNAL_BATCH_SIZE) -> np.ndarray:
+              internal_batch_size: list) -> np.ndarray:
 
     # Function for forward the model
     def forward_fn(v: torch.Tensor, gids_: torch.Tensor, mask_: torch.Tensor) -> torch.Tensor:
@@ -62,197 +229,50 @@ def _ig_batch(model: torch.nn.Module, gids: torch.Tensor, vals: torch.Tensor,
 
     # Integrated Gradients attribution for the batch of cells
     attributor = IntegratedGradients(forward_fn, multiply_by_inputs=True)
-    attrs = attributor.attribute(
+    attrs = attribute(
+        attributor, internal_batch_size,
         inputs=vals,
         baselines=torch.zeros_like(vals),
         additional_forward_args=(gids, mask),
         n_steps=n_steps,
         method="gausslegendre",
-        internal_batch_size=internal_batch_size,
     )
     return attrs.detach().float().cpu().numpy()
 
 
-
-@dataclass
-class IGResult:
-    """Pooled IG scores of one cell type, plus what the stratified (CSSI) score needs."""
-    mean_abs: Dict[str, float]  # mean |IG| per gene over the correctly classified cells
-    gate: dict
-    embeddings: np.ndarray      # (n_cells, d) residual-stream CLS embedding entering layer NUM_ATTN_LAYERS
-    labels: np.ndarray          # (n_cells,) 0 = control, 1 = PD
-    correct: np.ndarray         # (n_cells,) True where the classifier predicts the true label
-    token_cells: np.ndarray     # (n_tokens,) cell of every gene token of the correctly classified cells
-    token_gids: np.ndarray      # (n_tokens,) its token id
-    token_abs_ig: np.ndarray    # (n_tokens,) its |IG|
-
-    def save(self, path) -> None:
-        """Per-cell token |IG| to one .npz (embeddings excluded: cell_embeddings.npy)."""
-        np.savez(path, labels=self.labels, correct=self.correct, token_cells=self.token_cells,
-                 token_gids=self.token_gids, token_abs_ig=self.token_abs_ig)
-
-    @classmethod
-    def load(cls, path, embeddings: np.ndarray, vocab) -> "IGResult":
-        """A saved IGResult; the pooled mean |IG| is recomputed (equal up to summation order)."""
-        with np.load(path, allow_pickle=False) as npz:
-            data = {k: npz[k] for k in npz.files}
-        n_used = int(data["correct"].sum())
-        sums = np.bincount(data["token_gids"], weights=data["token_abs_ig"], minlength=len(vocab))
-        seen_ids = np.unique(data["token_gids"])
-        mean_abs = {name: float(sums[gid]) / n_used
-                    for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist()))
-                    if name not in C.SPECIAL_TOKENS}
-        return cls(mean_abs=mean_abs, gate={"ok": n_used > 0, "reason": "", "mode": "ig_predictions"},
-                   embeddings=embeddings, **data)
-
-
-# Mean absolute integrated gradient per gene over correctly classified cells
-def _compute_ig_importance(
-    model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
+def compute_ig_result(
+    model: torch.nn.Module, pt: Dict[str, torch.Tensor], cache, vocab, gene_names: dict,
     device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
-    classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
-    desc: str = "IG",
-) -> Tuple[Dict[str, float], dict]:
-    result = _compute_ig_result(model, pt, vocab, device, n_steps, batch_size, classify_batch_size,
-                                internal_batch_size, desc)
-    return result.mean_abs, result.gate
-
-
-# The same, keeping every cell's embedding and every token's |IG| (IGResult)
-def _compute_ig_result(
-    model: torch.nn.Module, pt: Dict[str, torch.Tensor], vocab,
-    device: torch.device, n_steps: int = IG_STEPS, batch_size: int = IG_BATCH_SIZE,
-    classify_batch_size: int = 64, internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
+    internal_batch_size: int = IG_INTERNAL_BATCH_SIZE, checkpoint: Optional[Path] = None,
     desc: str = "IG",
 ) -> IGResult:
+    """Mean absolute IG per gene over the correctly classified cells, keeping every token's |IG|.
 
-    # Number of cells and special tokens
-    n_cells = pt["gene_ids"].shape[0]
+    `cache` is the LoRA model's AttentionCache of the same cells
+    (collect_scgpt with use_predictions): its correctly classified cells are
+    the ones attributed, its embeddings are the result's.
+    """
     pad_id = vocab[C.PAD_TOKEN]
-    special_ids = {vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}
-    special_arr = np.array(sorted(special_ids | {pad_id}))
+    special_arr = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab} | {pad_id}))
 
     # We only need gradients w.r.t. the input values, not the (frozen) weights.
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # Pass 1: classify every cell (no gradients needed, just inference).
-    # Initialize variables
-    labels_all = pt["condition_labels"].numpy()
-    preds_all = np.empty(n_cells, dtype=np.int64)
-    # The same pass keeps each cell's CLS embedding entering the attention
-    # layer (as the zero-shot attention task does), for the CSSI strata
-    embeddings = []
-    capture = common._LayerInputCapture(model.transformer_encoder.layers[common.NUM_ATTN_LAYERS])
-    try:
-        # Iterate over cells and classified them
-        for start in progress(range(0, n_cells, classify_batch_size), desc=f"{desc} classify", unit="batch"):
-            # Special case for last batch
-            end = min(start + classify_batch_size, n_cells)
-            gids = pt["gene_ids"][start:end].to(device)
-            vals = pt["values"][start:end].to(device).float()
-            mask = gids.eq(pad_id)
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                preds_all[start:end] = (_pd_logit(model, gids, vals, mask) > 0).long().cpu().numpy()
-            embeddings.append(capture.captured[:, 0, :].float().cpu().numpy())
-    finally:
-        capture.remove()
+    internal = [internal_batch_size]
 
-    # Filter the correctly classified cells
-    correct_mask = preds_all == labels_all
-    correct_idx = torch.from_numpy(np.where(correct_mask)[0])
-    n_used = len(correct_idx)
-
-    # Pass 2: Integrated Gradients, only on the correctly classified subset.
-    # Initialize variables: per token id, summed |IG| and whether it was seen
-    n_ids = len(vocab)
-    sum_abs = np.zeros(n_ids)
-    seen = np.zeros(n_ids, dtype=bool)
-    token_cells, token_gids, token_abs_ig = [], [], []
-
-    # Iterate over the correctly classified cells in batches, computing IG for each
-    bar = progress(total=n_used, desc=desc, unit="cell")
-    for start in range(0, n_used, batch_size):
-        # Special case for last batch
-        end = min(start + batch_size, n_used)
-
-        # Correct id cells
-        idx = correct_idx[start:end]
-
-        # Genes to tensors for gene ids and labels (which we don't currently have)
+    # IG of a batch of correctly classified cells and its gene tokens (position 0 is the CLS)
+    def ig_fn(idx: np.ndarray):
         gids = pt["gene_ids"][idx].to(device)
         vals = pt["values"][idx].to(device).float()
-
-        # Masking the padding values
-        mask = gids.eq(pad_id)
-
-        # Compute IG for the batch of correctly classified cells
-        ig = _ig_batch(model, gids, vals, mask, device, n_steps, internal_batch_size)
+        ig = _ig_batch(model, gids, vals, gids.eq(pad_id), device, n_steps, internal)
         gids_np = gids.cpu().numpy()
-
-        # We have the IG by cell, like in attention, but we want the
-        # mean absolute IG per gene over only correctly classified cells.
-        # Every gene token of the batch at once (position 0 is the CLS)
         keep = ~np.isin(gids_np, special_arr)
         keep[:, 0] = False
-        sum_abs += np.bincount(gids_np[keep], weights=np.abs(ig[keep]), minlength=n_ids)
-        seen[gids_np[keep]] = True
-        token_cells.append(np.repeat(idx.numpy(), keep.sum(axis=1)).astype(np.int32))
-        token_gids.append(gids_np[keep].astype(np.int32))
-        token_abs_ig.append(np.abs(ig[keep]).astype(np.float32))
-        bar.update(end - start)
-    bar.close()
+        return gids_np, np.abs(ig), keep
 
-    # Compute the mean IG per gene over every correctly classified cell, a cell
-    # without the gene adds 0, so a gene seen in a handful of cells cannot
-    # outrank one seen in all of them
-    mean_abs: Dict[str, float] = {}
-    seen_ids = np.where(seen)[0]
-    for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist())):
-        if name in C.SPECIAL_TOKENS:
-            continue
-        mean_abs[name] = float(sum_abs[gid]) / n_used
-
-    # Safe case for 100% or 0% accuracy
-    ok = n_used > 0
-    gate = {"ok": bool(ok),
-            "reason": "" if ok else "no correctly-classified cells",
-            "mode": "ig_predictions"}
-    cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)
-    return IGResult(mean_abs=mean_abs, gate=gate, embeddings=np.concatenate(embeddings), labels=labels_all,
-                    correct=correct_mask, token_cells=cat(token_cells, np.int32),
-                    token_gids=cat(token_gids, np.int32), token_abs_ig=cat(token_abs_ig, np.float32))
-
-
-def stratified_ig_scores(result: IGResult, strata: np.ndarray, vocab,
-                         min_cells_per_condition: int = 20) -> Tuple[Dict[str, float], int]:
-    """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
-
-    The mean is over the stratum's correctly classified cells (a cell without
-    the gene adding 0), and a stratum needs min_cells_per_condition of them
-    per condition, as the attention CSSI (the LoRA embedding groups cells by
-    the model's prediction, so few strata qualify). Returns (scores, number
-    of valid strata); without any valid stratum the scores are the pooled ones.
-    """
-    n_ids = len(vocab)
-    best = np.zeros(n_ids)
-    seen = np.zeros(n_ids, dtype=bool)
-    token_strata = strata[result.token_cells]
-    valid = 0
-    for stratum in np.unique(strata):
-        cells = (strata == stratum) & result.correct
-        counts = [int(np.sum(cells & (result.labels == c))) for c in (0, 1)]
-        if min(counts) < min_cells_per_condition:
-            continue
-        valid += 1
-        tokens = token_strata == stratum
-        gids = result.token_gids[tokens]
-        means = np.bincount(gids, weights=result.token_abs_ig[tokens], minlength=n_ids) / cells.sum()
-        present = np.bincount(gids, minlength=n_ids) > 0
-        best[present] = np.where(seen[present], np.maximum(best[present], means[present]), means[present])
-        seen |= present
-    if valid == 0:
-        return dict(result.mean_abs), 0
-    seen_ids = np.where(seen)[0]
-    return {name: float(best[gid]) for gid, name in zip(seen_ids, vocab.lookup_tokens(seen_ids.tolist()))
-            if name not in C.SPECIAL_TOKENS}, valid
+    correct_idx = np.where(cache.correct)[0]
+    make_batches = lambda order: [order[i:i + batch_size] for i in range(0, order.size, batch_size)]
+    tokens = run_ig(correct_idx, make_batches, ig_fn, checkpoint, desc)
+    return IGResult.from_tokens(*tokens, embeddings=cache.embeddings, labels=cache.labels,
+                                correct=cache.correct, names=gene_names)

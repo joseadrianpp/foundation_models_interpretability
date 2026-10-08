@@ -14,14 +14,17 @@ import pandas as pd
 
 from ..postprocess import gene_sets as gs
 
-# Columns that identify an experiment, in table order
-KEY = ["Ranking", "TopN", "Model", "ModelForm", "Dataset", "CellType"]
+# Columns that identify an experiment, in table order. Score is the signal a
+# ranking is computed from: a LoRA model has both an attention and an IG
+# CSSI / residuals ranking (zero-shot rows are all attention)
+KEY = ["Ranking", "Score", "TopN", "Model", "ModelForm", "Dataset", "CellType"]
 
 # Table labels of the gene_sets.py names
 RANKING_LABELS = {"attention": "attention", "cssi": "CSSI", "ols": "residuals",
                   "integrated_gradients": "IG"}
+SCORE_LABELS = {"attention": "attention", "ig": "IG"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
-MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer"}
+MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
 MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "lora": "LoRA"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
@@ -80,6 +83,7 @@ def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = Non
                     df = pd.read_csv(path).sort_values("score", ascending=False, kind="stable")
                     rows.append({
                         "Ranking": RANKING_LABELS[meta["ranking"]],
+                        "Score": SCORE_LABELS[meta["score"]],
                         "TopN": TOPN_LABELS[selection],
                         "Model": MODEL_LABELS[meta["model"]],
                         "ModelForm": MODEL_FORM_LABELS[meta["model_form"]],

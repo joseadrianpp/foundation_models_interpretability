@@ -6,9 +6,9 @@
                                 overlap (P(X >= k))
 
 The p-value draws the selection from the genes the model could rank in that
-cell type (every gene of its zero-shot attention score: the 1000 HVG for
-scGPT, every gene seen for Geneformer), so overlaps are comparable between
-models with very different gene universes. The panels are the reference gene
+cell type (every gene of its zero-shot attention score: every expressed
+gene of the h5ad for scGPT, every gene seen for Geneformer and scCello), so
+overlaps are comparable between models with different gene universes. The panels are the reference gene
 sets saved by the gwas_similarity task (gwas_similarity/refs/).
 """
 

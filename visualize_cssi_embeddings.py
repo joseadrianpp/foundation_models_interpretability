@@ -3,7 +3,7 @@
 
 Every model task with CSSI saves its residual-stream CLS embeddings and Leiden
 labels under results/dataset_<x>/<scores>/<cell type>/ (scores:
-attention_zero_shot_<model>, ig_lora_scgpt, attention_lora_geneformer). This
+attention_zero_shot_<model>, attention_lora_<model>, ig_lora_<model>). This
 script runs no model: it loads them and draws, per cell type, PCA / UMAP /
 t-SNE colored by stratum, UMAP colored by condition, the cosine k-NN graph and
 the cells of each stratum per condition (valid: >= 20 of each, as CSSI).
@@ -33,8 +33,10 @@ from pipeline.utils.splits import labels_to_int
 
 HERE = Path(__file__).resolve().parent
 CELL_TYPES = ["astrocytes", "da_neurons", "microglia", "oligodendrocytes"]
-SCORES = ["attention_zero_shot_scgpt", "ig_lora_scgpt", "attention_zero_shot_geneformer", "attention_lora_geneformer"]
-SCGPT_H5ADS = [Path("mixed_split_scgpt") / f"Mixed_HVG_1000_pc_noXY_noMT_mixed_{split}.h5ad"
+SCORES = [f"{score}_{model}" for model in ("scgpt", "geneformer", "sccello")
+          for score in ("attention_zero_shot", "attention_lora", "ig_lora")]
+# Every model sees the same cells in the same order; the labels come from the scGPT h5ad obs
+SCGPT_H5ADS = [Path("mixed_split_scgpt") / f"Mixed_allgenes_pc_noXY_noMT_mixed_{split}.h5ad"
                for split in ("train", "val", "test")]
 MIN_CELLS_PER_CONDITION = 20
 
@@ -168,7 +170,7 @@ def main():
     p.add_argument("--results-dir", type=Path, default=HERE / "results")
     p.add_argument("--dataset", choices=["A", "B", "A+B"], default="A")
     p.add_argument("--scores", default=",".join(SCORES),
-                   help="Comma-separated model task folders (default: all four with CSSI).")
+                   help="Comma-separated model task folders (default: all nine with CSSI).")
     p.add_argument("--cell-types", default=",".join(CELL_TYPES))
     p.add_argument("--n-neighbors", type=int, default=15)
     p.add_argument("--n-pcs", type=int, default=50)
