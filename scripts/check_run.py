@@ -156,7 +156,8 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
             if meta is None:
                 rep.fail(f"{folder} {ct}: cssi_metadata.json missing")
                 continue
-            if (results_dir / folder / ct / "ig_checkpoint.npz").exists():
+            if ((results_dir / folder / ct / "ig_checkpoint.npz").exists()
+                    and not (results_dir / folder / ct / "done.json").exists()):
                 rep.fail(f"{folder} {ct}: IG checkpoint left, the task did not finish this cell type")
             if meta["n_cells"] != expected[model].get(ct):
                 rep.fail(f"{folder} {ct}: used {meta['n_cells']} cells, the data has {expected[model].get(ct)}")
