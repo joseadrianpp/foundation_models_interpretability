@@ -89,10 +89,25 @@ def _slug_cell_type(cell_type: str) -> str:
     return "_".join(str(cell_type).strip().lower().split())
 
 
-# scGPT zero-shot model load
-def _load_zero_shot_model(vocab, model_configs: dict, device: torch.device) -> nn.Module:
+# scGPT zero-shot model load. The Step 2.5 model is the same backbone with
+# other weights, so it is loaded the same way with its own weights_path
+def _load_zero_shot_model(vocab, model_configs: dict, device: torch.device,
+                          weights_path=C.SCGPT_WEIGHTS) -> nn.Module:
     model = build_base_model(vocab, model_configs, n_cls=2)
+    load_pretrained_weights(model, device, weights_path)
+    model.to(device); model.eval()
+    return model
+
+
+# Zero-shot model + Step 4 MLP head: the pretrained backbone, unchanged, with the
+# head pipeline_unified Step 4 trained on its CLS embedding as cls_decoder
+# (the head the LoRA was warm-started from, before any fine-tuning)
+def _load_mlp_model(head_path, vocab, model_configs: dict,
+                    device: torch.device) -> nn.Module:
+    model = build_base_model(vocab, model_configs, n_cls=1)
     load_pretrained_weights(model, device)
+    model.cls_decoder = FlexMLP(**C.SCGPT_LORA_HEAD_CONFIG)
+    model.cls_decoder.load_state_dict(torch.load(head_path, map_location=device)["state_dict"])
     model.to(device); model.eval()
     return model
 

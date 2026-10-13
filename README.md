@@ -1,6 +1,6 @@
 # Foundation Models Interpretability
 
-Run `run_tasks.py` for running the interpretability tasks, the same three for each model (scGPT with every gene, Geneformer V2 104M and scCello):
+Run `run_tasks.py` for running the interpretability tasks, the same six for each model (scGPT with every gene, Geneformer V2 104M and scCello):
 
 - **attention_scgpt**: forward-passes cells through the zero-shot pretrained scGPT model and captures the CLS-token attention to each gene. Genes are scored by `mean_attention_pd - mean_attention_control`, so the sign shows which condition attends to that gene more. Each mean is over every cell of the condition, a cell without the gene counting as 0, so a gene seen in only a few cells cannot rank above one seen in all of them.
 - **attention_lora_scgpt**: the same attention score with the LoRA fine-tuned scGPT classifier, using only the cells it classifies correctly.
@@ -8,7 +8,12 @@ Run `run_tasks.py` for running the interpretability tasks, the same three for ea
 - **attention_geneformer**, **attention_lora_geneformer**, **ig_lora_geneformer**: the same three with Geneformer. Its cells are ranked gene tokens with no expression value, so Integrated Gradients runs over the token embeddings, from a baseline where every gene is the `<mask>` token, and a gene's attribution is the sum over the embedding dimensions.
 - **attention_sccello**, **attention_lora_sccello**, **ig_lora_sccello**: the same three with scCello, a smaller Geneformer-like model that reads the same kind of cells.
 
-Run `--task <name>` to run only one of them. `--task all` (default) runs the nine. `--dataset A` (default) or `--dataset B` picks the dataset; results go to `results/dataset_a/` or `results/dataset_b/`. `results/dataset_*/ig_lora_*/` already holds the Integrated Gradients top-30 of the three models in both datasets, computed with the same score, so those three tasks only need running to reproduce them.
+Two more versions of each model, between the zero-shot and the LoRA one:
+
+- **Zero-shot + MLP head** (`attention_mlp_<model>`, `ig_mlp_<model>`): the zero-shot pretrained model, not fine-tuned, with the small MLP head trained to classify PD from its frozen cell embedding (the head the LoRA training starts from). It is a classifier like the LoRA one, so it runs the same two tasks: the attention score on the cells it classifies correctly and Integrated Gradients. Compared with the LoRA tasks, they show what fine-tuning the model itself changes.
+- **Step 2.5** (`attention_step2_5_<model>`): the pretrained model after a further self-supervised pretraining on the training cells of that dataset, with the model's own pretraining objective and no diagnosis labels. It has no head, so it runs the zero-shot attention task (every cell, by its true label). Compared with `attention_<model>`, it shows what adapting the model to these cells changes.
+
+Run `--task <name>` to run only one of them. `--task all` (default) runs the eighteen. `--dataset A` (default) or `--dataset B` picks the dataset; results go to `results/dataset_a/` or `results/dataset_b/`. `results/dataset_*/ig_lora_*/` and `results/dataset_*/ig_mlp_*/` already hold the Integrated Gradients top-30 of the three models in both datasets, computed with the same score, so those six tasks only need running to reproduce them.
 
 Everything runs in the scGPT environment: Geneformer and scCello are plain BERTs loaded with `transformers`/`peft`, and their cells come already tokenized, so neither the `geneformer` nor the `sccello` package is needed.
 
@@ -24,6 +29,9 @@ Everything runs in the scGPT environment: Geneformer and scCello are plain BERTs
 | `dataset_*/step5_1_lora_scgpt/` | LoRA fine-tuned scGPT classifier of that dataset (adapters merged into the model) |
 | `dataset_*/step5_1_lora_geneformer/` | LoRA fine-tuned Geneformer classifier of that dataset (adapter + head, on top of `Geneformer_V2_104M/`) |
 | `dataset_*/step5_1_lora_sccello/` | LoRA fine-tuned scCello classifier of that dataset (adapter + head, on top of `scCello_zeroshot/`) |
+| `dataset_*/step4_mlp_{scgpt,geneformer,sccello}/` | MLP head of the zero-shot + MLP classifier of that dataset (`best_mlp.pt`, on top of the zero-shot model) |
+| `dataset_*/step2_5_scgpt/` | scGPT after Step 2.5 on that dataset (`best_model.pt`, same architecture and vocabulary as `scGPT_brain/`) |
+| `dataset_*/step2_5_geneformer/`, `dataset_*/step2_5_sccello/` | Geneformer and scCello after Step 2.5 on that dataset (scCello stored as a plain BERT, like `scCello_zeroshot/`) |
 | `scGPT_brain/`, `Geneformer_V2_104M/`, `scCello_zeroshot/` | zero-shot pretrained models (scCello stored as a plain BERT) |
 | `pd_panels/` | PanelApp Parkinson Disease and Complex Parkinsonism panel and ParkinsonsUK-UCL GO annotations (QuickGO) |
 | `go3_refs/` | GO ontology and human GO annotations |

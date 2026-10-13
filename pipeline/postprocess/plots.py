@@ -7,20 +7,36 @@ import pandas as pd
 from .enrichment import CELL_TYPES, METHODS
 
 METHOD_LABELS = {"attention_zero_shot_scgpt": "scGPT zero-shot (attention)",
+                 "attention_step2_5_scgpt": "scGPT Step 2.5 (attention)",
+                 "attention_mlp_scgpt": "scGPT zero-shot + MLP (attention)",
+                 "ig_mlp_scgpt": "scGPT zero-shot + MLP (Integrated Gradients)",
                  "attention_lora_scgpt": "scGPT LoRA (attention)",
                  "ig_lora_scgpt": "scGPT LoRA (Integrated Gradients)",
                  "attention_zero_shot_geneformer": "Geneformer zero-shot (attention)",
+                 "attention_step2_5_geneformer": "Geneformer Step 2.5 (attention)",
+                 "attention_mlp_geneformer": "Geneformer zero-shot + MLP (attention)",
+                 "ig_mlp_geneformer": "Geneformer zero-shot + MLP (Integrated Gradients)",
                  "attention_lora_geneformer": "Geneformer LoRA (attention)",
                  "ig_lora_geneformer": "Geneformer LoRA (Integrated Gradients)",
                  "attention_zero_shot_sccello": "scCello zero-shot (attention)",
+                 "attention_step2_5_sccello": "scCello Step 2.5 (attention)",
+                 "attention_mlp_sccello": "scCello zero-shot + MLP (attention)",
+                 "ig_mlp_sccello": "scCello zero-shot + MLP (Integrated Gradients)",
                  "attention_lora_sccello": "scCello LoRA (attention)",
                  "ig_lora_sccello": "scCello LoRA (Integrated Gradients)"}
-METHOD_COLORS = {"attention_zero_shot_scgpt": "#4878CF", "attention_lora_scgpt": "#77BEDB",
-                 "ig_lora_scgpt": "#D65F5F",
-                 "attention_zero_shot_geneformer": "#6ACC65", "attention_lora_geneformer": "#B47CC7",
-                 "ig_lora_geneformer": "#EE854A",
-                 "attention_zero_shot_sccello": "#C4AD66", "attention_lora_sccello": "#DC7EC0",
-                 "ig_lora_sccello": "#8C613C"}
+METHOD_COLORS = {"attention_zero_shot_scgpt": "#4878CF", "attention_step2_5_scgpt": "#17BECF",
+                 "attention_mlp_scgpt": "#2A9D8F", "ig_mlp_scgpt": "#8B1E3F",
+                 "attention_lora_scgpt": "#77BEDB", "ig_lora_scgpt": "#D65F5F",
+                 "attention_zero_shot_geneformer": "#6ACC65", "attention_step2_5_geneformer": "#5C4B99",
+                 "attention_mlp_geneformer": "#2E7D32", "ig_mlp_geneformer": "#F2C14E",
+                 "attention_lora_geneformer": "#B47CC7", "ig_lora_geneformer": "#EE854A",
+                 "attention_zero_shot_sccello": "#C4AD66", "attention_step2_5_sccello": "#FF9896",
+                 "attention_mlp_sccello": "#7F7F7F", "ig_mlp_sccello": "#BCBD22",
+                 "attention_lora_sccello": "#DC7EC0", "ig_lora_sccello": "#8C613C"}
+# The legend fills column by column, so with six methods per model in METHODS each
+# foundation model takes two columns. It hangs below the panels, so its three rows
+# never cover the cell type labels
+LEGEND_COLUMNS = 6
 CELL_TYPE_LABELS = {"astrocytes": "Astrocytes", "da_neurons": "DA neurons",
                      "microglia": "Microglia", "oligodendrocytes": "Oligodendrocytes"}
 SIG_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
@@ -92,7 +108,7 @@ def plot_enrichment_summary(results_dir: Path) -> Path:
         _draw_enrichment_panel(ax, summary, tests, metric, metric_key, title)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=len(METHODS), frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+    fig.legend(handles, labels, loc="upper center", ncol=LEGEND_COLUMNS, frameon=False, fontsize=10, bbox_to_anchor=(0.5, 0.0))
     fig.tight_layout(rect=[0, 0.05, 1, 1])
 
     out_path = results_dir / "plots" / "enrichment_summary.png"
@@ -152,8 +168,8 @@ def plot_gwas_similarity(results_dir: Path) -> Path:
     axes[0].set_ylabel(f"Best-match similarity to PD\n({DISTANCE}, BMA)", fontsize=10)
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=METHOD_COLORS[m]) for m in METHODS]
-    fig.legend(handles, [METHOD_LABELS[m] for m in METHODS], loc="lower center",
-               ncol=len(METHODS), frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.05))
+    fig.legend(handles, [METHOD_LABELS[m] for m in METHODS], loc="upper center",
+               ncol=LEGEND_COLUMNS, frameon=False, fontsize=10, bbox_to_anchor=(0.5, 0.0))
     fig.tight_layout(rect=[0, 0.05, 1, 1])
 
     out_path = results_dir / "plots" / "gwas_similarity.png"

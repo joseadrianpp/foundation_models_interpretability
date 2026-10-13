@@ -1,12 +1,17 @@
 #!/usr/bin/env python
 """
 Interpretability outputs for the scGPT, Geneformer and scCello models, the
-same three for each model:
+same six for each model:
 
   1. Zero-shot CLS-attention signed score (PD vs Control) -> top-30 genes.
   2. The same attention score with the LoRA fine-tuned model, only on its
      correctly classified cells.
   3. Integrated Gradients on the LoRA fine-tuned model -> top-30 genes.
+  4. and 5. The attention of 2 and the Integrated Gradients of 3 with the
+     zero-shot model + Step 4 MLP head: the pretrained encoder, not fine-tuned,
+     with the head trained on its zero-shot cell embedding.
+  6. The attention of 1 with the model after Step 2.5: the pretrained encoder
+     after continued self-supervised pretraining on the train cells (no head).
 
 Runs on the full dataset (train + val + test combined), on Dataset A or
 Dataset B (--dataset), each with its own results folder.
@@ -51,18 +56,25 @@ TRAIN_H5AD_SCGPT = Path("mixed_split_scgpt") / "Mixed_allgenes_pc_noXY_noMT_mixe
 VAL_H5AD_SCGPT = Path("mixed_split_scgpt") / "Mixed_allgenes_pc_noXY_noMT_mixed_val.h5ad"
 TEST_H5AD_SCGPT = Path("mixed_split_scgpt") / "Mixed_allgenes_pc_noXY_noMT_mixed_test.h5ad"
 LORA_FULL_MODEL_SCGPT = Path("step5_1_lora_scgpt") / "best_full_model.pt"
+# Step 4 MLP head on the zero-shot embedding, and the weights after Step 2.5
+MLP_HEAD_SCGPT = Path("step4_mlp_scgpt") / "best_mlp.pt"
+STEP2_5_WEIGHTS_SCGPT = Path("step2_5_scgpt") / "best_model.pt"
 
 # Same cells and splits for Geneformer, already tokenized (Hugging Face datasets)
 TRAIN_DATASET_GENEFORMER = Path("mixed_split_geneformer") / "Mixed_pc_noXY_noMT_mixed_train.dataset"
 VAL_DATASET_GENEFORMER = Path("mixed_split_geneformer") / "Mixed_pc_noXY_noMT_mixed_val.dataset"
 TEST_DATASET_GENEFORMER = Path("mixed_split_geneformer") / "Mixed_pc_noXY_noMT_mixed_test.dataset"
 LORA_DIR_GENEFORMER = Path("step5_1_lora_geneformer")
+MLP_HEAD_GENEFORMER = Path("step4_mlp_geneformer") / "best_mlp.pt"
+STEP2_5_DIR_GENEFORMER = Path("step2_5_geneformer")
 
 # Same cells and splits for scCello, tokenized like Geneformer's with its own vocabulary
 TRAIN_DATASET_SCCELLO = Path("mixed_split_sccello") / "Mixed_pc_noXY_noMT_mixed_train.dataset"
 VAL_DATASET_SCCELLO = Path("mixed_split_sccello") / "Mixed_pc_noXY_noMT_mixed_val.dataset"
 TEST_DATASET_SCCELLO = Path("mixed_split_sccello") / "Mixed_pc_noXY_noMT_mixed_test.dataset"
 LORA_DIR_SCCELLO = Path("step5_1_lora_sccello")
+MLP_HEAD_SCCELLO = Path("step4_mlp_sccello") / "best_mlp.pt"
+STEP2_5_DIR_SCCELLO = Path("step2_5_sccello")
 
 # Geneformer and scCello are both BERTs over rank value encoded cells, so the
 # same functions run the two; these are the files and settings that change
@@ -70,12 +82,14 @@ GENEFORMER = {
     "datasets": (TRAIN_DATASET_GENEFORMER, VAL_DATASET_GENEFORMER, TEST_DATASET_GENEFORMER),
     "gene_names": C.GENEFORMER_GENE_NAMES, "token_dict": C.GENEFORMER_TOKEN_DICT,
     "model_dir": C.GENEFORMER_MODEL_DIR, "lora_dir": LORA_DIR_GENEFORMER,
+    "mlp_head": MLP_HEAD_GENEFORMER, "step2_5_dir": STEP2_5_DIR_GENEFORMER,
     "head_config": C.GENEFORMER_LORA_HEAD_CONFIG, "emb_layer": EMB_HIDDEN_LAYER,
 }
 SCCELLO = {
     "datasets": (TRAIN_DATASET_SCCELLO, VAL_DATASET_SCCELLO, TEST_DATASET_SCCELLO),
     "gene_names": C.SCCELLO_GENE_NAMES, "token_dict": C.SCCELLO_TOKEN_DICT,
     "model_dir": C.SCCELLO_MODEL_DIR, "lora_dir": LORA_DIR_SCCELLO,
+    "mlp_head": MLP_HEAD_SCCELLO, "step2_5_dir": STEP2_5_DIR_SCCELLO,
     "head_config": C.SCCELLO_LORA_HEAD_CONFIG, "emb_layer": SCCELLO_EMB_HIDDEN_LAYER,
 }
 
@@ -159,14 +173,13 @@ def task_attention_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.d
     del model
     torch.cuda.empty_cache()
 
-def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device) -> None:
-    # See scgpt_model.py for this functions description
-    vocab, model_configs = load_vocab(), load_model_configs()
+# Integrated Gradients of one scGPT classifier (LoRA or zero-shot + MLP head), for every cell type
+def _ig_scgpt(model, method: str, vocab, data_dir: Path, results_dir: Path,
+              device: torch.device) -> None:
     adata = _load_full_dataset_scgpt(data_dir)
     gene_names = load_gene_names(data_dir / C.SCGPT_GENE_NAMES)
-    model = common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
     for ct, slug, sub in _cell_type_subsets_scgpt(adata):
-        print(f"\n=== ig_lora_scgpt | {ct} ===")
+        print(f"\n=== {method} | {ct} ===")
         # Tokenise of the vocav of our data for the current cell type
         pt = common._tokenise(sub, vocab)
         # IG per gene per condition
@@ -174,9 +187,43 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device) 
         if not gate["ok"]:
             print(f"  skipped: {gate['reason']}")
             continue
-        
+
         # Write the csv with the top N genes
-        _write_top_n(mean_abs, results_dir / "ig_lora_scgpt" / slug / "top30_genes.csv")
+        _write_top_n(mean_abs, results_dir / method / slug / "top30_genes.csv")
+
+def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    # See scgpt_model.py for this functions description
+    vocab, model_configs = load_vocab(), load_model_configs()
+    model = common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
+    _ig_scgpt(model, "ig_lora_scgpt", vocab, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+# The zero-shot + MLP model also has one PD logit, so it runs as the LoRA one:
+# attention on its correctly classified cells and Integrated Gradients
+def task_attention_mlp_scgpt(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    vocab, model_configs = load_vocab(), load_model_configs()
+    model = common._load_mlp_model(data_dir / MLP_HEAD_SCGPT, vocab, model_configs, device)
+    _attention_scgpt(model, "attention_mlp_scgpt", 1, True, vocab, model_configs,
+                     data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+def task_ig_mlp_scgpt(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    vocab, model_configs = load_vocab(), load_model_configs()
+    model = common._load_mlp_model(data_dir / MLP_HEAD_SCGPT, vocab, model_configs, device)
+    _ig_scgpt(model, "ig_mlp_scgpt", vocab, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+# The Step 2.5 model has no head, so it runs as the zero-shot one: every cell,
+# grouped by its true label
+def task_attention_step2_5_scgpt(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    vocab, model_configs = load_vocab(), load_model_configs()
+    model = common._load_zero_shot_model(vocab, model_configs, device,
+                                         data_dir / STEP2_5_WEIGHTS_SCGPT)
+    _attention_scgpt(model, "attention_step2_5_scgpt", 2, False, vocab, model_configs,
+                     data_dir, results_dir, device)
     del model
     torch.cuda.empty_cache()
 
@@ -217,13 +264,18 @@ def _load_lora_geneformer(spec: dict, data_dir: Path, device: torch.device):
     return gf._load_lora_model(data_dir / spec["lora_dir"], spec["model_dir"],
                                spec["head_config"], spec["emb_layer"], device)
 
-# Integrated Gradients of one Geneformer or scCello LoRA model, for every cell type
-def _ig_lora_geneformer(spec: dict, method: str, data_dir: Path, results_dir: Path,
-                        device: torch.device) -> None:
+# Geneformer or scCello zero-shot model + Step 4 MLP head of one dataset
+def _load_mlp_geneformer(spec: dict, data_dir: Path, device: torch.device):
+    return gf._load_mlp_model(data_dir / spec["mlp_head"], spec["model_dir"],
+                              spec["head_config"], spec["emb_layer"], device)
+
+# Integrated Gradients of one Geneformer or scCello classifier (LoRA or zero-shot
+# + MLP head), for every cell type
+def _ig_geneformer(model, method: str, spec: dict, data_dir: Path, results_dir: Path,
+                   device: torch.device) -> None:
     token_dict = load_token_dictionary(spec["token_dict"])
     gene_names = load_gene_names(data_dir / spec["gene_names"])
     ds = _load_full_dataset_geneformer(data_dir, spec)
-    model = _load_lora_geneformer(spec, data_dir, device)
     for ct, slug, sub in _cell_type_subsets_geneformer(ds):
         print(f"\n=== {method} | {ct} ===")
         pt = gf._to_inputs(sub)
@@ -235,8 +287,6 @@ def _ig_lora_geneformer(spec: dict, method: str, data_dir: Path, results_dir: Pa
 
         # Same top N file as the scGPT IG
         _write_top_n(mean_abs, results_dir / method / slug / "top30_genes.csv")
-    del model
-    torch.cuda.empty_cache()
 
 def task_attention_geneformer(data_dir: Path, results_dir: Path, device: torch.device) -> None:
     # Like the scGPT attention task: every cell, grouped by its true label
@@ -255,9 +305,34 @@ def task_attention_lora_geneformer(data_dir: Path, results_dir: Path, device: to
     torch.cuda.empty_cache()
 
 def task_ig_lora_geneformer(data_dir: Path, results_dir: Path, device: torch.device) -> None:
-    _ig_lora_geneformer(GENEFORMER, "ig_lora_geneformer", data_dir, results_dir, device)
+    model = _load_lora_geneformer(GENEFORMER, data_dir, device)
+    _ig_geneformer(model, "ig_lora_geneformer", GENEFORMER, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
 
-# The three scCello tasks are the Geneformer ones with scCello's files and settings
+# Like the scGPT ones, the zero-shot + MLP model runs as the LoRA one and the
+# Step 2.5 model as the zero-shot one
+def task_attention_mlp_geneformer(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = _load_mlp_geneformer(GENEFORMER, data_dir, device)
+    _attention_geneformer(model, "attention_mlp_geneformer", True, GENEFORMER,
+                          data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+def task_ig_mlp_geneformer(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = _load_mlp_geneformer(GENEFORMER, data_dir, device)
+    _ig_geneformer(model, "ig_mlp_geneformer", GENEFORMER, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+def task_attention_step2_5_geneformer(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = gf._load_zero_shot_model(data_dir / GENEFORMER["step2_5_dir"], device)
+    _attention_geneformer(model, "attention_step2_5_geneformer", False, GENEFORMER,
+                          data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+# The six scCello tasks are the Geneformer ones with scCello's files and settings
 def task_attention_sccello(data_dir: Path, results_dir: Path, device: torch.device) -> None:
     model = gf._load_zero_shot_model(SCCELLO["model_dir"], device)
     _attention_geneformer(model, "attention_zero_shot_sccello", False, SCCELLO,
@@ -273,9 +348,34 @@ def task_attention_lora_sccello(data_dir: Path, results_dir: Path, device: torch
     torch.cuda.empty_cache()
 
 def task_ig_lora_sccello(data_dir: Path, results_dir: Path, device: torch.device) -> None:
-    _ig_lora_geneformer(SCCELLO, "ig_lora_sccello", data_dir, results_dir, device)
+    model = _load_lora_geneformer(SCCELLO, data_dir, device)
+    _ig_geneformer(model, "ig_lora_sccello", SCCELLO, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
 
-# Tasks of the pipeline
+def task_attention_mlp_sccello(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = _load_mlp_geneformer(SCCELLO, data_dir, device)
+    _attention_geneformer(model, "attention_mlp_sccello", True, SCCELLO,
+                          data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+def task_ig_mlp_sccello(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = _load_mlp_geneformer(SCCELLO, data_dir, device)
+    _ig_geneformer(model, "ig_mlp_sccello", SCCELLO, data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+def task_attention_step2_5_sccello(data_dir: Path, results_dir: Path, device: torch.device) -> None:
+    model = gf._load_zero_shot_model(data_dir / SCCELLO["step2_5_dir"], device)
+    _attention_geneformer(model, "attention_step2_5_sccello", False, SCCELLO,
+                          data_dir, results_dir, device)
+    del model
+    torch.cuda.empty_cache()
+
+# Tasks of the pipeline. The zero-shot + MLP and Step 2.5 ones go after the first
+# nine, so --task all still bins the scGPT cells of those nine with the same
+# random draws (see SEED)
 MODEL_TASKS = {
     "attention_scgpt": task_attention_scgpt,
     "attention_lora_scgpt": task_attention_lora_scgpt,
@@ -286,6 +386,15 @@ MODEL_TASKS = {
     "attention_sccello": task_attention_sccello,
     "attention_lora_sccello": task_attention_lora_sccello,
     "ig_lora_sccello": task_ig_lora_sccello,
+    "attention_mlp_scgpt": task_attention_mlp_scgpt,
+    "ig_mlp_scgpt": task_ig_mlp_scgpt,
+    "attention_step2_5_scgpt": task_attention_step2_5_scgpt,
+    "attention_mlp_geneformer": task_attention_mlp_geneformer,
+    "ig_mlp_geneformer": task_ig_mlp_geneformer,
+    "attention_step2_5_geneformer": task_attention_step2_5_geneformer,
+    "attention_mlp_sccello": task_attention_mlp_sccello,
+    "ig_mlp_sccello": task_ig_mlp_sccello,
+    "attention_step2_5_sccello": task_attention_step2_5_sccello,
 }
 POSTPROCESS_TASKS = {
     "enrichment": task_enrichment,
