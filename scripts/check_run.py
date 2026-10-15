@@ -2,7 +2,8 @@
 """Check a full run (scripts/run_full.sh) before its results are used.
 
   * logs: every task started and ended with exit 0, no tracebacks; skipped
-    cell types and missing inputs are listed;
+    cell types and missing inputs are listed. With several --log-dir (a run
+    split over several jobs, oldest first) a task's last end counts;
   * cells: the attention and OLS tasks saw every cell of each cell type;
   * CSSI: Leiden strata per cell type and whether any stratum was valid
     (with none, the CSSI score falls back to the pooled one);
@@ -92,15 +93,20 @@ def _tasks(dataset: str) -> list:
     return list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS) + ["postprocess"]
 
 
-def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
-    _section(f"logs ({log_dir})")
-    main_log = log_dir / "run_full.log"
-    if not main_log.exists():
-        rep.fail(f"{main_log} missing")
+def check_logs(log_dirs: list, datasets: list, rep: Report) -> None:
+    _section(f"logs ({', '.join(str(d) for d in log_dirs)})")
+    started, ended, ended_in = set(), {}, {}
+    for log_dir in log_dirs:
+        main_log = log_dir / "run_full.log"
+        if not main_log.exists():
+            continue
+        text = main_log.read_text()
+        started |= set(re.findall(r" start (\S+) (\S+)", text))
+        for d, t, code in re.findall(r" end (\S+) (\S+) \(exit (\d+)\)", text):
+            ended[(d, t)], ended_in[(d, t)] = int(code), log_dir
+    if not started:
+        rep.fail("no run_full.log in " + ", ".join(str(d) for d in log_dirs))
         return
-    text = main_log.read_text()
-    started = set(re.findall(r" start (\S+) (\S+)", text))
-    ended = {(d, t): int(code) for d, t, code in re.findall(r" end (\S+) (\S+) \(exit (\d+)\)", text)}
     for d in datasets:
         for t in _tasks(d):
             if (d, t) not in started and t in rt.DERIVED_TASKS:
@@ -111,25 +117,27 @@ def check_logs(log_dir: Path, datasets: list, rep: Report) -> None:
             elif (d, t) not in ended:
                 rep.fail(f"{d} {t}: started but did not end (still running or killed)")
             elif ended[(d, t)] != 0:
-                rep.fail(f"{d} {t}: exit {ended[(d, t)]}, see {log_dir / f'{d}_{t}.log'}")
+                rep.fail(f"{d} {t}: exit {ended[(d, t)]}, see {ended_in[(d, t)] / f'{d}_{t}.log'}")
 
-            task_log = log_dir / f"{d}_{t}.log"
-            if not task_log.exists():
+            # The log of the run whose end counts
+            if (d, t) not in ended_in or not (ended_in[(d, t)] / f"{d}_{t}.log").exists():
                 continue
+            task_log = ended_in[(d, t)] / f"{d}_{t}.log"
             for line in task_log.read_text(errors="replace").splitlines():
                 if LOG_FAIL_PATTERNS.search(line):
                     rep.fail(f"{task_log.name}: {line.strip()}")
                 elif LOG_WARN_PATTERNS.search(line):
                     rep.warn(f"{task_log.name}: {line.strip()}")
-    if "all done" not in text:
-        rep.warn("run_full.log has no 'all done' line")
+    last = log_dirs[-1] / "run_full.log"
+    if not (last.exists() and "all done" in last.read_text(errors="replace")):
+        rep.warn(f"{last} has no 'all done' line")
 
 
 # (model, model form, model task folder with the pooled/CSSI outputs, its OLS folder)
-SCORE_FOLDERS = [("scgpt", "zero-shot", "attention_zero_shot_scgpt", "attention_residualized_ols_scgpt"),
-                 ("scgpt", "lora", "ig_lora_scgpt", "ig_residualized_ols_lora_scgpt"),
-                 ("geneformer", "zero-shot", "attention_zero_shot_geneformer", "attention_residualized_ols_geneformer"),
-                 ("geneformer", "lora", "attention_lora_geneformer", "attention_residualized_ols_lora_geneformer")]
+SCORE_FOLDERS = [row for m in MODELS for row in [
+    (m, "zero-shot", f"attention_zero_shot_{m}", f"attention_residualized_ols_{m}"),
+    (m, "lora", f"attention_lora_{m}", f"attention_residualized_ols_lora_{m}"),
+    (m, "lora", f"ig_lora_{m}", f"ig_residualized_ols_lora_{m}")]]
 
 
 def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report) -> None:
@@ -148,6 +156,9 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
             if meta is None:
                 rep.fail(f"{folder} {ct}: cssi_metadata.json missing")
                 continue
+            if ((results_dir / folder / ct / "ig_checkpoint.npz").exists()
+                    and not (results_dir / folder / ct / "done.json").exists()):
+                rep.fail(f"{folder} {ct}: IG checkpoint left, the task did not finish this cell type")
             if meta["n_cells"] != expected[model].get(ct):
                 rep.fail(f"{folder} {ct}: used {meta['n_cells']} cells, the data has {expected[model].get(ct)}")
             if meta["valid_strata"] == 0:
@@ -280,7 +291,9 @@ def main():
     p.add_argument("--datasets", nargs="+", choices=list(rt.DATASET_DIRS), default=["A", "B"],
                    help="Datasets to check (default: A B; A+B only when it was run).")
     p.add_argument("--results-dir", type=Path, default=ROOT / "results")
-    p.add_argument("--log-dir", type=Path, default=ROOT / "logs")
+    p.add_argument("--log-dir", type=Path, nargs="+", default=[ROOT / "logs"],
+                   help="Log folder(s) of run_full.sh; several (oldest first) when the run was split "
+                        "over several jobs.")
     p.add_argument("--max-cells-per-type", type=int, default=None)
     p.add_argument("--distances", nargs="+", choices=DEFAULT_DISTANCES, default=DEFAULT_DISTANCES)
     p.add_argument("--no-logs", action="store_true", help="Skip the log checks (runs not made by run_full.sh).")

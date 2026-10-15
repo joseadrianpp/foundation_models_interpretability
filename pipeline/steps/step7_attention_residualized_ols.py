@@ -1,5 +1,6 @@
 """
-OLS residualization of zero-shot attention (scGPT or Geneformer) against
+OLS residualization of a pooled gene score (zero-shot or LoRA attention, or
+LoRA Integrated Gradients, of scGPT, Geneformer or scCello) against
 gene-level features.
 
 For each cell type:
@@ -9,8 +10,9 @@ For each cell type:
        - mean expression
        - expression variance
        - dropout rate (fraction of cells without the gene)
-     scGPT: from the h5ad X. Geneformer cells come rank-value encoded (no
-     expression values), so the features use a rank pseudo-expression instead:
+     scGPT: from the h5ad X. Geneformer and scCello cells come rank-value
+     encoded (no expression values), so the features use a rank
+     pseudo-expression instead:
      v = 1 - (p - 1) / (n - 1) for the gene at position p of a cell's n genes
      (1 = the cell's most expressed gene) and v = 0 when the gene is absent.
   3. Fit, across genes, the OLS model
@@ -51,24 +53,27 @@ DYNAMIC_PERMUTATION_ALPHA = 0.05
 DYNAMIC_PERMUTATION_EFFECT_SIZE = dynamic.PERMUTATION_EFFECT_SIZE
 
 
-def scgpt_gene_features(adata: ad.AnnData, vocab) -> Tuple[list, Dict[str, Dict[str, float]]]:
+def scgpt_gene_features(adata: ad.AnnData, vocab,
+                        gene_names: dict) -> Tuple[list, Dict[str, Dict[str, float]]]:
     """Genes and expression features of one cell type, as the scGPT attention task sees it.
 
     Same gene universe as that task: genes present in the scGPT vocabulary
-    and in this cell-type AnnData.
+    and in this cell-type AnnData, named by their current symbol (gene_names:
+    token id -> symbol, as the scores are).
     """
     in_vocab = np.array([g in vocab for g in adata.var.index])
-    genes = [str(g) for g in adata.var.index[in_vocab]]
-    return genes, _gene_features(adata[:, in_vocab].copy())
+    sub = adata[:, in_vocab].copy()
+    sub.var_names = [str(gene_names[vocab[g]]) for g in sub.var_names]
+    return list(sub.var_names), _gene_features(sub)
 
 
 def geneformer_rank_features(input_ids, token_dict: dict,
                              gene_names: dict) -> Tuple[list, Dict[str, Dict[str, float]]]:
-    """Genes and rank pseudo-expression features of one cell type (Geneformer).
+    """Genes and rank pseudo-expression features of one cell type (Geneformer or scCello).
 
     `input_ids` holds each cell's tokens, genes ordered from most to least
     expressed. Every gene seen in the cell type is kept, the same universe as
-    the Geneformer attention task.
+    the model's attention task.
     """
     special_ids = np.array(sorted(v for k, v in token_dict.items() if k.startswith("<")))
     gids, values = [], []
@@ -312,8 +317,8 @@ def residualize_cell_type(
     """OLS-residualize one cell type's pooled score against its gene features.
 
     The score is read from a model task's output, <source>/<slug>/csv/all_genes.csv
-    (source: attention_zero_shot_<model> by default; ig_lora_scgpt or
-    attention_lora_geneformer for the LoRA scores), so this runs on CPU and is
+    (source: attention_zero_shot_<model> by default; attention_lora_<model> or
+    ig_lora_<model> for the LoRA scores), so this runs on CPU and is
     exactly the pooled score that task ranked. `n_cells` must match the cells
     that task used (same --max-cells-per-type). The outputs go to
     <target>/<slug> (attention_residualized_ols_<model> by default).

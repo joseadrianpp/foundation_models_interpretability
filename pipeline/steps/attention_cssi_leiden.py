@@ -11,14 +11,13 @@ Your existing output is gene-level (PD-control attention), not TF-target edges,
 so the scoring step is the gene-level analogue of the paper's per-edge scoring.
 
 One forward pass per cell type fills an `AttentionCache` (model specific:
-`collect_scgpt`, `collect_geneformer`); everything after it (pooled means, Leiden strata, CSSI,
+`collect_scgpt`, `collect_geneformer` for Geneformer and scCello); everything after it (pooled means, Leiden strata, CSSI,
 donor-level matrices in attention_dynamic_selection.py) only reads the cache,
 so it is the same code for every model.
 
 Every mean is over all the cells of the group (condition, stratum or donor),
-a cell without the gene adding 0, the same convention as
-_step7_common._compute_attn_per_gene_per_condition: a gene seen in a handful
-of cells cannot outrank one seen in all of them.
+a cell without the gene adding 0: a gene seen in a handful of cells cannot
+outrank one seen in all of them.
 """
 
 from concurrent.futures import ProcessPoolExecutor
@@ -221,10 +220,16 @@ def _forward_cls_attention_with_embedding(
 SCGPT_ATTN_BATCH_SIZE = 16
 
 
-def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
-                  device: torch.device, n_cls: int = 2,
+def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, gene_names: dict, n_head: int,
+                  device: torch.device, n_cls: int = 2, use_predictions: bool = False,
                   batch_size: int = SCGPT_ATTN_BATCH_SIZE, desc: str = "attention") -> AttentionCache:
-    """One scGPT forward pass over the tokenised cells of one cell type."""
+    """One scGPT forward pass over the tokenised cells of one cell type.
+
+    Genes are named by `gene_names` (token id -> current symbol, GBA1 rather
+    than the vocabulary's GBA). With `use_predictions` (LoRA classifier,
+    n_cls=1) the cache also records which cells the classifier gets right
+    (`cache.correct`).
+    """
     special_ids = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}))
     builder = _CacheBuilder()
     n_cells = pt["gene_ids"].shape[0]
@@ -232,7 +237,7 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
         for start in range(0, n_cells, batch_size):
             end = min(start + batch_size, n_cells)
             batch = {k: v[start:end] for k, v in pt.items()}
-            cls_attn, _, embeddings = _forward_cls_attention_with_embedding(
+            cls_attn, preds, embeddings = _forward_cls_attention_with_embedding(
                 model, batch, vocab, n_head, device, n_cls
             )
             gids = batch["gene_ids"].numpy()
@@ -240,27 +245,33 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, n_head: int,
             keep = ~np.isin(gids, special_ids)
             keep[:, 0] = False
             builder.add(gids, cls_attn.cpu().numpy(), keep,
-                        batch["condition_labels"].numpy(), embeddings.cpu().numpy())
+                        batch["condition_labels"].numpy(), embeddings.cpu().numpy(),
+                        preds.cpu().numpy() if use_predictions else None)
             bar.update(end - start)
     return builder.build(
-        lambda ids: vocab.lookup_tokens([int(i) for i in ids]),
-        f"scGPT residual-stream CLS embedding entering transformer layer {common.NUM_ATTN_LAYERS}",
+        lambda ids: [gene_names[int(i)] for i in ids],
+        f"scGPT{' LoRA' if use_predictions else ''} residual-stream CLS embedding entering "
+        f"transformer layer {common.NUM_ATTN_LAYERS}",
     )
 
 
-def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
-                       device: torch.device, batch_size: int = gf.ATTN_BATCH_SIZE,
+def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict, device: torch.device,
+                       emb_layer: int, model_label: str = "Geneformer",
+                       batch_size: int = gf.ATTN_BATCH_SIZE,
                        use_predictions: bool = False, desc: str = "attention") -> AttentionCache:
-    """One Geneformer forward pass over the tokenised cells of one cell type.
+    """One Geneformer (or scCello) forward pass over the tokenised cells of one cell type.
 
+    The attention and the CSSI embedding are those of the block whose output
+    is the cell embedding (`emb_layer`, see _step7_geneformer.attn_layer_index).
     Cells are batched by length so each batch carries little padding (cells
     have 165-4096 tokens); the cache comes back in the original cell order.
     With `use_predictions` (LoRA classifier) the cache also records which
     cells the classifier gets right (`cache.correct`).
     """
-    # <pad>, <mask>, <cls> and <eos> are not genes
+    # <pad>, <mask>, <cls> and <eos> (Geneformer only) are not genes
     special_ids = np.array(sorted(v for k, v in token_dict.items() if k.startswith("<")))
     pad_id = token_dict["<pad>"]
+    layer_idx = gf.attn_layer_index(model, emb_layer)
     labels = pt["condition_labels"].numpy()
     order = np.argsort([len(s) for s in pt["input_ids"]], kind="stable")
     builder = _CacheBuilder()
@@ -269,7 +280,8 @@ def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
         for start in range(0, len(order), batch_size):
             idx = order[start:start + batch_size]
             ids, attn = gf._pad_batch([pt["input_ids"][i] for i in idx], pad_id, device)
-            cls_attn, preds, embeddings = gf._forward_cls_attention_with_embedding(model, ids, attn, use_predictions)
+            cls_attn, preds, embeddings = gf._forward_cls_attention_with_embedding(
+                model, ids, attn, layer_idx, use_predictions)
             gids = ids.cpu().numpy()
             keep = ~np.isin(gids, special_ids)
             keep[:, 0] = False
@@ -278,7 +290,7 @@ def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict,
             bar.update(len(idx))
     return builder.build(
         lambda ids: [gene_names[int(i)] for i in ids],
-        f"Geneformer residual-stream CLS embedding entering encoder layer {gf.NUM_ATTN_LAYER}",
+        f"{model_label} residual-stream CLS embedding entering encoder layer {layer_idx}",
         order=order,
     )
 

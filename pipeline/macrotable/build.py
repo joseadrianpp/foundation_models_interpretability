@@ -5,7 +5,7 @@
 
 Parts go to <results>/macrotable/parts/<module>.csv and the joined table to
 <results>/macrotable/macrotable.csv: KEY columns first, then each module's
-columns in MODULES order. Modules not run this time are taken from their
+columns in MODULES order, and the long gene list (`genes`) last. Modules not run this time are taken from their
 saved part, restricted to the current experiments.
 """
 
@@ -30,7 +30,13 @@ MODULES = {
 
 
 def _read_part(path: Path) -> pd.DataFrame:
-    part = pd.read_csv(path, dtype={c: str for c in KEY}).set_index(KEY)
+    part = pd.read_csv(path, dtype={c: str for c in KEY})
+    if not set(KEY) <= set(part.columns):
+        # Saved before a key column existed (Score): its rows cannot be matched
+        print(f"[macrotable] WARNING: {path.name} lacks key columns {sorted(set(KEY) - set(part.columns))}, "
+              "ignored; recompute it", flush=True)
+        return pd.DataFrame(index=pd.MultiIndex.from_tuples([], names=KEY))
+    part = part.set_index(KEY)
     # Counts (nGenes*, *TermCount, nFeaturesRF) stay integers next to NaN
     counts = [c for c in part.columns if re.match(r"n[A-Z]", c) or c.endswith("TermCount") or c.startswith("CSSI")]
     return part.astype({c: "Int64" for c in counts})
@@ -59,6 +65,8 @@ def build(settings: Settings, modules=None, datasets=None, model_forms=("zero-sh
             print(f"[macrotable] WARNING: the saved {name} part lacks {uncovered} experiments (empty in the "
                   f"table); recompute it with --modules {name}", flush=True)
         table = table.join(part.reindex(experiments.index))
+    # The gene list is long; last, so it does not push the other columns away
+    table = table[[c for c in table.columns if c != "genes"] + [c for c in table.columns if c == "genes"]]
     out = parts_dir.parent / "macrotable.csv"
     table.reset_index().to_csv(out, index=False)
     print(f"[macrotable] {table.shape[0]} rows x {table.shape[1] + len(KEY)} columns -> {out}", flush=True)

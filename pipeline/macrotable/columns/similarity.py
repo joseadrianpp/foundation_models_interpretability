@@ -5,6 +5,9 @@ gene list and reference R, in sub-ontology O (BP, CC, MF), with the first of
 settings.distances (SimRel by default).
 Sim<R>: the mean of Sim<R>_BP, Sim<R>_CC and Sim<R>_MF (over the ones
 available), the single value per reference of the table specification.
+SimPD: SimPDGWAS + SimPDGE + SimPDGO - SimAD - SimKidney - SimCAD, the
+similarity to the three PD references net of the three control diseases
+(NaN if any of the six is missing).
 Further distances add a suffix (Sim<R>_<distance>, Sim<R>_<O>_<distance>).
 A reference the gwas_similarity task did not compute yet gives NaN columns,
 so the table keeps the same columns.
@@ -53,4 +56,10 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     means = {f"Sim{label}{_suffix(settings.distances, dist)}":
              per_ontology[[f"Sim{label}_{ont}{_suffix(settings.distances, dist)}" for ont in ONTOLOGIES]].mean(axis=1)
              for dist in settings.distances for label in REFERENCES}
-    return pd.concat([pd.DataFrame(means), per_ontology], axis=1)
+    # PD references minus the control diseases, first among the similarity columns
+    net = {}
+    for dist in settings.distances:
+        sim = lambda label: means[f"Sim{label}{_suffix(settings.distances, dist)}"]
+        net[f"SimPD{_suffix(settings.distances, dist)}"] = (sim("PDGWAS") + sim("PDGE") + sim("PDGO")
+                                                            - sim("AD") - sim("Kidney") - sim("CAD"))
+    return pd.concat([pd.DataFrame(net), pd.DataFrame(means), per_ontology], axis=1)
