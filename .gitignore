@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.tar.gz
 CLAUDE.md
+CLAUDE.md.bak
+*.pdf
 venv
 .claude
 logs/
