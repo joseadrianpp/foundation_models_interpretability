@@ -65,9 +65,11 @@ def build_base_model(vocab: GeneVocab, model_configs: dict, n_cls: int = 1) -> T
         pre_norm=model_configs.get("pre_norm", False),
     )
 
-def load_pretrained_weights(model: TransformerModel, device: torch.device) -> None:
+# The weights are scGPT_brain's by default, or those of the same model after Step 2.5
+def load_pretrained_weights(model: TransformerModel, device: torch.device,
+                            weights_path=C.SCGPT_WEIGHTS) -> None:
     # Load the .pt file
-    pretrained = torch.load(C.SCGPT_WEIGHTS, map_location=device)
+    pretrained = torch.load(weights_path, map_location=device)
     # Load of pytorch modules
     model_dict = model.state_dict()
     # Only load weights that match in name and shape (same dimensions) to the scGPT 

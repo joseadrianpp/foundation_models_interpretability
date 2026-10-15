@@ -62,7 +62,8 @@ def _pad_batch(seqs: List[np.ndarray], pad_id: int,
     return ids.to(device), attn.to(device)
 
 
-# Geneformer or scCello zero-shot model load, only the encoder since attention needs no head
+# Geneformer or scCello zero-shot model load, only the encoder since attention needs no head.
+# The Step 2.5 model is the same encoder with other weights, loaded from its own folder
 def _load_zero_shot_model(model_dir, device: torch.device) -> nn.Module:
     model = BertModel.from_pretrained(str(model_dir), add_pooling_layer=False)
     model.to(device); model.eval()
@@ -79,6 +80,19 @@ def _load_lora_model(lora_dir, model_dir, head_config: dict, emb_layer: int,
     backbone = PeftModel.from_pretrained(backbone, str(lora_dir / "best_lora"))
     head = FlexMLP(**head_config)
     head.load_state_dict(torch.load(lora_dir / "best_head.pt", map_location=device))
+    model = GeneformerClassifier(backbone, head, emb_layer)
+    model.to(device); model.eval()
+    return model
+
+
+# Zero-shot model + Step 4 MLP head: the same classifier as the LoRA one without
+# the adapters, i.e. the pretrained encoder with the head pipeline_unified Step 4
+# trained on its zero-shot cell embedding (the LoRA's starting point)
+def _load_mlp_model(head_path, model_dir, head_config: dict, emb_layer: int,
+                    device: torch.device) -> nn.Module:
+    backbone = BertForSequenceClassification.from_pretrained(str(model_dir), num_labels=2)
+    head = FlexMLP(**head_config)
+    head.load_state_dict(torch.load(head_path, map_location=device)["state_dict"])
     model = GeneformerClassifier(backbone, head, emb_layer)
     model.to(device); model.eval()
     return model

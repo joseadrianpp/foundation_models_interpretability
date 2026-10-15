@@ -30,6 +30,7 @@ SCGPT_GENE_NAMES = Path("mixed_split_scgpt") / "gene_names.csv"
 # Head of the LoRA checkpoint: the Step 4 MLP it was warm-started from
 # (pipeline_unified Step 4 best_params.json, same shape in Dataset A and B).
 # The checkpoint stores only weights, so the head is rebuilt with this shape.
+# The zero-shot + MLP model uses that same Step 4 head, so the same shape.
 SCGPT_LORA_HEAD_CONFIG = {
     "input_dim": 512, "n_layers": 2, "hidden_size": 64, "dropout": 0.3,
     "activation": "gelu", "mlp_type": "constant", "n_classes": 1,
@@ -49,7 +50,7 @@ GENEFORMER_TOKEN_DICT = GENEFORMER_MODEL_DIR / "token_dictionary_gc104M.pkl"
 GENEFORMER_GENE_NAMES = Path("mixed_split_geneformer") / "gene_names.csv"
 
 # Head of the Geneformer LoRA checkpoint, again the Step 4 MLP it was
-# warm-started from (same shape in Dataset A and B)
+# warm-started from (same shape in Dataset A and B, and for the zero-shot + MLP model)
 GENEFORMER_LORA_HEAD_CONFIG = {
     "input_dim": 768, "n_layers": 2, "hidden_size": 64, "dropout": 0.3,
     "activation": "gelu", "mlp_type": "constant", "n_classes": 1,
@@ -69,6 +70,7 @@ SCCELLO_TOKEN_DICT = SCCELLO_MODEL_DIR / "token_dictionary.pkl"
 SCCELLO_GENE_NAMES = Path("mixed_split_sccello") / "gene_names.csv"
 
 # Head of the scCello LoRA checkpoint, the Step 4 MLP on its 256-dim embedding
+# (also the head of the zero-shot + MLP model)
 SCCELLO_LORA_HEAD_CONFIG = {
     "input_dim": 256, "n_layers": 2, "hidden_size": 64, "dropout": 0.3,
     "activation": "gelu", "mlp_type": "constant", "n_classes": 1,

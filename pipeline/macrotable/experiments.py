@@ -25,7 +25,7 @@ RANKING_LABELS = {"attention": "attention", "cssi": "CSSI", "ols": "residuals",
 SCORE_LABELS = {"attention": "attention", "ig": "IG"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
-MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "lora": "LoRA"}
+MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "step2_5": "Step2.5", "mlp": "zero-shot+MLP", "lora": "LoRA"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
 

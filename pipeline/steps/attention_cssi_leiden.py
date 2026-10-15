@@ -222,13 +222,17 @@ SCGPT_ATTN_BATCH_SIZE = 16
 
 def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, gene_names: dict, n_head: int,
                   device: torch.device, n_cls: int = 2, use_predictions: bool = False,
-                  batch_size: int = SCGPT_ATTN_BATCH_SIZE, desc: str = "attention") -> AttentionCache:
+                  batch_size: int = SCGPT_ATTN_BATCH_SIZE, desc: str = "attention",
+                  label: Optional[str] = None) -> AttentionCache:
     """One scGPT forward pass over the tokenised cells of one cell type.
 
     Genes are named by `gene_names` (token id -> current symbol, GBA1 rather
-    than the vocabulary's GBA). With `use_predictions` (LoRA classifier,
-    n_cls=1) the cache also records which cells the classifier gets right
-    (`cache.correct`).
+    than the vocabulary's GBA). With `use_predictions` (a classifier, LoRA or
+    zero-shot + MLP, n_cls=1) the cache also records which cells the
+    classifier gets right (`cache.correct`). `label` names the model in the
+    embedding source ("scGPT LoRA" with `use_predictions`, "scGPT" otherwise);
+    models with the same embeddings (zero-shot and zero-shot + MLP) share it,
+    so they also share their saved Leiden strata.
     """
     special_ids = np.array(sorted({vocab[t] for t in C.SPECIAL_TOKENS if t in vocab}))
     builder = _CacheBuilder()
@@ -250,7 +254,7 @@ def collect_scgpt(model, pt: Dict[str, torch.Tensor], vocab, gene_names: dict, n
             bar.update(end - start)
     return builder.build(
         lambda ids: [gene_names[int(i)] for i in ids],
-        f"scGPT{' LoRA' if use_predictions else ''} residual-stream CLS embedding entering "
+        f"{label or ('scGPT LoRA' if use_predictions else 'scGPT')} residual-stream CLS embedding entering "
         f"transformer layer {common.NUM_ATTN_LAYERS}",
     )
 

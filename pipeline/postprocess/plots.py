@@ -26,8 +26,8 @@ from .gene_sets import (ALL_SCORE_PATHS, CELL_TYPES, METHOD_META, METHODS, MODEL
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
 
 
-# Ranking (pooled / CSSI / OLS) and score (zero-shot attention, LoRA attention,
-# LoRA IG) of a method
+# Ranking (pooled / CSSI / OLS) and family (form and score: zero-shot attention,
+# Step 2.5 attention, zero-shot + MLP attention or IG, LoRA attention or IG) of a method
 def _ranking(method: str) -> str:
     ranking = METHOD_META[method]["ranking"]
     return ranking if ranking in ("cssi", "ols") else "pooled"
@@ -35,19 +35,21 @@ def _ranking(method: str) -> str:
 
 def _family(method: str) -> str:
     meta = METHOD_META[method]
-    if meta["model_form"] != "lora":
+    if meta["model_form"] == "zero-shot":
         return "zero_shot"
-    return "lora_ig" if meta["score"] == "ig" else "lora_attention"
+    return f"{meta['model_form']}_{meta['score']}"
 
 
-# Nine methods per model are more than the categorical palette holds, so the
+# Eighteen methods per model are more than the categorical palette holds, so the
 # encoding is composite: the first three slots of the fixed categorical order
 # (blue, orange, aqua; CVD safe for every pair, validated on the plot surface)
-# for the ranking, and a texture for the score
+# for the ranking, and a texture for the form and score
 RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a"}
-FAMILY_HATCH = {"zero_shot": None, "lora_attention": "////", "lora_ig": "xxxx"}
+FAMILY_HATCH = {"zero_shot": None, "step2_5_attention": "....", "mlp_attention": "\\\\\\\\",
+                "mlp_ig": "++++", "lora_attention": "////", "lora_ig": "xxxx"}
 RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS"}
-FAMILY_SHORT = {"zero_shot": "", "lora_attention": "LoRA attn.", "lora_ig": "LoRA IG"}
+FAMILY_SHORT = {"zero_shot": "", "step2_5_attention": "Step 2.5 attn.", "mlp_attention": "MLP attn.",
+                "mlp_ig": "MLP IG", "lora_attention": "LoRA attn.", "lora_ig": "LoRA IG"}
 METHOD_COLORS = {m: RANKING_COLORS[_ranking(m)] for m in METHODS}
 METHOD_HATCH = {m: FAMILY_HATCH[_family(m)] for m in METHODS}
 # Labels inside a figure: the model is already in the title

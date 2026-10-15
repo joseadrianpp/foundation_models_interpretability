@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 """
-Interpretability outputs for the scGPT, Geneformer and scCello models, the
-same three scores for each model:
+Interpretability outputs for the scGPT, Geneformer and scCello models, in
+four forms of each model (FORMS): the zero-shot encoder, the encoder after
+Step 2.5 (self-supervised, no labels), the zero-shot encoder + Step 4 MLP head
+and the LoRA fine-tuned classifier.
 
-  1. Zero-shot CLS-attention signed score (PD vs Control), plus the CSSI-max
-     score over Leiden strata and the dynamic selections (top30 / z-score /
-     elbow) of both.
-  2. The same attention outputs with the LoRA fine-tuned model, only on its
-     correctly classified cells.
-  3. Integrated Gradients on the LoRA fine-tuned model (pooled mean |IG|,
-     CSSI-max and the same selections), on the same cells.
-  4. OLS residualization of each of those pooled scores -> all genes +
+  1. CLS-attention signed score (PD vs Control) of every form, plus the
+     CSSI-max score over Leiden strata and the dynamic selections (top30 /
+     z-score / elbow) of both. The two encoders without a head use every
+     cell; the two classifiers only the cells they classify correctly.
+  2. Integrated Gradients of the two classifiers (pooled mean |IG|, CSSI-max
+     and the same selections), on the same cells.
+  3. OLS residualization of each of those pooled scores -> all genes +
      selections.
 
 Geneformer and scCello are both BERTs over rank value encoded cells, so the
@@ -19,8 +20,8 @@ same functions run the two (GENEFORMER / SCCELLO hold what changes).
 Runs on the full dataset (train + val + test combined), on Dataset A or
 Dataset B (--dataset), each with its own results folder.
 
-GPU-bound model tasks (1-3) can use --gpus to run independent cell-type
-workers on multiple GPUs. The OLS tasks (4) run on CPU from the model
+GPU-bound model tasks (1-2) can use --gpus to run independent cell-type
+workers on multiple GPUs. The OLS tasks (3) run on CPU from the model
 tasks' output, so they need those to have run first with the same
 --max-cells-per-type. With --skip-done, a model task keeps the cell types a
 previous run of it already finished (done.json), and IG resumes from its
@@ -78,6 +79,25 @@ DATASET_DIRS = {"A": DATA_DIR / "dataset_a", "B": DATA_DIR / "dataset_b",
 SCGPT_H5ADS = [Path("mixed_split_scgpt") / f"Mixed_allgenes_pc_noXY_noMT_mixed_{split}.h5ad"
                for split in ("train", "val", "test")]
 LORA_FULL_MODEL_SCGPT = Path("step5_1_lora_scgpt") / "best_full_model.pt"
+# Step 4 MLP head on the zero-shot embedding, and the weights after Step 2.5
+MLP_HEAD_SCGPT = Path("step4_mlp_scgpt") / "best_mlp.pt"
+STEP2_5_WEIGHTS_SCGPT = Path("step2_5_scgpt") / "best_model.pt"
+
+# The four forms of every model: two encoders without a head, the zero-shot one
+# and the one after Step 2.5 (further self-supervised pretraining on the train
+# cells, no labels), whose scores group every cell by its true label; and two
+# PD classifiers, the zero-shot encoder + Step 4 MLP head and the LoRA one,
+# scored on the cells they classify correctly. Output folders are
+# <score>_<form>_<model>
+FORMS = ["zero_shot", "step2_5", "mlp", "lora"]
+CLASSIFIER_FORMS = ("mlp", "lora")
+FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "zero-shot + MLP", "lora": "LoRA"}
+# Forms with the same cell embeddings (the MLP head sits on the frozen zero-shot
+# encoder), which therefore share their Leiden strata
+SAME_EMBEDDING = {"zero_shot": ("zero_shot", "mlp"), "mlp": ("zero_shot", "mlp"),
+                  "step2_5": ("step2_5",), "lora": ("lora",)}
+# scGPT model in the embedding source of each form (equal for equal embeddings)
+SCGPT_LABELS = {"zero_shot": "scGPT", "mlp": "scGPT", "step2_5": "scGPT Step 2.5", "lora": "scGPT LoRA"}
 
 # Same cells and splits for Geneformer and scCello, already tokenized (Hugging Face datasets)
 GENEFORMER_DATASETS = [Path("mixed_split_geneformer") / f"Mixed_pc_noXY_noMT_mixed_{split}.dataset"
@@ -94,6 +114,7 @@ GENEFORMER = {
     "name": "geneformer", "label": "Geneformer", "datasets": GENEFORMER_DATASETS,
     "gene_names": C.GENEFORMER_GENE_NAMES, "token_dict": C.GENEFORMER_TOKEN_DICT,
     "model_dir": C.GENEFORMER_MODEL_DIR, "lora_dir": Path("step5_1_lora_geneformer"),
+    "mlp_head": Path("step4_mlp_geneformer") / "best_mlp.pt", "step2_5_dir": Path("step2_5_geneformer"),
     "head_config": C.GENEFORMER_LORA_HEAD_CONFIG, "emb_layer": EMB_HIDDEN_LAYER,
     "attn_batch_size": gf.ATTN_BATCH_SIZE, "ig_tokens_per_batch": ig_gf.IG_TOKENS_PER_BATCH,
 }
@@ -101,6 +122,7 @@ SCCELLO = {
     "name": "sccello", "label": "scCello", "datasets": SCCELLO_DATASETS,
     "gene_names": C.SCCELLO_GENE_NAMES, "token_dict": C.SCCELLO_TOKEN_DICT,
     "model_dir": C.SCCELLO_MODEL_DIR, "lora_dir": Path("step5_1_lora_sccello"),
+    "mlp_head": Path("step4_mlp_sccello") / "best_mlp.pt", "step2_5_dir": Path("step2_5_sccello"),
     "head_config": C.SCCELLO_LORA_HEAD_CONFIG, "emb_layer": SCCELLO_EMB_HIDDEN_LAYER,
     "attn_batch_size": 4 * gf.ATTN_BATCH_SIZE, "ig_tokens_per_batch": 4 * ig_gf.IG_TOKENS_PER_BATCH,
 }
@@ -120,6 +142,16 @@ DYNAMIC_PERMUTATION_EFFECT_SIZE = 0.5
 
 def _signed_score(mean_pd: float, mean_ctrl: float) -> float:
     return mean_pd - mean_ctrl
+
+
+def _task_name(score: str, form: str, name: str) -> str:
+    """Task of a score and form of a model; the zero-shot attention task is attention_<model>."""
+    return f"attention_{name}" if (score, form) == ("attention", "zero_shot") else f"{score}_{form}_{name}"
+
+
+def _strata_dirs(results_dir: Path, name: str, form: str, slug: str) -> list:
+    """Output folders of the forms with the same embeddings, where saved Leiden strata are looked for."""
+    return [results_dir / f"{score}_{f}_{name}" / slug for f in SAME_EMBEDDING[form] for score in ("attention", "ig")]
 
 
 def _write_top_n(score_map: dict, out_csv: Path, n: int = TOP_N) -> None:
@@ -429,30 +461,35 @@ def _write_score_outputs(pooled_scores: dict, cssi_scores: dict, strata: np.ndar
               flush=True)
 
 
-def _scgpt_inputs(data_dir: Path, lora: bool) -> list:
-    """Files a scGPT task reads (for its done.json)."""
+def _scgpt_inputs(data_dir: Path, form: str) -> list:
+    """Files a scGPT task of one form reads (for its done.json)."""
     data_dir = _single_dir(data_dir, "scGPT")
-    model = [data_dir / LORA_FULL_MODEL_SCGPT] if lora else [C.SCGPT_WEIGHTS]
+    model = {"zero_shot": [C.SCGPT_WEIGHTS], "step2_5": [data_dir / STEP2_5_WEIGHTS_SCGPT],
+             "mlp": [C.SCGPT_WEIGHTS, data_dir / MLP_HEAD_SCGPT],
+             "lora": [data_dir / LORA_FULL_MODEL_SCGPT]}[form]
     return [data_dir / p for p in SCGPT_H5ADS] + model
 
 
-def _rank_inputs(spec: dict, data_dir, lora: bool) -> list:
-    """Files a Geneformer or scCello task reads (for its done.json)."""
-    inputs = [d / p for d in _dirs(data_dir) for p in spec["datasets"]] + [spec["model_dir"]]
-    if lora:
-        inputs.append(_single_dir(data_dir, f"The LoRA {spec['label']} model") / spec["lora_dir"])
-    return inputs
+def _rank_inputs(spec: dict, data_dir, form: str) -> list:
+    """Files a Geneformer or scCello task of one form reads (for its done.json)."""
+    inputs = [d / p for d in _dirs(data_dir) for p in spec["datasets"]]
+    if form == "zero_shot":
+        return inputs + [spec["model_dir"]]
+    form_dir = _single_dir(data_dir, f"The {FORM_LABELS[form]} {spec['label']} model")
+    if form == "step2_5":
+        return inputs + [form_dir / spec["step2_5_dir"]]
+    return inputs + [spec["model_dir"], form_dir / spec["mlp_head" if form == "mlp" else "lora_dir"]]
 
 
-def _write_ig_outputs(result: ig.IGResult, names: dict, out_dir: Path, sibling_dir: Path, source: str,
+def _write_ig_outputs(result: ig.IGResult, names: dict, out_dir: Path, strata_dirs, source: str,
                       desc: str) -> None:
     """Pooled and CSSI IG scores, selections, Leiden artifacts and per-cell |IG| of one cell type.
 
-    CSSI: Leiden strata of the LoRA model's own cell embedding (the ones the
-    LoRA attention task of the model saved in `sibling_dir` if it ran first),
-    each gene scored by its largest mean |IG| over the valid strata.
+    CSSI: Leiden strata of the classifier's own cell embedding (the ones its
+    attention task saved in `strata_dirs` if it ran first), each gene scored
+    by its largest mean |IG| over the valid strata.
     """
-    saved = _saved_strata([out_dir, sibling_dir], result.embeddings, source)
+    saved = _saved_strata([out_dir, *strata_dirs], result.embeddings, source)
     strata, meta = saved if saved is not None else cssi._leiden_from_embeddings(
         result.embeddings, n_neighbors=CSSI_N_NEIGHBORS, target_k=CSSI_TARGET_K, random_state=SEED,
         embedding_source=source, desc=f"{desc} Leiden")
@@ -476,104 +513,106 @@ def _correct_counts_ok(cache: cssi.AttentionCache) -> bool:
 # ---------------------------------------------------------------------------
 # scGPT
 # ---------------------------------------------------------------------------
-def task_attention_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
+def _load_scgpt(form: str, data_dir, vocab, model_configs: dict, device: torch.device):
+    """scGPT model of one form; the Step 2.5, MLP and LoRA ones are per dataset."""
+    if form == "zero_shot":
+        return common._load_zero_shot_model(vocab, model_configs, device)
+    data_dir = _single_dir(data_dir, f"The {FORM_LABELS[form]} scGPT model")
+    if form == "step2_5":
+        return common._load_zero_shot_model(vocab, model_configs, device, data_dir / STEP2_5_WEIGHTS_SCGPT)
+    if form == "mlp":
+        return common._load_mlp_model(data_dir / MLP_HEAD_SCGPT, vocab, model_configs, device)
+    return common._load_lora_model(data_dir / LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
+
+
+# A scGPT classifier's attention pass over one cell type: attention, predictions
+# and embeddings, shared by its attention and IG tasks
+def _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale, desc):
+    return cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=1,
+                              use_predictions=True, batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc,
+                              label=SCGPT_LABELS[form])
+
+
+def task_attention_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.device,
                          cell_types=None, opts=None) -> None:
+    """Attention task of one scGPT form: pooled + CSSI scores and selections.
+
+    Encoders without a head (zero-shot, Step 2.5): every cell, grouped by its
+    true label, with the donor-level permutation selector if asked. The
+    classifiers (zero-shot + MLP, LoRA): the same scores only on the cells
+    they classify correctly, with the per-cell scores saved.
+    """
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
+    task = _task_name("attention", form, "scgpt")
+    classifier = form in CLASSIFIER_FORMS
     vocab, model_configs = load_vocab(), load_model_configs()
     gene_names = _load_scgpt_gene_names(data_dir)
     adata = _load_full_dataset_scgpt(data_dir)
-    model = common._load_zero_shot_model(vocab, model_configs, device)
+    model = _load_scgpt(form, data_dir, vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
-        print(f"\n# attention_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} #", flush=True)
-        out_dir = results_dir / "attention_zero_shot_scgpt" / slug
-        info = _done_info("attention_scgpt", sub.n_obs, _scgpt_inputs(data_dir, False),
-                          max_seq_len=C.MAX_SEQ_LEN, permutation=opts["permutation"])
+        print(f"\n# {task} | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} #", flush=True)
+        out_dir = results_dir / f"attention_{form}_scgpt" / slug
+        params = {"max_seq_len": C.MAX_SEQ_LEN} if classifier else \
+            {"max_seq_len": C.MAX_SEQ_LEN, "permutation": opts["permutation"]}
+        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form), **params)
         if _is_done(out_dir, info, opts):
             continue
         pt = common._tokenise(sub, vocab)
+        desc = f"{task} {slug} [{device}]"
+        strata_dirs = _strata_dirs(results_dir, "scgpt", form, slug)
 
-        donor_ids = None
-        if opts["permutation"]:
-            donor_column = dynamic.resolve_donor_column(sub, opts["donor_col"])
-            donor_ids = sub.obs[donor_column].astype(str).to_numpy()
-            print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
-
-        # One forward pass; pooled, CSSI and donor-level scores all read this cache
-        cache = cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=2,
-                                   batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale,
-                                   desc=f"attention_scgpt {slug} [{device}]")
-        if _write_attention_outputs(cache, out_dir, donor_ids):
+        if classifier:
+            cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale, desc)
+            if not _correct_counts_ok(cache):
+                continue
+            # Pooled, CSSI (strata of the classifier's own embedding) and selections
+            done = _write_attention_outputs(cache, out_dir, cell_mask=cache.correct, save_cells=True,
+                                            strata_dirs=strata_dirs)
+        else:
+            donor_ids = None
+            if opts["permutation"]:
+                donor_column = dynamic.resolve_donor_column(sub, opts["donor_col"])
+                donor_ids = sub.obs[donor_column].astype(str).to_numpy()
+                print(f"  donor column: {donor_column} | {np.unique(donor_ids).size} donors", flush=True)
+            # One forward pass; pooled, CSSI and donor-level scores all read this cache
+            cache = cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=2,
+                                       batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc,
+                                       label=SCGPT_LABELS[form])
+            done = _write_attention_outputs(cache, out_dir, donor_ids, strata_dirs=strata_dirs)
+        if done:
             _mark_done(out_dir, info)
 
     del model
     torch.cuda.empty_cache()
 
 
-# The LoRA scGPT classifier's attention pass over one cell type: attention,
-# predictions and embeddings, shared by its attention and IG tasks
-def _lora_scgpt_cache(model, pt, vocab, gene_names, model_configs, device, scale, desc):
-    return cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=1,
-                              use_predictions=True, batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc)
-
-
-def task_attention_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                              cell_types=None, opts=None) -> None:
-    # Attention scores of the LoRA classifier (pooled, CSSI, selections) only
-    # on the cells it classifies correctly
+def task_ig_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.device,
+                  cell_types=None, opts=None) -> None:
+    """Integrated Gradients of the PD logit of a scGPT classifier (zero-shot + MLP or LoRA)."""
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
-    vocab, model_configs = load_vocab(), load_model_configs()
-    gene_names = _load_scgpt_gene_names(data_dir)
-    adata = _load_full_dataset_scgpt(data_dir)
-    model = common._load_lora_model(_single_dir(data_dir, "The LoRA scGPT model") / LORA_FULL_MODEL_SCGPT,
-                                    vocab, model_configs, device)
-
-    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
-        print(f"\n# attention_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} #", flush=True)
-        out_dir = results_dir / "attention_lora_scgpt" / slug
-        info = _done_info("attention_lora_scgpt", sub.n_obs, _scgpt_inputs(data_dir, True),
-                          max_seq_len=C.MAX_SEQ_LEN)
-        if _is_done(out_dir, info, opts):
-            continue
-        cache = _lora_scgpt_cache(model, common._tokenise(sub, vocab), vocab, gene_names, model_configs,
-                                  device, scale, f"attention_lora_scgpt {slug} [{device}]")
-        if not _correct_counts_ok(cache):
-            continue
-        # Pooled, CSSI (strata of the LoRA model's own embedding) and selections
-        if _write_attention_outputs(cache, out_dir, cell_mask=cache.correct, save_cells=True,
-                                    strata_dirs=[results_dir / "ig_lora_scgpt" / slug]):
-            _mark_done(out_dir, info)
-
-    del model
-    torch.cuda.empty_cache()
-
-
-def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
-                       cell_types=None, opts=None) -> None:
-    opts = {**DEFAULT_OPTS, **(opts or {})}
-    scale = _batch_scale(device, opts)
+    task = _task_name("ig", form, "scgpt")
     vocab, model_configs = load_vocab(), load_model_configs()
     gene_names = _load_scgpt_gene_names(data_dir)
     adata = _load_full_dataset_scgpt(data_dir)
 
-    print(f"[{device}] loading LoRA model...", flush=True)
-    model = common._load_lora_model(_single_dir(data_dir, "The LoRA scGPT model") / LORA_FULL_MODEL_SCGPT,
-                                    vocab, model_configs, device)
+    print(f"[{device}] loading {FORM_LABELS[form]} model...", flush=True)
+    model = _load_scgpt(form, data_dir, vocab, model_configs, device)
 
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
-        print(f"\n=== ig_lora_scgpt | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
-        out_dir = results_dir / "ig_lora_scgpt" / slug
-        info = _done_info("ig_lora_scgpt", sub.n_obs, _scgpt_inputs(data_dir, True),
+        print(f"\n=== {task} | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
+        out_dir = results_dir / task / slug
+        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form),
                           max_seq_len=C.MAX_SEQ_LEN, ig_steps=ig.IG_STEPS)
         if _is_done(out_dir, info, opts):
             continue
         pt = common._tokenise(sub, vocab)
 
-        # The correctly classified cells and the embeddings: the attention_lora_scgpt pass
-        cache = _lora_scgpt_cache(model, pt, vocab, gene_names, model_configs, device, scale,
-                                  f"ig_lora_scgpt {slug} classify [{device}]")
+        # The correctly classified cells and the embeddings: the attention_<form>_scgpt pass
+        cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale,
+                                        f"{task} {slug} classify [{device}]")
         if not _correct_counts_ok(cache):
             continue
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -581,9 +620,9 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
         result = ig.compute_ig_result(
             model, pt, cache, vocab, gene_names, device, batch_size=ig.IG_BATCH_SIZE * scale,
             internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale, checkpoint=checkpoint,
-            desc=f"ig_lora_scgpt {slug} [{device}]")
-        _write_ig_outputs(result, gene_names, out_dir, results_dir / "attention_lora_scgpt" / slug,
-                          cache.embedding_source, f"ig_lora_scgpt {slug}")
+            desc=f"{task} {slug} [{device}]")
+        _write_ig_outputs(result, gene_names, out_dir, _strata_dirs(results_dir, "scgpt", form, slug),
+                          cache.embedding_source, f"{task} {slug}")
         ig.remove_checkpoint(checkpoint)
         _mark_done(out_dir, info)
 
@@ -594,10 +633,18 @@ def task_ig_lora_scgpt(data_dir: Path, results_dir: Path, device: torch.device,
 # ---------------------------------------------------------------------------
 # Geneformer and scCello
 # ---------------------------------------------------------------------------
-def _load_lora_rank(spec: dict, data_dir, device: torch.device):
-    """Geneformer or scCello LoRA classifier of one dataset."""
-    lora_dir = _single_dir(data_dir, f"The LoRA {spec['label']} model") / spec["lora_dir"]
-    return gf._load_lora_model(lora_dir, spec["model_dir"], spec["head_config"], spec["emb_layer"], device)
+def _load_rank(spec: dict, form: str, data_dir, device: torch.device):
+    """Geneformer or scCello model of one form; the Step 2.5, MLP and LoRA ones are per dataset."""
+    if form == "zero_shot":
+        return gf._load_zero_shot_model(spec["model_dir"], device)
+    form_dir = _single_dir(data_dir, f"The {FORM_LABELS[form]} {spec['label']} model")
+    if form == "step2_5":
+        return gf._load_zero_shot_model(form_dir / spec["step2_5_dir"], device)
+    if form == "mlp":
+        return gf._load_mlp_model(form_dir / spec["mlp_head"], spec["model_dir"], spec["head_config"],
+                                  spec["emb_layer"], device)
+    return gf._load_lora_model(form_dir / spec["lora_dir"], spec["model_dir"], spec["head_config"],
+                               spec["emb_layer"], device)
 
 
 def _rank_cache(model, sub, spec: dict, token_dict: dict, gene_names: dict, device, scale: int,
@@ -609,40 +656,41 @@ def _rank_cache(model, sub, spec: dict, token_dict: dict, gene_names: dict, devi
                                    use_predictions=use_predictions, desc=desc)
 
 
-def task_attention_rank(spec: dict, lora: bool, data_dir: Path, results_dir: Path, device: torch.device,
+def task_attention_rank(spec: dict, form: str, data_dir: Path, results_dir: Path, device: torch.device,
                         cell_types=None, opts=None) -> None:
-    """Attention task of Geneformer or scCello, zero-shot or LoRA (`lora`).
+    """Attention task of one Geneformer or scCello form.
 
-    Zero-shot: like the scGPT attention task, every cell, grouped by its true
-    label, with the same pooled + CSSI scores and dynamic selections. LoRA:
-    the same scores only on the cells the classifier gets right (the same
+    Like the scGPT attention task: the encoders without a head (zero-shot,
+    Step 2.5) score every cell, grouped by its true label; the classifiers
+    (zero-shot + MLP, LoRA) only the cells they get right (the same
     convention as upstream), with the per-cell scores saved.
     """
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
     name = spec["name"]
-    task = f"attention_lora_{name}" if lora else f"attention_{name}"
-    method = f"attention_lora_{name}" if lora else f"attention_zero_shot_{name}"
+    task = _task_name("attention", form, name)
+    classifier = form in CLASSIFIER_FORMS
     if opts["permutation"]:
         print(f"  --permutation ignored: the {spec['label']} datasets have no donor column", flush=True)
     token_dict = load_token_dictionary(spec["token_dict"])
     gene_names = _load_rank_gene_names(data_dir, spec)
     ds = _load_full_dataset_rank(data_dir, spec)
-    model = _load_lora_rank(spec, data_dir, device) if lora else gf._load_zero_shot_model(spec["model_dir"], device)
+    model = _load_rank(spec, form, data_dir, device)
 
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
         print(f"\n# {task} | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} #", flush=True)
-        out_dir = results_dir / method / slug
-        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, lora))
+        out_dir = results_dir / f"attention_{form}_{name}" / slug
+        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, form))
         if _is_done(out_dir, info, opts):
             continue
-        cache = _rank_cache(model, sub, spec, token_dict, gene_names, device, scale, lora,
+        cache = _rank_cache(model, sub, spec, token_dict, gene_names, device, scale, classifier,
                             f"{task} {slug} [{device}]")
-        if lora and not _correct_counts_ok(cache):
+        if classifier and not _correct_counts_ok(cache):
             continue
+        strata_dirs = _strata_dirs(results_dir, name, form, slug)
         done = (_write_attention_outputs(cache, out_dir, cell_mask=cache.correct, save_cells=True,
-                                         strata_dirs=[results_dir / f"ig_lora_{name}" / slug])
-                if lora else _write_attention_outputs(cache, out_dir))
+                                         strata_dirs=strata_dirs)
+                if classifier else _write_attention_outputs(cache, out_dir, strata_dirs=strata_dirs))
         if done:
             _mark_done(out_dir, info)
 
@@ -650,25 +698,25 @@ def task_attention_rank(spec: dict, lora: bool, data_dir: Path, results_dir: Pat
     torch.cuda.empty_cache()
 
 
-def task_ig_lora_rank(spec: dict, data_dir: Path, results_dir: Path, device: torch.device,
-                      cell_types=None, opts=None) -> None:
-    """Integrated Gradients of the Geneformer or scCello LoRA classifier, pooled + CSSI + selections."""
+def task_ig_rank(spec: dict, form: str, data_dir: Path, results_dir: Path, device: torch.device,
+                 cell_types=None, opts=None) -> None:
+    """Integrated Gradients of a Geneformer or scCello classifier (zero-shot + MLP or LoRA)."""
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
     name = spec["name"]
-    task = f"ig_lora_{name}"
+    task = _task_name("ig", form, name)
     token_dict = load_token_dictionary(spec["token_dict"])
     gene_names = _load_rank_gene_names(data_dir, spec)
     ds = _load_full_dataset_rank(data_dir, spec)
-    model = _load_lora_rank(spec, data_dir, device)
+    model = _load_rank(spec, form, data_dir, device)
 
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
         print(f"\n=== {task} | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} ===", flush=True)
         out_dir = results_dir / task / slug
-        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, True), ig_steps=ig.IG_STEPS)
+        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, form), ig_steps=ig.IG_STEPS)
         if _is_done(out_dir, info, opts):
             continue
-        # The correctly classified cells and the embeddings: the attention_lora_<model> pass
+        # The correctly classified cells and the embeddings: the attention_<form>_<model> pass
         cache = _rank_cache(model, sub, spec, token_dict, gene_names, device, scale, True,
                             f"{task} {slug} classify [{device}]")
         if not _correct_counts_ok(cache):
@@ -679,7 +727,7 @@ def task_ig_lora_rank(spec: dict, data_dir: Path, results_dir: Path, device: tor
             model, gf._to_inputs(sub), cache, token_dict, gene_names, device,
             tokens_per_batch=spec["ig_tokens_per_batch"] * scale, checkpoint=checkpoint,
             desc=f"{task} {slug} [{device}]")
-        _write_ig_outputs(result, gene_names, out_dir, results_dir / f"attention_lora_{name}" / slug,
+        _write_ig_outputs(result, gene_names, out_dir, _strata_dirs(results_dir, name, form, slug),
                           cache.embedding_source, f"{task} {slug}")
         ig.remove_checkpoint(checkpoint)
         _mark_done(out_dir, info)
@@ -719,24 +767,27 @@ def task_residualized_ols_rank(spec: dict, source: str, target: str, data_dir: P
                                                sub.num_rows, opts["permutation"], source=source, target=target)
 
 
-# Model tasks: zero-shot attention, LoRA attention and LoRA IG of every model
-MODEL_TASKS = {
-    "attention_scgpt": task_attention_scgpt,
-    "attention_lora_scgpt": task_attention_lora_scgpt,
-    "ig_lora_scgpt": task_ig_lora_scgpt,
-}
-for _name, _spec in RANK_MODELS.items():
-    MODEL_TASKS[f"attention_{_name}"] = partial(task_attention_rank, _spec, False)
-    MODEL_TASKS[f"attention_lora_{_name}"] = partial(task_attention_rank, _spec, True)
-    MODEL_TASKS[f"ig_lora_{_name}"] = partial(task_ig_lora_rank, _spec)
+# Model tasks of every model: the attention of its four forms and the IG of its
+# two classifiers
+MODEL_TASKS = {}
+for _name in ["scgpt", *RANK_MODELS]:
+    for _form in FORMS:
+        MODEL_TASKS[_task_name("attention", _form, _name)] = (
+            partial(task_attention_scgpt, _form) if _name == "scgpt"
+            else partial(task_attention_rank, RANK_MODELS[_name], _form))
+        if _form in CLASSIFIER_FORMS:
+            MODEL_TASKS[_task_name("ig", _form, _name)] = (
+                partial(task_ig_scgpt, _form) if _name == "scgpt"
+                else partial(task_ig_rank, RANK_MODELS[_name], _form))
 
 # CPU tasks computed from the model tasks' output: the OLS residual of each pooled
 # score, <target>: <source> (as in the README)
 DERIVED_TASKS = {}
 for _name in ["scgpt", *RANK_MODELS]:
-    for _source, _target in [(f"attention_zero_shot_{_name}", f"attention_residualized_ols_{_name}"),
-                             (f"attention_lora_{_name}", f"attention_residualized_ols_lora_{_name}"),
-                             (f"ig_lora_{_name}", f"ig_residualized_ols_lora_{_name}")]:
+    for _score, _form in [("attention", f) for f in FORMS] + [("ig", f) for f in CLASSIFIER_FORMS]:
+        _source = f"{_score}_{_form}_{_name}"
+        _target = (f"attention_residualized_ols_{_name}" if _form == "zero_shot"
+                   else f"{_score}_residualized_ols_{_form}_{_name}")
         DERIVED_TASKS[_target] = (partial(task_residualized_ols_scgpt, _source, _target) if _name == "scgpt"
                                   else partial(task_residualized_ols_rank, RANK_MODELS[_name], _source, _target))
 
