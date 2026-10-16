@@ -1,44 +1,36 @@
 """
-Gene-level GO3 semantic similarity (go3.compare_gene_set_pairs_batch, BMA)
-between the top-30 genes of each method and three GWAS Catalog diseases
-reference gene sets plus two curated Parkinson's panels (PanelApp and
-ParkinsonsUK-UCL), per cell type / ontology / distance measure.
+Gene-level GO3 semantic similarity (groupwise BMA, as
+go3.compare_gene_set_pairs_batch) between each method's gene set (one per
+selection) and four GWAS Catalog diseases reference gene sets plus two
+curated Parkinson's panels (PanelApp and ParkinsonsUK-UCL), per cell type /
+ontology / distance measure.
+
+The gene x gene similarities come from the shared pair cache
+(_go3_common.pair_similarities), so each gene pair is computed once for every
+selection, method, dataset and for gene_matrix.py.
 """
 
 from pathlib import Path
 
 import pandas as pd
 
-import go3
-
 from . import _go3_common as g3c
-from .enrichment import CELL_TYPES, METHODS
+from .gene_sets import CELL_TYPES, SELECTIONS, load_genes, methods_for, output_dir
+from .plots import plot_gwas_set_similarity
 
-TOP_N = 30
 ONTOLOGIES = ["BP", "CC", "MF"]
 GO_SOURCES = {"BP": "GO:BP", "CC": "GO:CC", "MF": "GO:MF"}
 DEFAULT_DISTANCES = ["lin", "SimRel", "wang"]
 
 
-# top30_genes.csv is already the top-30, but re-sorting/truncating here keeps
-# this function correct even if that assumption ever changes upstream
-def _top_genes(path: Path) -> list:
-    if not path.exists():
-        return None
-    df = pd.read_csv(path).sort_values("score", ascending=False)
-    return df["gene"].astype(str).head(TOP_N).tolist()
-
-
-# One entry per (method, cell type) with its top-30 genes, skipping missing pairs
-def _collect_entries(results_dir: Path) -> list:
+# One entry per (method, cell type) with its gene set, skipping missing pairs
+def _collect_entries(results_dir: Path, selection: str) -> list:
     entries = []
-    for method in METHODS:
+    for method in methods_for(selection):
         for cell_type in CELL_TYPES:
-            genes = _top_genes(results_dir / method / cell_type / "top30_genes.csv")
+            genes = load_genes(results_dir, method, selection, cell_type)
             if genes:
                 entries.append({"method": method, "cell_type": cell_type, "genes": genes})
-            else:
-                print(f"  MISSING {results_dir / method / cell_type / 'top30_genes.csv'}")
     return entries
 
 
@@ -55,40 +47,52 @@ def _annotated_counts(refs: dict, out_csv: Path) -> None:
     pd.DataFrame(rows).to_csv(out_csv, index=False)
 
 # One similarity row per (reference, method, cell_type, ontology, distance),that's the four fors
-def _compute(entries: list, refs: dict, counter, distances: list) -> pd.DataFrame:
+def _compute(entries: list, refs: dict, pair_matrices: dict, distances: list) -> pd.DataFrame:
     rows = []
     for ref_key, ref_genes in refs.items():
         for ont in ONTOLOGIES:
-            # Every method/cell_type gene set is compared against the same reference
-            pairs = [(e["genes"], ref_genes) for e in entries]
             for dist in distances:
-                # One batched go3 call per (ontology, distance) covers every entry
-                sims = go3.compare_gene_set_pairs_batch(pairs, ont, dist, "bma", counter)
-                for e, s in zip(entries, sims):
+                # Every entry's BMA similarity is read from the cached gene x gene
+                # block, identical to go3.compare_gene_set_pairs_batch(..., "bma")
+                pm = pair_matrices[(ont, dist)]
+                for e in entries:
                     rows.append({"reference": ref_key, "method": e["method"],
-                                 "cell_type": e["cell_type"], "go_source": GO_SOURCES[ont],
-                                 "distance": dist, "similarity": float(s)})
-            print(f"[{ref_key}] {GO_SOURCES[ont]} done")
+                                 "cell_type": e["cell_type"], "n_genes": len(e["genes"]),
+                                 "go_source": GO_SOURCES[ont],
+                                 "distance": dist, "similarity": g3c.bma(pm.block(e["genes"], ref_genes))})
     return pd.DataFrame(rows)
 
-def task_gwas_similarity(results_dir: Path) -> None:
-    out_dir = results_dir / "gwas_similarity"
-    refs_dir = out_dir / "refs"
+def task_gwas_similarity(results_dir: Path, selections=SELECTIONS, distances=DEFAULT_DISTANCES) -> None:
+    refs_dir = results_dir / "gwas_similarity" / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fetch (or reuse the cached) GWAS Catalog gene sets for PD/AD/CAD, plus the two PD panels
+    # Fetch (or reuse the cached) GWAS Catalog gene sets for PD/AD/CAD/CKD, plus the two PD panels
     refs = {**g3c.fetch_all_gwas(refs_dir), **g3c.load_pd_panels(refs_dir)}
-    print("Reference sizes:", {k: len(v) for k, v in refs.items()})
-
-    # Load the top-30 genes of every (method, cell type)
-    entries = _collect_entries(results_dir)
-    print(f"Collected {len(entries)} gene sets; distances={DEFAULT_DISTANCES}")
+    print("Reference sizes:", {k: len(v) for k, v in refs.items()}, flush=True)
 
     # Loading the GO ontology
     counter = g3c.init_go3()
-    # Record how many genes in each reference (i.e., PD/AD/CAD and the PD panels) are annotated in each sub-ontology
+    # Record how many genes in each reference (i.e., PD/AD/CAD/CKD and the PD panels) are annotated in each sub-ontology
     _annotated_counts(refs, refs_dir / "annotated_counts.csv")
 
-    df = _compute(entries, refs, counter, DEFAULT_DISTANCES)
-    df.to_csv(out_dir / "gene_level_similarity_all.csv", index=False)
-    print("Saved:", out_dir / "gene_level_similarity_all.csv")
+    # Load the gene set of every (selection, method, cell type)
+    entries_by_selection = {s: _collect_entries(results_dir, s) for s in selections}
+    for s, entries in entries_by_selection.items():
+        print(f"[{s}] collected {len(entries)} gene sets; distances={list(distances)}", flush=True)
+
+    # One go3 pass per (ontology, distance) over every gene of every selection,
+    # computing only the gene pairs that are not in the shared cache yet
+    all_genes = sorted({g for entries in entries_by_selection.values() for e in entries for g in e["genes"]})
+    all_refs = sorted({g for genes in refs.values() for g in genes})
+    cache_dir = g3c.pair_cache_dir(results_dir)
+    pair_matrices = {(ont, dist): g3c.pair_similarities(all_genes, all_refs, ont, dist, counter, cache_dir)
+                     for ont in ONTOLOGIES for dist in distances}
+
+    for selection, entries in entries_by_selection.items():
+        out_dir = output_dir(results_dir, "gwas_similarity", selection)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df = _compute(entries, refs, pair_matrices, distances)
+        df.to_csv(out_dir / "gene_level_similarity_all.csv", index=False)
+        print("Saved:", out_dir / "gene_level_similarity_all.csv", flush=True)
+
+        plot_gwas_set_similarity(results_dir, selection)

@@ -1,21 +1,18 @@
 """
-g:Profiler enrichment of the top-30 genes per method and cell type, against
-g:Profiler's default annotated-genome background.
+g:Profiler enrichment of each method's gene set (top-30 or elbow) per cell
+type, against g:Profiler's default annotated-genome background.
 """
 
 from pathlib import Path
 
 import pandas as pd
 from gprofiler import GProfiler
+from tqdm import tqdm
 
-# Six methods per foundation model: zero-shot, Step 2.5, zero-shot + MLP head and LoRA
-METHODS = ["attention_zero_shot_scgpt", "attention_step2_5_scgpt", "attention_mlp_scgpt",
-           "ig_mlp_scgpt", "attention_lora_scgpt", "ig_lora_scgpt",
-           "attention_zero_shot_geneformer", "attention_step2_5_geneformer", "attention_mlp_geneformer",
-           "ig_mlp_geneformer", "attention_lora_geneformer", "ig_lora_geneformer",
-           "attention_zero_shot_sccello", "attention_step2_5_sccello", "attention_mlp_sccello",
-           "ig_mlp_sccello", "attention_lora_sccello", "ig_lora_sccello"]
-CELL_TYPES = ["astrocytes", "da_neurons", "microglia", "oligodendrocytes"]
+from ..utils.progress import progress
+from .gene_sets import CELL_TYPES, SELECTIONS, load_genes, methods_for, output_dir
+from .plots import plot_gene_set_overview
+
 # This are ontologies of gprofiler
 GPROFILER_SOURCES = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
 
@@ -31,39 +28,43 @@ def _run_enrichment(gp: GProfiler, genes: list) -> pd.DataFrame:
     # Keep only the terms g:Profiler flagged as significant
     return df[df["significant"] == True].copy()
 
-# Run enrichment for every method and cell type pair and record a manifest
-def task_enrichment(results_dir: Path) -> None:
-
-    # Initialization of the GProfiler
-    gp = GProfiler(return_dataframe=True)
-    out_dir = results_dir / "enrichment"
+# Run enrichment for every method and cell type pair of one selection and record a manifest
+def _enrichment_for_selection(gp: GProfiler, results_dir: Path, selection: str) -> None:
+    out_dir = output_dir(results_dir, "enrichment", selection)
     manifest_rows = []
 
-    # Iterate over methods and cell types
-    for method in METHODS:
-        for cell_type in CELL_TYPES:
-            # top30_genes.csv is written by run_tasks.py's attention/ig_lora tasks
-            genes_path = results_dir / method / cell_type / "top30_genes.csv"
-            if not genes_path.exists():
-                print(f"  MISSING {genes_path}")
-                continue
-            genes = pd.read_csv(genes_path)["gene"].tolist()
-            sig_df = _run_enrichment(gp, genes)
+    # Iterate over methods and cell types (one g:Profiler query per pair)
+    pairs = [(m, c) for m in methods_for(selection) for c in CELL_TYPES]
+    for method, cell_type in progress(pairs, desc=f"g:Profiler {selection}", unit="set"):
+        genes = load_genes(results_dir, method, selection, cell_type)
+        if not genes:
+            continue
+        sig_df = _run_enrichment(gp, genes)
 
-            # Write the significant terms of this (method, cell type) pair
-            method_dir = out_dir / method
-            method_dir.mkdir(parents=True, exist_ok=True)
-            sig_df.to_csv(method_dir / f"{cell_type}.csv", index=False)
+        # Write the significant terms of this (method, cell type) pair
+        method_dir = out_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        sig_df.to_csv(method_dir / f"{cell_type}.csv", index=False)
 
-            # Track number of terms counts across all pairs
-            # This will be saved in manifest.csv
-            manifest_rows.append({
-                "method": method, "cell_type": cell_type,
-                "n_query_genes": len(genes), "n_significant_terms": len(sig_df),
-            })
-            print(f"[{method}/{cell_type}] {len(genes)} genes -> {len(sig_df)} significant terms")
+        # Track number of terms counts across all pairs
+        # This will be saved in manifest.csv
+        manifest_rows.append({
+            "method": method, "cell_type": cell_type,
+            "n_query_genes": len(genes), "n_significant_terms": len(sig_df),
+        })
+        tqdm.write(f"[{selection}/{method}/{cell_type}] {len(genes)} genes -> {len(sig_df)} significant terms")
 
     # One-row-per-pair summary of how many genes went in and terms came out
     manifest = pd.DataFrame(manifest_rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(out_dir / "manifest.csv", index=False)
-    print(f"Saved manifest.csv ({len(manifest)} rows)")
+    print(f"Saved {out_dir / 'manifest.csv'} ({len(manifest)} rows)")
+
+
+def task_enrichment(results_dir: Path, selections=SELECTIONS) -> None:
+    # Initialization of the GProfiler
+    gp = GProfiler(return_dataframe=True)
+    for selection in selections:
+        _enrichment_for_selection(gp, results_dir, selection)
+    # Gene-set sizes and overlap between methods, independent of enrichment
+    plot_gene_set_overview(results_dir)

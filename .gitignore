@@ -2,3 +2,13 @@ data/
 __pycache__/
 *.pyc
 *.tar.gz
+CLAUDE.md
+CLAUDE.md.bak
+*.pdf
+venv
+.claude
+logs/
+results/
+docs/
+*.zip
+scripts/slurm/

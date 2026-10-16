@@ -96,8 +96,12 @@ PAD_TOKEN = "<pad>"
 SPECIAL_TOKENS = [PAD_TOKEN, "<cls>", "<eoc>"]
 PAD_VALUE = -2
 N_BINS = 51
+# scGPT's binning breaks ties with np.random, so tokenisation is seeded to make
+# attention/IG scores independent of cell-type processing order.
+BINNING_SEED = 42
 # Up to 1200 expressed genes + CLS, as used for the all-genes run; a cell with
-# more expressed genes keeps a random 1200 of them (scGPT's pad_batch)
+# more expressed genes keeps a random 1200 of them (scGPT's pad_batch, seeded
+# with BINNING_SEED like the binning)
 MAX_SEQ_LEN = 1201
 
 # go3/gwas_similarity/gene_matrix postprocess steps expect the monorepo's own

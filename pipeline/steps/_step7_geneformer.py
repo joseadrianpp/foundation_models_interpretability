@@ -13,8 +13,8 @@ Pipeline:
      via a forward pre-hook.
   3. Compute CLS-row attention scores from Q.Kt (per head), rank-normalise
      across the gene axis (ignoring padding), average across heads.
-  4. Aggregate per-gene CLS attention per condition. For the LoRA model we
-     restrict to correctly classified cells.
+  4. Aggregate per-gene CLS attention per condition (attention_cssi_leiden.py).
+     For the LoRA model we restrict to correctly classified cells.
 
 The per-gene score (PD - Control) and the top-N file are the same as for
 scGPT (run_tasks.py).
@@ -98,20 +98,30 @@ def _load_mlp_model(head_path, model_dir, head_config: dict, emb_layer: int,
     return model
 
 
-# Forward pass to compute attention for the CLS token
-def _forward_cls_attention(
-    model: nn.Module, ids: torch.Tensor, attn: torch.Tensor, emb_layer: int,
-    use_predictions: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+# The BERT of a zero-shot model (the model itself) or of a LoRA classifier
+def _bert(model: nn.Module) -> nn.Module:
+    return model.backbone.bert if isinstance(model, GeneformerClassifier) else model
+
+
+# 0-indexed encoder block whose output is the cell embedding (hidden_states[emb_layer]
+# is the output of encoder.layer[emb_layer]): Geneformer 10 of 12, scCello 5 of 6.
+# Its attention is the last one that shapes what the head classifies
+def attn_layer_index(model: nn.Module, emb_layer: int) -> int:
+    return emb_layer % _bert(model).config.num_hidden_layers
+
+
+# CLS attention of the attention block `layer_idx`, the predictions of a LoRA
+# classifier (use_predictions) and the residual-stream CLS embedding entering
+# that block (the cell embedding the CSSI strata are built from, see
+# attention_cssi_leiden.collect_geneformer)
+def _forward_cls_attention_with_embedding(
+    model: nn.Module, ids: torch.Tensor, attn: torch.Tensor, layer_idx: int, use_predictions: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     # The zero-shot model is the BERT itself, the LoRA one has it inside the classifier
-    bert = model.backbone.bert if isinstance(model, GeneformerClassifier) else model
-    # hidden_states[emb_layer] is the output of encoder.layer[emb_layer], so this is
-    # the last block that shapes what the head classifies
-    layer = bert.encoder.layer[emb_layer]
+    bert = _bert(model)
+    layer = bert.encoder.layer[layer_idx]
     n_head = bert.config.num_attention_heads
-
-    # True to padded positions (not all cells are equal length)
     mask = attn.eq(0)
 
     capture = _LayerInputCapture(layer)
@@ -132,75 +142,11 @@ def _forward_cls_attention(
         self_attn = layer.attention.self
         q = rearrange(self_attn.query(embs), "b s (h d) -> b h s d", h=n_head)
         k = rearrange(self_attn.key(embs), "b s (h d) -> b h s d", h=n_head)
-
         # Attention of the CLS (first token of Q) to every token: Q_cls*K^T.
         # Dividing by sqrt(d_k) is left out because it does not change the ranks
         cls_scores = (q[:, :, 0:1, :] @ k.transpose(-1, -2)).squeeze(2)
-
-        # AVERAGE the attention scores
+        # Rank-normalised and AVERAGED over the heads (12 in Geneformer, 4 in scCello)
         cls_attn = _cls_attn_rank_norm_head_avg(cls_scores, mask)
 
     preds = (logits > 0).long() if use_predictions else None
-    return cls_attn, preds
-
-
-# Add the attention of one cell to the per-gene sums, gene by gene, because the
-# attention we want is the attention of genes, not cells
-def _add_cell(sums: Dict[int, float], cell_gids: np.ndarray, row: np.ndarray,
-              special_ids: set) -> None:
-    for pos in range(1, len(cell_gids)):
-        gid = int(cell_gids[pos])
-        if gid in special_ids:
-            continue
-        sums[gid] = sums.get(gid, 0.0) + float(row[pos])
-
-
-# Calculate the attention between the CLS token and the gene tokens
-def _compute_attn_per_gene_per_condition(
-    model: nn.Module, pt: Dict, token_dict: dict, gene_names: dict, emb_layer: int,
-    device: torch.device, use_predictions: bool, batch_size: int = ATTN_BATCH_SIZE,
-) -> Tuple[Dict[int, Dict[str, float]], dict]:
-
-    n_cells = len(pt["input_ids"])
-    pad_id = token_dict["<pad>"]
-    # <pad>, <mask>, <cls> and <eos> (Geneformer only) are not genes
-    special_ids = {v for k, v in token_dict.items() if k.startswith("<")}
-
-    # Initialize variables to save attention values
-    sum_by_gid: Dict[int, Dict[int, float]] = {0: {}, 1: {}}
-    n_used = {0: 0, 1: 0}
-
-    # Iterate over batches of cells
-    for start in range(0, n_cells, batch_size):
-        end = min(start + batch_size, n_cells)
-        ids, attn = _pad_batch(pt["input_ids"][start:end], pad_id, device)
-
-        # Calculate the attention AVERAGE over the heads (12 in Geneformer, 4 in scCello)
-        cls_attn, preds = _forward_cls_attention(model, ids, attn, emb_layer, use_predictions)
-
-        gids = ids.cpu().numpy()
-        labels = pt["condition_labels"][start:end].numpy()
-        cls_attn_np = cls_attn.cpu().numpy()
-
-        # This bucle is cell by cell
-        for i in range(end - start):
-            true = int(labels[i])
-            # With the LoRA model only the correctly classified cells count
-            if use_predictions and int(preds[i]) != true:
-                continue
-            n_used[true] += 1
-            _add_cell(sum_by_gid[true], gids[i], cls_attn_np[i], special_ids)
-
-    # Compute the mean attention per gene per condition (positive; PD and negative; Control).
-    # The mean is over every cell of the condition and a cell without the gene adds 0,
-    # so a gene seen in a handful of cells cannot outrank one seen in all of them
-    means: Dict[int, Dict[str, float]] = {0: {}, 1: {}}
-    for cond in (0, 1):
-        for gid, s in sum_by_gid[cond].items():
-            means[cond][gene_names[gid]] = s / n_used[cond]
-
-    # Safe case for a condition without cells (e.g. 0% accuracy on it)
-    ok = n_used[0] > 0 and n_used[1] > 0
-    reason = "" if ok else f"cells used: control={n_used[0]}, pd={n_used[1]}"
-    gate = {"ok": bool(ok), "reason": reason, "mode": "predictions" if use_predictions else "labels"}
-    return means, gate
+    return cls_attn, preds, embs[:, 0, :]
