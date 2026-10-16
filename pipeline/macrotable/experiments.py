@@ -14,15 +14,14 @@ import pandas as pd
 
 from ..postprocess import gene_sets as gs
 
-# Columns that identify an experiment, in table order. Score is the signal a
-# ranking is computed from: a LoRA model has both an attention and an IG
-# CSSI / residuals ranking (zero-shot rows are all attention)
+# Columns that identify an experiment, in table order. Score is the per-cell
+# signal (attention, IG, IG±) and Ranking how it is aggregated over the cells
+# (pooled mean, CSSI-max, OLS residual): every score has the three rankings
 KEY = ["Ranking", "Score", "TopN", "Model", "ModelForm", "Dataset", "CellType"]
 
 # Table labels of the gene_sets.py names
-RANKING_LABELS = {"attention": "attention", "cssi": "CSSI", "ols": "residuals",
-                  "integrated_gradients": "IG"}
-SCORE_LABELS = {"attention": "attention", "ig": "IG"}
+RANKING_LABELS = {"pooled": "pooled", "cssi": "CSSI", "ols": "residualized"}
+SCORE_LABELS = {"attention": "attention", "ig": "IG", "igsigned": "IG±"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
 MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "step2_5": "Step2.5", "mlp": "zero-shot+MLP", "lora": "LoRA"}

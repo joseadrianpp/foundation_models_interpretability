@@ -1,7 +1,8 @@
 """
 Gene sets fed to the post-hoc analyses, per (method, selection, cell type).
 
-A method is one gene ranking of one model, `<ranking>_<model>`:
+A method is one gene ranking (pooled, CSSI or residualized) of one score
+(attention, IG or IG±) of one form of one model:
   * attention_zero_shot_<model>        - pooled CLS attention, PD - control (baseline)
   * attention_cssi_<model>             - CSSI-max attention over Leiden strata (method 2.1)
   * attention_residualized_ols_<model> - OLS residual of the pooled attention (method 2.3)
@@ -14,7 +15,13 @@ mlp, the zero-shot encoder + Step 4 MLP head; lora, the LoRA classifier):
         form's own embedding, OLS residual; the classifiers (mlp, lora) on
         their correctly classified cells
   * ig_<form>_<model> / ig_cssi_<form>_<model> / ig_residualized_ols_<form>_<model>
-      - mean |Integrated Gradients| of the classifiers (mlp, lora), the same three
+      - score IG: mean |Integrated Gradients| (as JA's IG and SIGnature), the
+        same three rankings
+  * igsigned_<form>_<model> / igsigned_cssi_<form>_<model> /
+    igsigned_residualized_ols_<form>_<model>
+      - score IG±: signed IG, mean in PD - mean in control, the same three
+IG runs on the classifiers (mlp, lora) of every model and, for scGPT, also
+on the encoders without a head (zero_shot, step2_5, SIGnature's IG).
 
 Selections:
   * top30   - static top-30 ranking
@@ -22,8 +29,8 @@ Selections:
   * elbow   - Kneedle elbow on the descending score curve (variable size)
 
 METHOD_META gives each method's (ranking, score, model, model form, label),
-the columns that identify an experiment: the score is the attention or IG
-signal a ranking is computed from (zero-shot models: attention only).
+the columns that identify an experiment: the score is the per-cell signal
+(attention, IG, IG±) a ranking is computed from.
 
 All paths are relative to the per-dataset results folder (results/dataset_a,
 results/dataset_b). top30 outputs keep the original locations
@@ -39,9 +46,19 @@ import pandas as pd
 CELL_TYPES = ["astrocytes", "da_neurons", "microglia", "oligodendrocytes"]
 SELECTIONS = ["top30", "z-score", "elbow"]
 MODELS = ["scgpt", "geneformer", "sccello"]
-# Forms of a model besides zero-shot (folder part -> label); the IG runs on the classifiers
-FORM_LABELS = {"step2_5": "Step 2.5", "mlp": "zero-shot + MLP", "lora": "LoRA"}
+# Forms of a model (folder part -> model form, label); the IG runs on the
+# classifiers, and for scGPT on the encoders without a head too (SIGnature)
+FORMS = {"zero_shot": ("zero-shot", "zero-shot"), "step2_5": ("step2_5", "Step 2.5"),
+         "mlp": ("mlp", "zero-shot + MLP"), "lora": ("lora", "LoRA")}
 CLASSIFIER_FORMS = ("mlp", "lora")
+IG_FORMS = {"scgpt": tuple(FORMS)}
+# Scores (folder prefix -> label)
+SCORE_NAMES = {"attention": "attention", "ig": "IG", "igsigned": "IG±"}
+
+
+def ig_forms(model: str) -> tuple:
+    """Forms of a model with Integrated Gradients."""
+    return IG_FORMS.get(model, CLASSIFIER_FORMS)
 
 # Per method: gene-list CSV per selection (columns rank, gene, score), the
 # all-gene score CSV and the dynamic-selection summary, relative to results_dir
@@ -68,9 +85,10 @@ def _dynamic_lists(top30: str, sel_dir: str) -> dict:
 
 
 for _model in MODELS:
+    # Zero-shot attention keeps its original method names
     _pooled = f"attention_zero_shot_{_model}/{{ct}}"
     _ols = f"attention_residualized_ols_{_model}/{{ct}}"
-    _register(f"attention_zero_shot_{_model}", "attention", "attention", _model, "zero-shot",
+    _register(f"attention_zero_shot_{_model}", "pooled", "attention", _model, "zero-shot",
               "zero-shot attention (pooled)",
               _dynamic_lists(f"{_pooled}/top30_genes.csv", f"{_pooled}/csv"),
               f"{_pooled}/csv/all_genes.csv", f"{_pooled}/csv/selection_summary.json")
@@ -81,22 +99,22 @@ for _model in MODELS:
               "OLS-residual attention (2.3)",
               _dynamic_lists(f"{_ols}/csv/top30.csv", f"{_ols}/csv"),
               f"{_ols}/csv/ols.csv", f"{_ols}/csv/selection_summary.json")
-    # The other forms: attention of each, and IG of the classifiers, each with
-    # the same output layout, pooled + CSSI in one folder and OLS in another
-    for _form, _form_label in FORM_LABELS.items():
-        for _base, _signal, _label in [("attention", "attention", f"{_form_label} attention"),
-                                       ("ig", "integrated_gradients", f"{_form_label} IG")]:
-            if _base == "ig" and _form not in CLASSIFIER_FORMS:
+    # Every other (score, form): the same output layout, pooled + CSSI in one
+    # folder and OLS in another
+    for _score, _score_label in SCORE_NAMES.items():
+        for _form, (_model_form, _form_label) in FORMS.items():
+            if (_score, _form) == ("attention", "zero_shot") or (_score != "attention" and _form not in ig_forms(_model)):
                 continue
-            _dir = f"{_base}_{_form}_{_model}/{{ct}}"
-            _ols_dir = f"{_base}_residualized_ols_{_form}_{_model}/{{ct}}"
-            _register(f"{_base}_{_form}_{_model}", _signal, _base, _model, _form, f"{_label} (pooled)",
+            _label = f"{_form_label} {_score_label}"
+            _dir = f"{_score}_{_form}_{_model}/{{ct}}"
+            _ols_dir = f"{_score}_residualized_ols_{_form}_{_model}/{{ct}}"
+            _register(f"{_score}_{_form}_{_model}", "pooled", _score, _model, _model_form, f"{_label} (pooled)",
                       _dynamic_lists(f"{_dir}/top30_genes.csv", f"{_dir}/csv"),
                       f"{_dir}/csv/all_genes.csv", f"{_dir}/csv/selection_summary.json")
-            _register(f"{_base}_cssi_{_form}_{_model}", "cssi", _base, _model, _form, f"{_label}, CSSI-max",
+            _register(f"{_score}_cssi_{_form}_{_model}", "cssi", _score, _model, _model_form, f"{_label}, CSSI-max",
                       _dynamic_lists(f"{_dir}/cssi/csv/top30.csv", f"{_dir}/cssi/csv"),
                       f"{_dir}/cssi_genes.csv", f"{_dir}/cssi/csv/selection_summary.json")
-            _register(f"{_base}_residualized_ols_{_form}_{_model}", "ols", _base, _model, _form,
+            _register(f"{_score}_residualized_ols_{_form}_{_model}", "ols", _score, _model, _model_form,
                       f"{_label}, OLS residual",
                       _dynamic_lists(f"{_ols_dir}/csv/top30.csv", f"{_ols_dir}/csv"),
                       f"{_ols_dir}/csv/ols.csv", f"{_ols_dir}/csv/selection_summary.json")
