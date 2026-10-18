@@ -2,6 +2,8 @@
 
   python -m pipeline.macrotable.build                       # every module
   python -m pipeline.macrotable.build --modules classifier  # recompute one part, rejoin all
+  python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt \
+      --modules similarity faithfulness                     # the scGPT study (then summarize_scgpt.py)
 
 Parts go to <results>/macrotable/parts/<module>.csv and the joined table to
 <results>/macrotable/macrotable.csv: KEY columns first, then each module's
@@ -16,14 +18,15 @@ import re
 import pandas as pd
 
 from ..postprocess.gwas_similarity import DEFAULT_DISTANCES
-from .columns import classifier, context, enrichment, overlap, similarity
-from .experiments import KEY, Settings, load_experiments
+from .columns import classifier, context, enrichment, faithfulness, overlap, similarity
+from .experiments import DEFAULT_MODEL_FORMS, KEY, MODEL_LABELS, Settings, load_experiments
 
 # Column modules in table order
 MODULES = {
     "overlap": overlap,
     "enrichment": enrichment,
     "similarity": similarity,
+    "faithfulness": faithfulness,
     "classifier": classifier,
     "context": context,
 }
@@ -42,8 +45,9 @@ def _read_part(path: Path) -> pd.DataFrame:
     return part.astype({c: "Int64" for c in counts})
 
 
-def build(settings: Settings, modules=None, datasets=None, model_forms=("zero-shot", "lora")) -> pd.DataFrame:
-    experiments = load_experiments(settings.results_root, datasets, model_forms)
+def build(settings: Settings, modules=None, datasets=None, model_forms=DEFAULT_MODEL_FORMS,
+          models=None) -> pd.DataFrame:
+    experiments = load_experiments(settings.results_root, datasets, model_forms, models)
     print(f"[macrotable] {len(experiments)} experiments", flush=True)
     parts_dir = Path(settings.results_root) / "macrotable" / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +83,11 @@ def main():
     p.add_argument("--modules", nargs="+", choices=list(MODULES), default=None,
                    help="Modules to (re)compute; the others are read from their saved parts (default: all).")
     p.add_argument("--datasets", nargs="+", default=None, help="Dataset labels, e.g. A B (default: every one).")
-    p.add_argument("--zero-shot-only", action="store_true", help="Leave out the LoRA experiments.")
+    p.add_argument("--zero-shot-only", action="store_true", help="Only the zero-shot experiments.")
+    p.add_argument("--forms", nargs="+", choices=list(DEFAULT_MODEL_FORMS), default=list(DEFAULT_MODEL_FORMS),
+                   help="Model forms (default: all four).")
+    p.add_argument("--models", nargs="+", choices=list(MODEL_LABELS), default=None,
+                   help="Models (default: all).")
     p.add_argument("--distances", nargs="+", choices=DEFAULT_DISTANCES, default=["SimRel"],
                    help="GO3 distances of the similarity columns; the first has no suffix (default: SimRel).")
     p.add_argument("--rf-max-cells", type=int, default=20000, help="Cells per dataset and cell type for the RF.")
@@ -90,8 +98,8 @@ def main():
 
     settings = Settings(results_root=args.results_dir, distances=args.distances, rf_max_cells=args.rf_max_cells,
                         rf_trees=args.rf_trees, rf_folds=args.rf_folds, n_jobs=args.n_jobs)
-    forms = ("zero-shot",) if args.zero_shot_only else ("zero-shot", "lora")
-    build(settings, args.modules, args.datasets, forms)
+    forms = ("zero-shot",) if args.zero_shot_only else tuple(args.forms)
+    build(settings, args.modules, args.datasets, forms, args.models)
 
 
 if __name__ == "__main__":

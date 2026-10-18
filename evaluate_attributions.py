@@ -1,12 +1,55 @@
 #!/usr/bin/env python
-"""Evaluate per-cell gene attributions of a LoRA classifier with Quantus (Problem A).
+"""Evaluate per-cell gene attributions and population rankings with Quantus (Problems A and B).
 
-For a model (scGPT, Geneformer or scCello) and a dataset, a seeded sample of
-correctly classified cells per cell type is explained by each method (IG,
-|IG|, attention, random; see pipeline/evaluation/rank_model.py and
-scgpt_model.py), and each explanation is scored by Quantus metrics, one cell
-at a time. Removing a gene is replacing it by <mask> (Geneformer, scCello) or
-setting its expression value to 0 (scGPT), the baselines of our IG:
+scGPT (the study): the faithfulness gain (FG) of every form (zero_shot,
+step2_5, mlp, lora; --forms) on the same cells, from a finished pipeline
+run (run_tasks.py --task scgpt, read from --results-dir):
+
+  cells    --cells-per-type (default 200, 800 per dataset) per cell type,
+           the same for every form: cells classified correctly by both
+           classifiers (zero-shot + MLP and LoRA, the `correct` their IG
+           tasks saved), spread over the donors (each donor's cells in a
+           seeded random order, the donors taken in turn; a donor out of
+           cells leaves its turns to the others). attribution_eval/cells.csv
+  methods  ig: the pipeline's signed IG of the cell (cell_scores.npz, the
+           cell type tokenised exactly as the pipeline did), towards the true
+           class for a classifier (IG of the PD logit times +1/2 or -1/2),
+           as saved for an encoder (SIGnature); random: uniform noise;
+           rank_<score>_<ranking>: every population ranking of the form
+           (score ig or igsigned, ranking pooled, cssi or ols) as every
+           cell's attribution. IG± is flipped for control cells only for an
+           encoder (its PD - control mean of the SIGnature IG points to PD);
+           for a classifier it is already the mean IG towards the true class
+           of both conditions, like the cell's own ig. |IG| is not
+           evaluated: its FG was far lower than the signed IG's on every model
+           (0.19 / 0.17 / 0.03 against 0.93 / 0.78 / 0.66, scCello /
+           Geneformer / scGPT LoRA, dataset A), as it adds up genes that push
+           against the target.
+  curve    the MoRF (deletion) curve of quantus.PixelFlipping: genes removed
+           most relevant first (value 0, the IG baseline), the output after
+           each step; --engine batch computes the same steps in batches
+           (_morf_curves), --engine quantus calls PixelFlipping (to validate).
+           The classifiers' output is the target class probability; an
+           encoder without a head has none, so its output is the one its IG
+           explains, SIGnature's y = sum_k |w_k * f_k(x')| (w = f(x)), as
+           (y(x') - y(0)) / (y(x) - y(0)): 1 for the real cell, 0 with every
+           gene removed.
+  FG       1 - deletion AUC / deletion AUC of random on the same cell (0 =
+           random, higher = better; above 1 is possible for the encoders,
+           whose output can fall below that of the baseline).
+
+Outputs per form (<results-dir>/dataset_<x>/attribution_eval/scgpt_<form>/):
+cells/<cell type>.csv (one row per cell and method) and cells/<cell
+type>_curves.npz, written cell type by cell type (--skip-done keeps them),
+then curves.csv (all of them) and fg_by_cell_type.csv (mean FG per method
+and cell type, and over every cell; read by the macrotable).
+
+  CUDA_VISIBLE_DEVICES=1 python evaluate_attributions.py --dataset A --results-dir results/scgpt --skip-done
+
+Geneformer and scCello (earlier evaluation, one classifier, --form mlp|lora,
+its own correctly classified cells): the explanations of rank_model.py
+(ig, attention, random), each scored by the Quantus metrics below, or with
+--curves by their MoRF and LeRF curves and the scores derived from them.
 
   faithfulness  PixelFlipping: genes removed most relevant first,
                 ~50 steps; the area under the target probability curve over the
@@ -24,11 +67,13 @@ setting its expression value to 0 (scGPT), the baselines of our IG:
 With --curves, only the two perturbation curves of each explanation are
 computed (both with PixelFlipping): MoRF, the genes removed most relevant
 first (the deletion curve above), and LeRF, least relevant first (the same
-metric with the attribution negated). Every score derived from them is a
-probability or a fraction of genes, so it compares across models:
+metric with the attribution negated), and the scores derived from them:
 
-  deletion_auc / lerf_auc  area under each curve (target probability over
-                           the fraction of genes removed)
+  deletion_auc / lerf_auc  area under each curve (output over the fraction
+                           of genes removed)
+  fg                       faithfulness gain, 1 - deletion_auc / deletion_auc
+                           of random on the same cell (0 = random, higher =
+                           better): the single Problem A / B metric
   abpc                     lerf_auc - deletion_auc, the area between the
                            curves (Samek et al., 2017): necessity and
                            sufficiency together (higher = better)
@@ -36,21 +81,23 @@ probability or a fraction of genes, so it compares across models:
   sufficiency_10           p(0) - p keeping only the top 10%, i.e. after
                            removing the least relevant 90% (lower = better)
   k_flip                   fraction of genes removed, most relevant first,
-                           until the target probability drops below 0.5
-                           (lower = the decision rests on fewer genes; 1 if
-                           it never flips)
+                           until the output drops below 0.5 (lower = the
+                           decision rests on fewer genes; 1 if it never does)
 
-Outputs (results/dataset_<x>/attribution_eval/<model>/): cells.csv, one row
-per (cell, method) with every score and the seconds each metric took, and
-summary.csv, the mean and standard error per method; with --curves,
-curves.csv, curves_summary.csv and curves.npz (every curve, keyed
+Outputs (<results-dir>/dataset_<x>/attribution_eval/<model>_<form>/):
+cells.csv, one row per (cell, method) with every score and the seconds each
+metric took, and summary.csv, the mean and standard error per method; with
+--curves, curves.csv, curves_summary.csv, fg_by_cell_type.csv (mean FG per
+method and cell type, and over all cells) and curves.npz (every curve, keyed
 <cell type>:<cell>:<method>:<morf|lerf>).
 
-  CUDA_VISIBLE_DEVICES=1 python evaluate_attributions.py --model sccello --dataset A --cells-per-type 12
+  CUDA_VISIBLE_DEVICES=1 python evaluate_attributions.py --model scgpt --form lora --dataset A \
+      --curves --rankings --results-dir results/scgpt
 """
 
 import argparse
 import gc
+import math
 import time
 import warnings
 from pathlib import Path
@@ -65,9 +112,11 @@ import run_tasks as rt
 from pipeline import config as C
 from pipeline.evaluation import rank_model, scgpt_model
 from pipeline.evaluation.rank_model import RankTokenClassifier, mask_tokens
-from pipeline.evaluation.scgpt_model import ScGPTValueClassifier
+from pipeline.evaluation.scgpt_model import ScGPTEmbeddingScorer, ScGPTValueClassifier
+from pipeline.postprocess import gene_sets as gs
 from pipeline.steps import _step7_common as common
 from pipeline.steps import _step7_geneformer as gf
+from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.utils.geneformer_model import load_token_dictionary
 from pipeline.utils.progress import progress
 from pipeline.utils.scgpt_model import load_model_configs, load_vocab
@@ -81,6 +130,8 @@ FC_SUBSET = 0.10
 FC_RUNS = 50
 SENS_FRACTION = 0.02
 SENS_SAMPLES = 10
+# Default cells per cell type (spread over the donors)
+CELLS_PER_TYPE = 200
 
 
 def _features_in_step(n: int, steps: int = PF_STEPS) -> int:
@@ -89,54 +140,278 @@ def _features_in_step(n: int, steps: int = PF_STEPS) -> int:
     return min(divisors, key=lambda d: (abs(d - n / steps), d))
 
 
-def _is_correct(model, cell: dict) -> bool:
-    """Whether the classifier predicts the cell's label."""
-    model.set_cell(cell["tokens"])
+def _eligible(model, cell: dict) -> bool:
+    """Whether the cell can be evaluated: a classifier must predict its label, an encoder takes any cell."""
+    model.set_cell(cell["tokens"], cell["x"])
+    if not model.softmax:
+        return True
     with torch.no_grad():
         return int(model(torch.as_tensor(cell["x"]))[0].argmax()) == cell["label"]
 
 
+def _donor_order(idx: np.ndarray, donors, rng: np.random.Generator) -> np.ndarray:
+    """`idx` in the order cells are tried: donors in turn, each donor's cells in a seeded random order.
+
+    Without donors (None), a seeded random order of the cells.
+    """
+    if donors is None:
+        return rng.permutation(idx)
+    donors = np.asarray(donors)
+    names = rng.permutation(np.unique(donors))
+    queues = [rng.permutation(idx[donors == d]) for d in names]
+    rounds = max(len(q) for q in queues)
+    return np.array([q[r] for r in range(rounds) for q in queues if r < len(q)], dtype=idx.dtype)
+
+
+def _pick(model, candidates, n: int):
+    """The first n eligible cells of `candidates` (dicts, in order)."""
+    cells = []
+    for cell in candidates:
+        if _eligible(model, cell):
+            cells.append(cell)
+            if len(cells) == n:
+                break
+    return cells
+
+
 def _rank_cells(model: RankTokenClassifier, spec: dict, data_dir, n: int, rng: np.random.Generator):
-    """(cell type, slug, up to n correctly classified cells) of a Geneformer or scCello dataset."""
+    """(cell type, slug, up to n eligible cells) of a Geneformer or scCello dataset (no donor column)."""
     ds = rt._load_full_dataset_rank(data_dir, spec)
     for ct, slug, sub in rt._cell_type_subsets_geneformer(ds):
         pt = gf._to_inputs(sub)
-        cells = []
-        for i in rng.permutation(len(pt["input_ids"])):
-            ids = pt["input_ids"][i]
-            cell = {"idx": int(i), "label": int(pt["condition_labels"][i]), "tokens": ids,
-                    "x": ids.astype(np.float32)[None, None, :]}
-            if _is_correct(model, cell):
-                cells.append(cell)
-            if len(cells) == n:
-                break
-        yield ct, slug, cells
+        order = _donor_order(np.arange(len(pt["input_ids"])), None, rng)
+        candidates = ({"idx": int(i), "donor": "", "label": int(pt["condition_labels"][i]),
+                       "tokens": pt["input_ids"][i], "x": pt["input_ids"][i].astype(np.float32)[None, None, :]}
+                      for i in order)
+        yield ct, slug, _pick(model, candidates, n)
 
 
-def _scgpt_cells(model: ScGPTValueClassifier, vocab, data_dir, n: int, rng: np.random.Generator):
-    """(cell type, slug, up to n correctly classified cells) of a scGPT dataset.
+# ---------------------------------------------------------------------------
+# scGPT: FG of the four forms on the same cells, from the pipeline's IG
+# ---------------------------------------------------------------------------
+def _scgpt_cell_types(adata, vocab, max_cells):
+    """(cell type, slug, tokens, donors) of every cell type, tokenised exactly as the pipeline did.
 
-    Only a seeded sample of candidates (3n) is tokenised: binning the whole
-    cell type takes minutes and the evaluation needs a few dozen cells. Each
-    cell keeps its real tokens (no padding): <cls> and its expressed genes.
+    The whole cell type (or the pipeline's --max-cells-per-type subset) goes
+    through common._tokenise like in run_tasks.py, so the binned values and
+    the kept genes, and therefore the IG of cell_scores.npz, are the same.
     """
+    donor_col = dynamic.resolve_donor_column(adata, None)
+    for ct, slug, sub in rt._cell_type_subsets_scgpt(adata, None, max_cells):
+        pt = common._tokenise(sub, vocab)
+        yield ct, slug, pt, sub.obs[donor_col].astype(str).to_numpy(), sub.obs_names.to_numpy()
+
+
+def _shared_cells(results_dir: Path, slug: str, donors: np.ndarray, labels: np.ndarray, n: int,
+                  rng: np.random.Generator) -> np.ndarray:
+    """Positions (in the cell type) of the n cells every form is evaluated on.
+
+    Cells classified correctly by both classifiers (the `correct` the IG tasks
+    of the zero-shot + MLP and LoRA forms saved), spread over the donors
+    (_donor_order).
+    """
+    correct = np.ones(labels.size, dtype=bool)
+    for form in rt.CLASSIFIER_FORMS:
+        path = results_dir / f"ig_{form}_scgpt" / slug / "cell_scores.npz"
+        with np.load(path) as z:
+            if z["correct"].size != labels.size:
+                raise SystemExit(f"{path} has {z['correct'].size} cells, the cell type {labels.size}: "
+                                 "use the --max-cells-per-type of that run")
+            correct &= z["correct"]
+    order = _donor_order(np.arange(labels.size), donors, rng)
+    return order[correct[order]][:n]
+
+
+class _PipelineIG:
+    """The signed IG the pipeline saved for one form and cell type, cell by cell."""
+
+    def __init__(self, path: Path):
+        with np.load(path) as z:
+            self.cells, self.gids, self.ig = z["token_cells"], z["token_gids"], z["token_ig"]
+        self.ptr = np.searchsorted(self.cells, np.arange(self.cells.max() + 2))
+
+    def cell(self, i: int, gids: np.ndarray) -> np.ndarray:
+        """IG of every position of cell i (<cls> first, 0): `gids` must be its gene tokens."""
+        lo, hi = self.ptr[i], self.ptr[i + 1]
+        if not np.array_equal(self.gids[lo:hi], gids[1:]):
+            raise ValueError(f"cell {i}: the pipeline's IG tokens differ from the tokenised cell")
+        return np.concatenate([[0.0], self.ig[lo:hi]]).astype(np.float32)
+
+
+def _morf_curves(model, x: np.ndarray, target: int, attributions: dict, chunk: int) -> dict:
+    """The MoRF (deletion) curve of every attribution, computed in batches.
+
+    The same procedure as quantus.PixelFlipping (normalise=False,
+    perturb_baseline = model.remove_value): genes ordered by np.argsort(-a),
+    ceil(n / features_in_step) cumulative steps, each setting the next
+    features_in_step genes to the baseline, the output read after each step;
+    the output before any removal goes first. Quantus runs the steps one
+    forward at a time; here every step of every attribution is one input of a
+    batch of `chunk`.
+    """
+    n = x.shape[-1]
+    f = _features_in_step(n)
+    steps = math.ceil(n / f)
+    flat = x.reshape(-1)
+    inputs = [flat[None, :]]
+    for a in attributions.values():
+        order = np.argsort(-a.reshape(1, -1), axis=1)[0]
+        removed = np.zeros((steps, n), dtype=bool)
+        for k in range(steps):
+            removed[k:, order[k * f:(k + 1) * f]] = True
+        inputs.append(np.where(removed, np.float32(model.remove_value), flat[None, :]))
+    batch = np.concatenate(inputs).astype(np.float32)
+    outs = []
+    with torch.no_grad():
+        for start in range(0, len(batch), chunk):
+            out = model(torch.as_tensor(batch[start:start + chunk, None, :]))
+            out = torch.softmax(out, dim=1) if model.softmax else out
+            outs.append(out[:, target].float().cpu().numpy())
+    outs = np.concatenate(outs)
+    p0, rest = outs[0], outs[1:].reshape(len(attributions), steps)
+    return {m: np.concatenate([[p0], rest[j]]) for j, m in enumerate(attributions)}
+
+
+def _quantus_morf(model, x: np.ndarray, target: int, attributions: dict, device) -> dict:
+    """The same curves with quantus.PixelFlipping, step by step (to validate _morf_curves)."""
+    with torch.no_grad():
+        out = model(torch.as_tensor(x).to(model.device))
+        p0 = float((torch.softmax(out, dim=1) if model.softmax else out)[0, target])
+    curves = {}
+    for m, a in attributions.items():
+        metric = quantus.PixelFlipping(features_in_step=_features_in_step(x.shape[-1]),
+                                       perturb_baseline=model.remove_value, normalise=False,
+                                       disable_warnings=True, display_progressbar=False)
+        result = metric(model=model, x_batch=x, y_batch=np.array([target]), a_batch=a.copy(), device=str(device),
+                        channel_first=True, softmax=model.softmax)
+        curves[m] = np.concatenate([[p0], np.asarray(result[0], dtype=float)])
+        _free_quantus_models()
+    return curves
+
+
+def _auc(curve: np.ndarray) -> float:
+    return float(np.trapezoid(curve, np.linspace(0, 1, len(curve))))
+
+
+def run_scgpt(args) -> None:
+    """FG of the scGPT forms: per-cell IG (the pipeline's), random and the population rankings."""
+    data_dir = rt.DATASET_DIRS[args.dataset]
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    results_dir = args.results_dir / f"dataset_{args.dataset.lower()}"
+    rankings_dir = args.rankings_dir or args.results_dir
+    eval_dir = results_dir / "attribution_eval"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    vocab, model_configs = load_vocab(), load_model_configs()
+    names = rt._load_scgpt_gene_names(data_dir)
+    models = {}
+    for form in args.forms:
+        net = rt._load_scgpt(form, data_dir, vocab, model_configs, device)
+        cls = ScGPTValueClassifier if form in rt.CLASSIFIER_FORMS else ScGPTEmbeddingScorer
+        models[form] = cls(net, vocab, model_configs["nheads"]).eval()
+
+    rng = np.random.default_rng(SEED)
+    cells_csv = eval_dir / "cells.csv"
+    saved_cells = pd.read_csv(cells_csv) if cells_csv.exists() else None
     adata = rt._load_full_dataset_scgpt(data_dir)
-    values = adata.obs[C.CELL_TYPE_COL].astype(str).to_numpy()
-    for ct in sorted(set(values)):
-        idx = np.where(values == ct)[0]
-        cand = rng.permutation(idx)[:3 * n]
-        pt = common._tokenise(adata[np.sort(cand)].copy(), vocab)
-        cells = []
-        for j in range(len(cand)):
-            gids = pt["gene_ids"][j].numpy()
-            keep = gids != vocab[C.PAD_TOKEN]
-            cell = {"idx": int(np.sort(cand)[j]), "label": int(pt["condition_labels"][j]), "tokens": gids[keep],
-                    "x": pt["values"][j].numpy()[keep].astype(np.float32)[None, None, :]}
-            if _is_correct(model, cell):
-                cells.append(cell)
-            if len(cells) == n:
-                break
-        yield ct, common._slug_cell_type(ct), cells
+    for ct, slug, pt, donors, obs_names in _scgpt_cell_types(adata, vocab, args.max_cells_per_type):
+        labels = pt["condition_labels"].numpy()
+        # The same cells for every form, chosen once per dataset (cells.csv)
+        if saved_cells is not None and (saved_cells["cell_type"] == slug).any():
+            sel = saved_cells[saved_cells["cell_type"] == slug]["cell"].to_numpy()
+        else:
+            sel = _shared_cells(results_dir, slug, donors, labels, args.cells_per_type, rng)
+            rows = pd.DataFrame({"cell_type": slug, "cell": sel, "obs_name": obs_names[sel],
+                                 "donor": donors[sel], "label": labels[sel]})
+            saved_cells = rows if saved_cells is None else pd.concat([saved_cells, rows], ignore_index=True)
+            saved_cells.to_csv(cells_csv, index=False)
+        print(f"\n# scGPT {args.dataset} {ct}: {sel.size} cells from {np.unique(donors[sel]).size} donors",
+              flush=True)
+
+        for form, model in models.items():
+            out_dir = eval_dir / f"scgpt_{form}"
+            ct_csv = out_dir / "cells" / f"{slug}.csv"
+            if args.skip_done and ct_csv.exists():
+                print(f"  {form}: done ({ct_csv}), kept", flush=True)
+                continue
+            ct_csv.parent.mkdir(parents=True, exist_ok=True)
+            ig_scores = _PipelineIG(results_dir / f"ig_{form}_scgpt" / slug / "cell_scores.npz")
+            rankings = _ranking_methods("scgpt", form, rankings_dir, args.dataset, slug, names)
+            rows, curves_npz = [], {}
+            for i in progress(sel, desc=f"scgpt_{form} {slug}", unit="cell"):
+                i = int(i)
+                gids = pt["gene_ids"][i].numpy()
+                keep = gids != vocab[C.PAD_TOKEN]
+                tokens = gids[keep]
+                x = pt["values"][i].numpy()[keep].astype(np.float32)[None, None, :]
+                label = int(labels[i])
+                y = np.array([label])
+                model.set_cell(tokens, x)
+                ig = ig_scores.cell(i, tokens)
+                # Signed IG towards the true class for a classifier (as explain_ig), as saved for an encoder
+                if form in rt.CLASSIFIER_FORMS:
+                    ig = ig * (0.5 if label == 1 else -0.5)
+                attributions = {"ig": ig[None, None, :]}
+                np.random.seed(SEED + i)
+                attributions["random"] = scgpt_model.explain_random(model, x, y)
+                for method, explain in rankings.items():
+                    attributions[method] = explain(model, x, y)
+                start = time.perf_counter()
+                curves = (_quantus_morf(model, x, label, attributions, device) if args.engine == "quantus"
+                          else _morf_curves(model, x, label, attributions, args.chunk))
+                seconds = round((time.perf_counter() - start) / len(attributions), 3)
+                for method, curve in curves.items():
+                    rows.append({"cell_type": slug, "cell": i, "donor": donors[i], "label": label,
+                                 "n_tokens": x.shape[-1], "method": method, "deletion_auc": _auc(curve),
+                                 "curve_s": seconds})
+                    curves_npz[f"{slug}:{i}:{method}"] = curve
+            _add_fg(pd.DataFrame(rows)).to_csv(ct_csv, index=False)
+            np.savez_compressed(out_dir / "cells" / f"{slug}_curves.npz", **curves_npz)
+
+    # Per form: every cell type's rows, the mean FG per method and cell type, and over all cells
+    for form in args.forms:
+        out_dir = eval_dir / f"scgpt_{form}"
+        parts = sorted((out_dir / "cells").glob("*.csv"))
+        if not parts:
+            continue
+        cells_df = pd.concat([pd.read_csv(f) for f in parts], ignore_index=True)
+        cells_df.to_csv(out_dir / "curves.csv", index=False)
+        fg = cells_df.pivot_table(index="method", columns="cell_type", values="fg", aggfunc="mean")
+        fg["all"] = cells_df.groupby("method")["fg"].mean()
+        fg.to_csv(out_dir / "fg_by_cell_type.csv")
+        print(f"\n# scGPT {form} {args.dataset}: mean FG\n{fg.round(3).to_string()}", flush=True)
+
+
+def _ranking_methods(model_name: str, form: str, rankings_dir: Path, dataset: str, slug: str,
+                     names: dict) -> dict:
+    """{method: explain function} of the population rankings (score IG or IG±) of one form and cell type.
+
+    Every ranking the pipeline wrote for that cell type in `rankings_dir`; a
+    gene's score goes to every token named like it (`names`: token id ->
+    gene symbol, as the pipeline names them). IG± (mean_pd - mean_control of
+    the signed IG) is flipped for control cells only for an encoder: for a
+    classifier the IG is of the PD logit, so mean_pd(IG) - mean_control(IG)
+    already adds up both conditions' IG towards their true class.
+    """
+    tokens_of = {}
+    for gid, name in names.items():
+        tokens_of.setdefault(name, []).append(int(gid))
+    model_form = gs.FORMS[form][0]
+    results_dir = rankings_dir / f"dataset_{dataset.lower()}"
+    methods = {}
+    for method in gs.METHODS:
+        meta = gs.METHOD_META[method]
+        if (meta["model"], meta["model_form"]) != (model_name, model_form) or meta["score"] == "attention":
+            continue
+        path = results_dir / gs.ALL_SCORE_PATHS[method].format(ct=slug)
+        if not path.exists():
+            print(f"  ranking {method} missing ({path}), skipped", flush=True)
+            continue
+        df = pd.read_csv(path)
+        scores = {gid: float(score) for gene, score in zip(df["gene"].astype(str), df["score"])
+                  for gid in tokens_of.get(gene, [])}
+        methods[f"rank_{meta['score']}_{meta['ranking']}"] = scgpt_model.ranking_explainer(
+            scores, signed=meta["score"] == "igsigned" and form not in rt.CLASSIFIER_FORMS)
+    return methods
 
 
 def _metrics(n_tokens: int, remove_value: float) -> dict:
@@ -181,14 +456,15 @@ def _curve_scores(model, x: np.ndarray, y: np.ndarray, a: np.ndarray, device) ->
     """MoRF and LeRF curves of one explanation (PixelFlipping) and the scores derived from them."""
     n_tokens = x.shape[-1]
     with torch.no_grad():
-        p0 = float(torch.softmax(model(torch.as_tensor(x).to(model.device)), dim=1)[0, int(y[0])])
+        out = model(torch.as_tensor(x).to(model.device))
+        p0 = float((torch.softmax(out, dim=1) if model.softmax else out)[0, int(y[0])])
     curves = {}
     for order, attribution in (("morf", a), ("lerf", -a)):
         metric = quantus.PixelFlipping(features_in_step=_features_in_step(n_tokens),
                                        perturb_baseline=model.remove_value, normalise=False,
                                        disable_warnings=True, display_progressbar=False)
         result = metric(model=model, x_batch=x, y_batch=y, a_batch=attribution.copy(), device=str(device),
-                        channel_first=True, softmax=True)
+                        channel_first=True, softmax=model.softmax)
         curves[order] = np.concatenate([[p0], np.asarray(result[0], dtype=float)])
         _free_quantus_models()
     t = np.linspace(0, 1, len(curves["morf"]))
@@ -222,51 +498,67 @@ def _free_quantus_models() -> None:
     torch.cuda.empty_cache()
 
 
+def _add_fg(cells_df: pd.DataFrame) -> pd.DataFrame:
+    """FG of every row: 1 - deletion AUC / deletion AUC of random on the same cell."""
+    random_auc = (cells_df[cells_df["method"] == "random"].set_index(["cell_type", "cell"])["deletion_auc"])
+    ref = cells_df.set_index(["cell_type", "cell"]).index.map(random_auc.to_dict())
+    cells_df["fg"] = 1.0 - cells_df["deletion_auc"].to_numpy() / np.asarray(ref, dtype=float)
+    return cells_df
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--model", choices=["scgpt", *rt.RANK_MODELS], default="sccello")
+    p.add_argument("--model", choices=["scgpt", *rt.RANK_MODELS], default="scgpt")
+    p.add_argument("--forms", nargs="+", choices=rt.FORMS, default=list(rt.FORMS),
+                   help="scGPT forms, evaluated on the same cells (default: all four).")
+    p.add_argument("--form", choices=rt.CLASSIFIER_FORMS, default="lora", help="Geneformer / scCello classifier.")
     p.add_argument("--dataset", choices=["A", "B"], default="A")
-    p.add_argument("--cells-per-type", type=int, default=12)
-    p.add_argument("--methods", nargs="+", choices=list(rank_model.EXPLAIN_FUNCS),
-                   default=list(rank_model.EXPLAIN_FUNCS))
-    p.add_argument("--metrics", nargs="+", default=None, help="Subset of the metric names (default: all).")
-    p.add_argument("--curves", action="store_true",
-                   help="Only the MoRF/LeRF curves and the scores derived from them (curves.csv).")
+    p.add_argument("--cells-per-type", type=int, default=CELLS_PER_TYPE)
+    p.add_argument("--max-cells-per-type", type=int, default=None,
+                   help="scGPT: the --max-cells-per-type of the pipeline run whose IG and rankings are read.")
+    p.add_argument("--engine", choices=["batch", "quantus"], default="batch",
+                   help="scGPT deletion curves: batched (default) or quantus.PixelFlipping step by step.")
+    p.add_argument("--chunk", type=int, default=64, help="scGPT: perturbed inputs per forward pass.")
+    p.add_argument("--skip-done", action="store_true", help="scGPT: keep the (form, cell type) already written.")
+    p.add_argument("--rankings-dir", type=Path, default=None,
+                   help="Results root holding the rankings (default: --results-dir).")
+    p.add_argument("--methods", nargs="+", choices=list(rank_model.EXPLAIN_FUNCS), default=["ig", "random"],
+                   help="Geneformer / scCello explanations.")
+    p.add_argument("--metrics", nargs="+", default=None, help="Geneformer / scCello: subset of the metric names.")
+    p.add_argument("--curves", action="store_true", help="Geneformer / scCello: only the MoRF/LeRF curves.")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--results-dir", type=Path, default=HERE / "results")
     args = p.parse_args()
     warnings.filterwarnings("ignore")
+    if args.model == "scgpt":
+        run_scgpt(args)
+        return
 
+    # Geneformer and scCello: one classifier, its own correctly classified cells, every Quantus metric
+    methods = list(dict.fromkeys(args.methods + ["random"]))
     data_dir = rt.DATASET_DIRS[args.dataset]
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     rng = np.random.default_rng(SEED)
-    if args.model == "scgpt":
-        vocab, model_configs = load_vocab(), load_model_configs()
-        net = common._load_lora_model(data_dir / rt.LORA_FULL_MODEL_SCGPT, vocab, model_configs, device)
-        model = ScGPTValueClassifier(net, vocab, model_configs["nheads"]).eval()
-        explain_funcs = scgpt_model.EXPLAIN_FUNCS
-        cell_types = _scgpt_cells(model, vocab, data_dir, args.cells_per_type, rng)
-    else:
-        spec = rt.RANK_MODELS[args.model]
-        token_dict = load_token_dictionary(spec["token_dict"])
-        model = RankTokenClassifier(rt._load_lora_rank(spec, data_dir, device), token_dict, spec["emb_layer"])
-        model.eval()
-        explain_funcs = rank_model.EXPLAIN_FUNCS
-        cell_types = _rank_cells(model, spec, data_dir, args.cells_per_type, rng)
-    out_dir = args.results_dir / f"dataset_{args.dataset.lower()}" / "attribution_eval" / args.model
+    spec = rt.RANK_MODELS[args.model]
+    token_dict = load_token_dictionary(spec["token_dict"])
+    model = RankTokenClassifier(rt._load_rank(spec, args.form, data_dir, device), token_dict, spec["emb_layer"])
+    model.eval()
+    cell_types = _rank_cells(model, spec, data_dir, args.cells_per_type, rng)
+    tag = f"{args.model}_{args.form}"
+    out_dir = args.results_dir / f"dataset_{args.dataset.lower()}" / "attribution_eval" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows, all_curves = [], {}
     for ct, slug, cells in cell_types:
-        print(f"\n# {args.model} {args.dataset} {ct}: {len(cells)} correctly classified cells", flush=True)
-        for cell in progress(cells, desc=f"{args.model} {slug}", unit="cell"):
+        print(f"\n# {tag} {args.dataset} {ct}: {len(cells)} cells, {len(methods)} methods", flush=True)
+        for cell in progress(cells, desc=f"{tag} {slug}", unit="cell"):
             i, label, x = cell["idx"], cell["label"], cell["x"]
             n_tokens = x.shape[-1]
-            model.set_cell(cell["tokens"])
+            model.set_cell(cell["tokens"], x)
             model._target = label
             y = np.array([label])
-            for method in args.methods:
-                explain = explain_funcs[method]
+            for method in methods:
+                explain = rank_model.EXPLAIN_FUNCS[method]
                 np.random.seed(SEED + i)
                 torch.manual_seed(SEED + i)
                 a = explain(model, x, y)
@@ -294,8 +586,10 @@ def main():
 
     cells_df = pd.DataFrame(rows)
     if args.curves:
+        cells_df = _add_fg(cells_df)
+        cells_df.to_csv(out_dir / "curves.csv", index=False)
         np.savez_compressed(out_dir / "curves.npz", **all_curves)
-        summary = cells_df.groupby("method")[CURVE_SCORES].agg(["mean", "sem"])
+        summary = cells_df.groupby("method")[["fg", *CURVE_SCORES]].agg(["mean", "sem"])
         summary.to_csv(out_dir / "curves_summary.csv")
         print(summary.round(4).to_string(), flush=True)
         return
@@ -304,8 +598,6 @@ def main():
     summary = cells_df.groupby("method")[scores].agg(["mean", "sem"])
     summary.to_csv(out_dir / "summary.csv")
     print(summary.round(4).to_string(), flush=True)
-    print(f"\nseconds per cell and metric:\n{cells_df.groupby('method')[[f'{s}_s' for s in scores]].mean().round(2)}",
-          flush=True)
 
 
 if __name__ == "__main__":

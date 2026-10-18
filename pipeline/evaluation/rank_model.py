@@ -19,7 +19,6 @@ Explanations (Quantus `explain_func`), one value per position, 0 on the
 special tokens:
   - ig: Integrated Gradients of the target logit w.r.t. the token embeddings
     (the pipeline's IG of z, times +1/2 for PD and -1/2 for control), signed.
-  - ig_abs: |ig|, the per-cell quantity the pipeline's IG ranking averages.
   - attention: the CLS attention of the block that outputs the cell
     embedding, rank-normalised and averaged over heads (the pipeline's
     attention), the same for both targets.
@@ -38,7 +37,9 @@ from ..steps.step7_explainability_ig_scgpt import IG_STEPS
 
 
 class RankTokenClassifier(nn.Module):
-    """A LoRA GeneformerClassifier (Geneformer or scCello) taking a cell's token ids as floats."""
+    """A GeneformerClassifier (Geneformer or scCello, zero-shot + MLP or LoRA) taking a cell's token ids as floats."""
+
+    softmax = True
 
     def __init__(self, classifier: nn.Module, token_dict: dict, emb_layer: int):
         super().__init__()
@@ -53,7 +54,7 @@ class RankTokenClassifier(nn.Module):
         """What a removed gene becomes (Quantus' perturb_baseline): the <mask> token."""
         return self.mask_id
 
-    def set_cell(self, ids: np.ndarray) -> None:
+    def set_cell(self, ids: np.ndarray, x=None) -> None:
         """The cell being explained: its special tokens are restored in every perturbed copy."""
         self.cell = np.asarray(ids, dtype=np.int64)
         self.special_pos = np.where(np.isin(self.cell, self.special_ids))[0]
@@ -92,11 +93,6 @@ def explain_ig(model: RankTokenClassifier, inputs, targets, n_steps: int = IG_ST
     return _zero_specials(model, ig_z * sign).reshape(np.shape(inputs)).astype(np.float32)
 
 
-def explain_ig_abs(model: RankTokenClassifier, inputs, targets, n_steps: int = IG_STEPS, **kwargs) -> np.ndarray:
-    """|IG| of every position: how much each gene moves the logit, whatever the direction."""
-    return np.abs(explain_ig(model, inputs, targets, n_steps))
-
-
 def explain_attention(model: RankTokenClassifier, inputs, targets, **kwargs) -> np.ndarray:
     """CLS attention of every position of every input (B, 1, L), as the pipeline computes it."""
     ids = model.token_ids(inputs)
@@ -111,8 +107,7 @@ def explain_random(model: RankTokenClassifier, inputs, targets, **kwargs) -> np.
     return _zero_specials(model, a).reshape(np.shape(inputs))
 
 
-EXPLAIN_FUNCS = {"ig": explain_ig, "ig_abs": explain_ig_abs, "attention": explain_attention,
-                 "random": explain_random}
+EXPLAIN_FUNCS = {"ig": explain_ig, "attention": explain_attention, "random": explain_random}
 
 
 def mask_tokens(arr: np.ndarray, indices: np.ndarray, mask_id: int, fraction: float = 0.02,

@@ -17,7 +17,7 @@ failed.
 
   venv/bin/python scripts/check_run.py
   venv/bin/python scripts/check_run.py --datasets A --max-cells-per-type 200
-  venv/bin/python scripts/check_run.py --models scgpt --results-dir results/scgpt   # a --task scgpt run
+  venv/bin/python scripts/check_run.py --models scgpt --scores ig igsigned --results-dir results/scgpt
   venv/bin/python scripts/check_run.py --forms zero-shot lora                       # a run before the MLP / Step 2.5 forms
 
 --max-cells-per-type and --distances must match the run being checked.
@@ -79,7 +79,13 @@ def _read_json(path: Path):
 DATASET_SCOPE = {"A+B": {("geneformer", "zero-shot")}}
 # Models and model forms the checked run covers (--models, --forms)
 MODEL_FORMS = [mf for mf, _ in FORMS.values()]
-SCOPE = {"models": list(MODELS), "forms": list(MODEL_FORMS)}
+SCORES = ["attention", "ig", "igsigned"]
+SCOPE = {"models": list(MODELS), "forms": list(MODEL_FORMS), "scores": list(SCORES), "post": "all"}
+
+
+def _score_of(name: str) -> str:
+    """Score of a task, results folder or method name (attention, ig or igsigned)."""
+    return name.split("_", 1)[0]
 
 
 def _in_scope(dataset: str, model: str, model_form: str) -> bool:
@@ -89,7 +95,8 @@ def _in_scope(dataset: str, model: str, model_form: str) -> bool:
 
 
 def _methods(dataset: str) -> list:
-    return [m for m in METHODS if _in_scope(dataset, METHOD_META[m]["model"], METHOD_META[m]["model_form"])]
+    return [m for m in METHODS if _in_scope(dataset, METHOD_META[m]["model"], METHOD_META[m]["model_form"])
+            and METHOD_META[m]["score"] in SCOPE["scores"]]
 
 
 def _task_scope(task: str) -> tuple:
@@ -103,8 +110,9 @@ def _tasks(dataset: str) -> list:
     """Model, OLS and post-hoc tasks a dataset's run should have."""
     if dataset in DATASET_SCOPE:
         return ["attention_geneformer", "attention_residualized_ols_geneformer", "postprocess"]
-    return [t for t in list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS) if _in_scope(dataset, *_task_scope(t))] \
-        + ["postprocess"]
+    post = ["postprocess"] if SCOPE["post"] == "all" else ["gwas_similarity"]
+    return [t for t in list(rt.MODEL_TASKS) + list(rt.DERIVED_TASKS)
+            if _in_scope(dataset, *_task_scope(t)) and _score_of(t) in SCOPE["scores"]] + post
 
 
 def check_logs(log_dirs: list, datasets: list, rep: Report) -> None:
@@ -170,7 +178,7 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
     data_dir = rt.DATASET_DIRS[dataset]
     rows, expected = [], {}
     for model, form, folder, ols_folder in SCORE_FOLDERS:
-        if not _in_scope(dataset, model, form):
+        if not _in_scope(dataset, model, form) or _score_of(folder) not in SCOPE["scores"]:
             continue
         if model not in expected:
             counts = rt._cell_type_counts(f"attention_{model}", data_dir, max_cells)
@@ -258,7 +266,9 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
         # Enrichment: one significant-terms CSV per gene set, counted in manifest.csv
         enr_dir = output_dir(results_dir, "enrichment", selection)
         manifest = enr_dir / "manifest.csv"
-        if not manifest.exists():
+        if SCOPE["post"] != "all":
+            pass
+        elif not manifest.exists():
             rep.fail(f"{selection}: {manifest} missing")
         else:
             m = pd.read_csv(manifest)
@@ -271,7 +281,7 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
             no_terms = int((m["n_significant_terms"] == 0).sum())
             print(f"  {selection}: enrichment of {len(m)} gene sets, {no_terms} without significant terms")
 
-        for name in ["summary_table.csv", "pairwise_tests.csv"]:
+        for name in ["summary_table.csv", "pairwise_tests.csv"] if SCOPE["post"] == "all" else []:
             if not (output_dir(results_dir, "enrichment_summary", selection) / name).exists():
                 rep.fail(f"{selection}: enrichment_summary/{name} missing")
 
@@ -289,6 +299,8 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
             if n_nan:
                 rep.warn(f"{selection}: {n_nan} NaN GO3 similarities")
 
+        if SCOPE["post"] != "all":
+            continue
         # Gene matrices: one per (cell type, PD reference, distance, ontology)
         gm_dir = output_dir(results_dir, "gene_matrix", selection)
         for name in ["summary_statistics.csv", "method_gene_annotation.csv"]:
@@ -305,7 +317,7 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
             for name in PLOTS_PER_SELECTION:
                 if not plot_path(results_dir, f"{name}_{model}", selection).exists():
                     rep.fail(f"plot {plot_path(results_dir, f'{name}_{model}', selection).name} missing")
-    for model in [m for m in MODELS if any(_in_scope(dataset, m, f) for f in MODEL_FORMS)]:
+    for model in [m for m in MODELS if SCOPE["post"] == "all" and any(_in_scope(dataset, m, f) for f in MODEL_FORMS)]:
         for name in PLOTS_FIXED:
             if not (results_dir / "plots" / f"{name}_{model}.png").exists():
                 rep.fail(f"plot {name}_{model}.png missing")
@@ -326,8 +338,12 @@ def main():
                    help="Models the run covers (default: all; scgpt for a --task scgpt run).")
     p.add_argument("--forms", nargs="+", choices=MODEL_FORMS, default=MODEL_FORMS,
                    help="Model forms the run covers (default: all).")
+    p.add_argument("--post", choices=["all", "gwas"], default="all",
+                   help="Post-hoc outputs to check: every one, or gwas_similarity only (SimPD).")
+    p.add_argument("--scores", nargs="+", choices=SCORES, default=SCORES,
+                   help="Scores the run covers (default: all; ig igsigned for the scGPT study).")
     args = p.parse_args()
-    SCOPE.update(models=args.models, forms=args.forms)
+    SCOPE.update(models=args.models, forms=args.forms, scores=args.scores, post=args.post)
 
     rep = Report()
     if not args.no_logs:

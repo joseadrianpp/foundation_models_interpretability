@@ -13,7 +13,13 @@
 #   STAGES       any of: model ols post (default: all three). model: the model
 #                tasks (GPU); ols: every OLS task (CPU, from the model tasks'
 #                output); post: the post-hoc analyses (CPU)
-#   MODEL_TASKS  model tasks of the model stage (default: all nine, every model)
+#   MODEL_TASKS  model tasks of the model stage (default: the nine of the zero-shot
+#                and LoRA forms of every model)
+#   OLS_TASKS    OLS tasks of the ols stage (default: the nine of those forms)
+#   POST_TASKS   post-hoc tasks of the post stage, in order (default: postprocess,
+#                i.e. every one; e.g. "gwas_similarity" for SimPD only)
+#   RESULTS_DIR  results root, results/dataset_<x> inside it (default: results;
+#                results/scgpt for the scGPT study)
 #   SKIP_DONE    1: model tasks keep the cell types an earlier run finished
 #                (--skip-done); IG resumes from its checkpoint either way
 #   DISTANCES    GO term similarities for the post-hoc tasks (default: lin SimRel wang)
@@ -31,15 +37,17 @@ STAGES=${STAGES:-"model ols post"}
 MODEL_TASKS=${MODEL_TASKS:-"attention_scgpt attention_lora_scgpt ig_lora_scgpt
   attention_geneformer attention_lora_geneformer ig_lora_geneformer
   attention_sccello attention_lora_sccello ig_lora_sccello"}
-OLS_TASKS="attention_residualized_ols_scgpt attention_residualized_ols_lora_scgpt ig_residualized_ols_lora_scgpt
+OLS_TASKS=${OLS_TASKS:-"attention_residualized_ols_scgpt attention_residualized_ols_lora_scgpt ig_residualized_ols_lora_scgpt
   attention_residualized_ols_geneformer attention_residualized_ols_lora_geneformer ig_residualized_ols_lora_geneformer
-  attention_residualized_ols_sccello attention_residualized_ols_lora_sccello ig_residualized_ols_lora_sccello"
+  attention_residualized_ols_sccello attention_residualized_ols_lora_sccello ig_residualized_ols_lora_sccello"}
+POST_TASKS=${POST_TASKS:-postprocess}
+RESULTS_DIR=${RESULTS_DIR:-results}
 DISTANCES=${DISTANCES:-"lin SimRel wang"}
 LOG_DIR=${LOG_DIR:-logs}
 SKIP=""
 [ "${SKIP_DONE:-0}" = 1 ] && SKIP="--skip-done"
 mkdir -p "$LOG_DIR"
-RUN="$PYTHON -u run_tasks.py"
+RUN="$PYTHON -u run_tasks.py --results-dir $RESULTS_DIR"
 stamp() { echo "$(date '+%F %T') $*" | tee -a "$LOG_DIR/run_full.log"; }
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
 
@@ -66,12 +74,18 @@ ols() {  # $1 = dataset
 }
 
 post() {  # $1 = dataset
-  stamp "start $1 postprocess (distances: $DISTANCES) -> $LOG_DIR/$1_postprocess.log"
-  $RUN --task postprocess --dataset $1 --distances $DISTANCES > "$LOG_DIR/$1_postprocess.log" 2>&1
-  stamp "end $1 postprocess (exit $?)"
+  for T in $POST_TASKS; do
+    stamp "start $1 $T (distances: $DISTANCES) -> $LOG_DIR/$1_$T.log"
+    if [ "$T" = gwas_similarity ] || [ "$T" = gene_matrix ] || [ "$T" = postprocess ]; then
+      $RUN --task $T --dataset $1 --distances $DISTANCES > "$LOG_DIR/$1_$T.log" 2>&1
+    else
+      $RUN --task $T --dataset $1 > "$LOG_DIR/$1_$T.log" 2>&1
+    fi
+    stamp "end $1 $T (exit $?)"
+  done
 }
 
-stamp "datasets: $DATASETS; stages: $STAGES"
+stamp "datasets: $DATASETS; stages: $STAGES; results: $RESULTS_DIR"
 # The post-hoc tasks of a dataset run in the background, next to the model
 # tasks of the next one; two of them never run at once (they share the GO3 cache)
 POST_PID=""

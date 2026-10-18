@@ -59,8 +59,9 @@ def genes_hash(genes: Sequence[str]) -> str:
 
 
 def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = None,
-                     model_forms: Sequence[str] = DEFAULT_MODEL_FORMS) -> pd.DataFrame:
-    """One row per existing gene list, indexed by KEY.
+                     model_forms: Sequence[str] = DEFAULT_MODEL_FORMS,
+                     models: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """One row per existing gene list, indexed by KEY (of `models`, default every model).
 
     Besides KEY: method, selection, model and cell_type (gene_sets.py names),
     results_dir (the dataset's results folder), gene_list (path) and genes
@@ -71,7 +72,7 @@ def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = Non
     for dataset, results_dir in dataset_dirs(results_root, datasets).items():
         for method in gs.METHODS:
             meta = gs.METHOD_META[method]
-            if meta["model_form"] not in model_forms:
+            if meta["model_form"] not in model_forms or (models is not None and meta["model"] not in models):
                 continue
             for selection in gs.GENE_LIST_PATHS[method]:
                 for cell_type in gs.CELL_TYPES:
