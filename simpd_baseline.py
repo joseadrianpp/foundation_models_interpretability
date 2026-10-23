@@ -4,7 +4,9 @@
 SimPD of a gene set (as pipeline/macrotable/columns/similarity.py): per
 reference, the GO3 set-level BMA similarity (SimRel) in BP, CC and MF,
 averaged over the three; then PD GWAS + PanelApp + ParkinsonsUK-UCL minus
-Alzheimer + kidney + CAD.
+Alzheimer + kidney + CAD. As in gwas_similarity, genes without an
+informative GO annotation in an ontology (of the set or of the reference)
+are left out of its BMA, so a random set is scored like an observed one.
 
 Two nulls per gene set of one dataset and cell type, --draws random sets
 each (seed 42), drawn from the cell type's universe (every gene the scGPT
@@ -77,22 +79,30 @@ def _universe(results_dir: Path, cell_type: str) -> list:
 class SetScorer:
     """SimPD of gene sets of one universe (indices into it), from the gene x reference similarities."""
 
-    def __init__(self, universe: list, refs: dict, pms: dict):
-        self.blocks, self.best = {}, {}
+    def __init__(self, universe: list, refs: dict, pms: dict, annotated: dict):
+        self.blocks, self.best, self.known = {}, {}, {}
         for o in ONTOLOGIES:
+            ann = annotated[f"GO:{o}"]
+            # Universe genes with an informative annotation in the ontology: only they enter the BMA
+            self.known[o] = np.array([g in ann for g in universe])
             rows = np.array([pms[o]._gi[g] for g in universe])
             for r, genes in refs.items():
-                block = pms[o].values[np.ix_(rows, [pms[o]._ri[g] for g in genes])]
+                block = pms[o].values[np.ix_(rows, [pms[o]._ri[g] for g in genes if g in ann])]
                 self.blocks[(o, r)] = block
-                # Each universe gene's best match in the reference (one half of the BMA)
-                self.best[(o, r)] = block.max(axis=1)
+                # Each universe gene's best match in the reference (one half of the BMA);
+                # a reference without annotated genes has none, and its BMA is NaN
+                self.best[(o, r)] = block.max(axis=1) if block.shape[1] else None
 
     def simpd(self, pick: np.ndarray) -> float:
         out = 0.0
         for r, sign in SIGN.items():
-            # BMA as g3c.bma: best matches of the set's genes and of the reference's genes
-            sims = [(self.best[(o, r)][pick].sum() + self.blocks[(o, r)][pick].max(axis=0).sum())
-                    / (pick.size + self.blocks[(o, r)].shape[1]) for o in ONTOLOGIES]
+            sims = []
+            for o in ONTOLOGIES:
+                # BMA as g3c.bma over the set's annotated genes; a set without any gives NaN there
+                known = pick[self.known[o][pick]]
+                block = self.blocks[(o, r)]
+                sims.append((self.best[(o, r)][known].sum() + block[known].max(axis=0).sum())
+                            / (known.size + block.shape[1]) if known.size and block.shape[1] else np.nan)
             out += sign * float(np.nanmean(sims))
         return out
 
@@ -134,13 +144,14 @@ def run(results_root: Path, dataset: str, draws: int) -> None:
     all_refs = sorted({g for genes in refs.values() for g in genes})
     cache_dir = g3c.pair_cache_dir(results_dir)
     pms = {o: g3c.pair_similarities(all_genes, all_refs, o, "SimRel", counter, cache_dir) for o in ONTOLOGIES}
+    annotated = g3c.gaf_symbols_by_go_source()
 
     # Both nulls of every observed set: draws[(method, selection, cell type)][null] = (draws,) SimPD
     null_draws, rows = {}, []
     for i, ct in enumerate(gs.CELL_TYPES):
         universe = universes[ct]
         index = {g: k for k, g in enumerate(universe)}
-        scorer = SetScorer(universe, refs, pms)
+        scorer = SetScorer(universe, refs, pms, annotated)
         bins = _detection_bins(results_dir, ct, universe)
         members = [np.where(bins == b)[0] for b in range(N_BINS)]
         uniform = {}
