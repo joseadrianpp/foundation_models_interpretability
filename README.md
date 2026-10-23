@@ -47,7 +47,7 @@ These read the gene sets produced above; run them after the model and OLS tasks,
 |---|---|---|
 | `enrichment` | g:Profiler GO/KEGG/REAC enrichment | `enrichment/` |
 | `enrichment_summary` | term-count/IC/functional abundance stats + pairwise Mann-Whitney tests over the enrichment above | `enrichment_summary/` |
-| `gwas_similarity` | GO3 gene-level similarity (lin/SimRel/wang or any other distance) vs GWAS Catalog PD/AD/CAD/kidney gene sets and the PanelApp and ParkinsonsUK-UCL PD panels | `gwas_similarity/` |
+| `gwas_similarity` | GO3 gene-level similarity (lin/SimRel/wang or any other distance) vs GWAS Catalog PD/AD/CAD/kidney gene sets and the PanelApp and ParkinsonsUK-UCL PD panels; genes without an informative GO annotation in the ontology (none, or only NOT or ND ones) are left out, not counted as 0 | `gwas_similarity/` |
 | `gene_matrix` | gene x gene GO3 similarity matrices vs the Parkinson references (GWAS, PanelApp, ParkinsonsUK-UCL) | `gene_matrix/` |
 | `plots` | the comparison figures of the tasks above, one per model | `plots/` |
 
