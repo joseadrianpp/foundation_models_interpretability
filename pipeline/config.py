@@ -91,6 +91,13 @@ LABEL_NORMALISE = {
 }
 LABEL_TO_INT = {"control": 0, "pd": 1}
 
+# Every per-gene mean (attention, |IG|) is taken over the cells of the group
+# (condition, stratum, donor) that have the gene, so it measures the gene where
+# it is expressed and not how many cells express it. A mean over too few cells
+# is noise, so a gene gets one only if at least this fraction of the group's
+# cells has it (the rule of pipeline_unified's present-only rankings)
+MIN_PRESENT_FRAC = 0.05
+
 # scGPT special tokens (must mirror the original training run)
 PAD_TOKEN = "<pad>"
 SPECIAL_TOKENS = [PAD_TOKEN, "<cls>", "<eoc>"]

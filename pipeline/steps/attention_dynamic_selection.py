@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
+from pipeline import config as C
 from pipeline.steps import attention_cssi_leiden as cssi
 
 TOP_N = 30
@@ -153,9 +154,10 @@ def validate_donor_labels(donor_ids: np.ndarray, labels: np.ndarray):
     return donors, donor_labels
 
 
-# Donor x gene mean attention over the cells in `cell_mask`. A donor's mean is
-# over all its cells (a cell without the gene adds 0); donors without cells in
-# the mask get a NaN row, which the Cohen's d below skips
+# Donor x gene mean attention over the cells in `cell_mask` that have the gene.
+# A donor's mean needs the gene in at least C.MIN_PRESENT_FRAC of its cells;
+# below it, and for donors without cells in the mask, it is NaN, which the
+# Cohen's d below skips
 def _donor_gene_means(cache: cssi.AttentionCache, donor_idx: np.ndarray, n_donors: int,
                       cell_mask: Optional[np.ndarray] = None) -> np.ndarray:
     n_genes = cache.genes.size
@@ -163,11 +165,12 @@ def _donor_gene_means(cache: cssi.AttentionCache, donor_idx: np.ndarray, n_donor
     tokens = cells[cache.token_cells]
     key = donor_idx[cache.token_cells[tokens]].astype(np.int64) * n_genes + cache.gene_idx[tokens]
     sums = np.bincount(key, weights=cache.attn[tokens], minlength=n_donors * n_genes)
+    cells_with_gene = np.bincount(key, minlength=n_donors * n_genes).reshape(n_donors, n_genes)
     n_cells = np.bincount(donor_idx[cells], minlength=n_donors).astype(float)
     return np.divide(
-        sums.reshape(n_donors, n_genes), n_cells[:, None],
+        sums.reshape(n_donors, n_genes), cells_with_gene,
         out=np.full((n_donors, n_genes), np.nan),
-        where=n_cells[:, None] > 0,
+        where=(cells_with_gene > 0) & (cells_with_gene >= C.MIN_PRESENT_FRAC * n_cells[:, None]),
     )
 
 
