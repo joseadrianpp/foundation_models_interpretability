@@ -8,6 +8,9 @@ available), the single value per reference of the table specification.
 SimPD: SimPDGWAS + SimPDGE + SimPDGO - SimAD - SimKidney - SimCAD, the
 similarity to the three PD references net of the three control diseases
 (NaN if any of the six is missing).
+Column order: the six Sim<R>, then SimPD, then the per-ontology columns
+(these stay in parts/similarity.csv only; build.py leaves them out of the
+macrotable).
 Further distances add a suffix (Sim<R>_<distance>, Sim<R>_<O>_<distance>).
 A reference the gwas_similarity task did not compute yet gives NaN columns,
 so the table keeps the same columns.
@@ -38,6 +41,11 @@ def _columns(distances: list) -> dict:
     return cols
 
 
+def per_ontology_columns(distances: list) -> list:
+    """The Sim<R>_<O> columns, which only the similarity part keeps."""
+    return list(_columns(distances).values())
+
+
 def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     cols = _columns(settings.distances)
     sims = {}
@@ -56,10 +64,10 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     means = {f"Sim{label}{_suffix(settings.distances, dist)}":
              per_ontology[[f"Sim{label}_{ont}{_suffix(settings.distances, dist)}" for ont in ONTOLOGIES]].mean(axis=1)
              for dist in settings.distances for label in REFERENCES}
-    # PD references minus the control diseases, first among the similarity columns
+    # PD references minus the control diseases, after the six references
     net = {}
     for dist in settings.distances:
         sim = lambda label: means[f"Sim{label}{_suffix(settings.distances, dist)}"]
         net[f"SimPD{_suffix(settings.distances, dist)}"] = (sim("PDGWAS") + sim("PDGE") + sim("PDGO")
                                                             - sim("AD") - sim("Kidney") - sim("CAD"))
-    return pd.concat([pd.DataFrame(net), pd.DataFrame(means), per_ontology], axis=1)
+    return pd.concat([pd.DataFrame(means), pd.DataFrame(net), per_ontology], axis=1)

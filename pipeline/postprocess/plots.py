@@ -45,7 +45,8 @@ def _family(method: str) -> tuple:
 RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a"}
 RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS"}
 FORM_SHORT = {"zero-shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "MLP", "lora": "LoRA"}
-SCORE_SHORT = {"attention": "attn.", "ig": "IG", "igsigned": "IG±"}
+SCORE_SHORT = {"attention": "attn.", "ig": "IG", "igsigned": "IG±", "rollout": "roll.", "rolloutsigned": "roll.±",
+               "gradrollout": "g.roll.", "gradrolloutsigned": "g.roll.±"}
 ZERO_SHOT_ATTENTION = ("zero-shot", "attention")
 _HATCHES = ["////", "xxxx", "....", "\\\\", "++++", "oo", "**", "||||", "----", "O.", "x.", "/.", "+.", "\\."]
 _FAMILIES = [f for f in dict.fromkeys(_family(m) for m in METHODS) if f != ZERO_SHOT_ATTENTION]

@@ -60,6 +60,7 @@ from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.steps import step7_attention_residualized_ols as residualized_ols
 from pipeline.steps import step7_explainability_ig_geneformer as ig_gf
 from pipeline.steps import step7_explainability_ig_scgpt as ig
+from pipeline.steps import rollout_scgpt as rollout
 from pipeline.utils import progress
 from pipeline.utils.geneformer_model import (EMB_HIDDEN_LAYER, SCCELLO_EMB_HIDDEN_LAYER,
                                              load_gene_names, load_token_dictionary)
@@ -97,6 +98,11 @@ IG_FORMS = {"scgpt": FORMS}
 # The two scores of one IG run: IG (mean |IG|, as JA's IG and SIGnature) and
 # IG± (signed IG, PD - control), in ig_<form>_<model>/ and igsigned_<form>_<model>/
 IG_SCORES = ("ig", "igsigned")
+# The two scores of scGPT's attention rollout (rollout_scgpt), written like IG's:
+# rollout (mean) in rollout_<form>_scgpt/, rollout± (PD - control) in rolloutsigned_<form>_scgpt/
+ROLLOUT_SCORES = ("rollout", "rolloutsigned")
+# Gradient-weighted rollout (Chefer et al. 2021): gradrollout_<form>_scgpt/, gradrolloutsigned_<form>_scgpt/
+GRAD_ROLLOUT_SCORES = ("gradrollout", "gradrolloutsigned")
 FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "zero-shot + MLP", "lora": "LoRA"}
 # Forms with the same cell embeddings (the MLP head sits on the frozen zero-shot
 # encoder), which therefore share their Leiden strata
@@ -158,7 +164,7 @@ def _task_name(score: str, form: str, name: str) -> str:
 def _strata_dirs(results_dir: Path, name: str, form: str, slug: str) -> list:
     """Output folders of the forms with the same embeddings, where saved Leiden strata are looked for."""
     return [results_dir / f"{score}_{f}_{name}" / slug for f in SAME_EMBEDDING[form]
-            for score in ("attention", *IG_SCORES)]
+            for score in ("attention", *IG_SCORES, *ROLLOUT_SCORES, *GRAD_ROLLOUT_SCORES)]
 
 
 def _write_top_n(score_map: dict, out_csv: Path, n: int = TOP_N) -> None:
@@ -657,6 +663,85 @@ def task_ig_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.de
     torch.cuda.empty_cache()
 
 
+def task_rollout_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.device,
+                       cell_types=None, opts=None, kind: str = "rollout") -> None:
+    """Attention rollout of one scGPT form: scores rollout and rollout± (kind="rollout"),
+    or gradient-weighted rollout: gradrollout and gradrollout± (kind="gradrollout").
+
+    The cells are those of the form's IG: every cell for the encoders without
+    a head (zero-shot, Step 2.5), the correctly classified ones for the
+    classifiers. Plain rollout does not see the head, so the zero-shot + MLP
+    form's is the zero-shot one (run rollout_zero_shot_scgpt first) on the
+    cells the MLP classifies correctly (read from ig_mlp_scgpt/<cell
+    type>/cell_scores.npz). The gradient-weighted rollout follows the output
+    the form's IG explains (PD logit towards the true class, or SIGnature's),
+    so it is computed for every form.
+    """
+    opts = {**DEFAULT_OPTS, **(opts or {})}
+    scale = _batch_scale(device, opts)
+    task = _task_name(kind, form, "scgpt")
+    grad = kind == "gradrollout"
+    reuse_zero_shot = form == "mlp" and not grad
+    vocab, model_configs = load_vocab(), load_model_configs()
+    gene_names = _load_scgpt_gene_names(data_dir)
+    adata = _load_full_dataset_scgpt(data_dir)
+    model = None
+    if not reuse_zero_shot:
+        print(f"[{device}] loading {FORM_LABELS[form]} model...", flush=True)
+        model = _load_scgpt(form, data_dir, vocab, model_configs, device)
+
+    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
+        print(f"\n=== {task} | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
+        out_dir = results_dir / task / slug
+        signed_dir = results_dir / f"{kind}signed_{form}_scgpt" / slug
+        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form), max_seq_len=C.MAX_SEQ_LEN,
+                          scores=list(GRAD_ROLLOUT_SCORES if grad else ROLLOUT_SCORES))
+        if _is_done(out_dir, info, opts):
+            continue
+        source = SCGPT_LABELS[form]
+        if reuse_zero_shot:
+            # The zero-shot rollout on the MLP's correctly classified cells
+            zs_dir = results_dir / _task_name("rollout", "zero_shot", "scgpt") / slug
+            ig_mlp = results_dir / _task_name("ig", "mlp", "scgpt") / slug / "cell_scores.npz"
+            if not (zs_dir / "done.json").exists() or not ig_mlp.exists():
+                raise SystemExit(f"{task}: needs {zs_dir} (rollout_zero_shot_scgpt) and {ig_mlp} (ig_mlp_scgpt)")
+            embeddings = np.load(zs_dir / "cell_embeddings.npy")
+            with np.load(ig_mlp) as z:
+                correct = z["correct"]
+            result = rollout.subset_result(ig.IGResult.load(zs_dir / "cell_scores.npz", embeddings, gene_names),
+                                           correct, gene_names)
+        else:
+            pt = common._tokenise(sub, vocab)
+            desc = f"{task} {slug} {'classify' if form in CLASSIFIER_FORMS else 'embed'} [{device}]"
+            if form in CLASSIFIER_FORMS:
+                cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale,
+                                                desc)
+                if not _correct_counts_ok(cache):
+                    continue
+                scored = cache.correct
+            else:
+                cache = cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=2,
+                                           batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc, label=source)
+                scored = np.ones(cache.n_cells, dtype=bool)
+            source = cache.embedding_source
+            out_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint = out_dir / "rollout_checkpoint.npz"
+            output = ("pd_logit" if form in CLASSIFIER_FORMS else "signature") if grad else None
+            batch = rollout.GRAD_ROLLOUT_BATCH_SIZE if grad else rollout.ROLLOUT_BATCH_SIZE
+            result = rollout.compute_rollout_result(
+                model, pt, cache, vocab, gene_names, device, model_configs["nheads"], scored,
+                batch_size=batch * scale, checkpoint=checkpoint, desc=f"{task} {slug} [{device}]", output=output)
+            ig.remove_checkpoint(checkpoint)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _write_ig_outputs(result, gene_names, out_dir, signed_dir, _strata_dirs(results_dir, "scgpt", form, slug),
+                          source, f"{task} {slug}")
+        _mark_done(out_dir, info)
+        _mark_done(signed_dir, info)
+
+    del model
+    torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Geneformer and scCello
 # ---------------------------------------------------------------------------
@@ -809,13 +894,19 @@ for _name in ["scgpt", *RANK_MODELS]:
             MODEL_TASKS[_task_name("ig", _form, _name)] = (
                 partial(task_ig_scgpt, _form) if _name == "scgpt"
                 else partial(task_ig_rank, RANK_MODELS[_name], _form))
+        if _name == "scgpt":
+            MODEL_TASKS[_task_name("rollout", _form, _name)] = partial(task_rollout_scgpt, _form)
+            MODEL_TASKS[_task_name("gradrollout", _form, _name)] = partial(task_rollout_scgpt, _form,
+                                                                            kind="gradrollout")
 
 # CPU tasks computed from the model tasks' output: the OLS residual of each pooled
 # score, <target>: <source> (as in the README)
 DERIVED_TASKS = {}
 for _name in ["scgpt", *RANK_MODELS]:
     for _score, _form in ([("attention", f) for f in FORMS]
-                          + [(score, f) for f in IG_FORMS.get(_name, CLASSIFIER_FORMS) for score in IG_SCORES]):
+                          + [(score, f) for f in IG_FORMS.get(_name, CLASSIFIER_FORMS) for score in IG_SCORES]
+                          + ([(score, f) for f in FORMS for score in ROLLOUT_SCORES + GRAD_ROLLOUT_SCORES]
+                             if _name == "scgpt" else [])):
         _source = f"{_score}_{_form}_{_name}"
         _target = (f"attention_residualized_ols_{_name}" if (_score, _form) == ("attention", "zero_shot")
                    else f"{_score}_residualized_ols_{_form}_{_name}")

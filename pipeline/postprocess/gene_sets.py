@@ -53,7 +53,10 @@ FORMS = {"zero_shot": ("zero-shot", "zero-shot"), "step2_5": ("step2_5", "Step 2
 CLASSIFIER_FORMS = ("mlp", "lora")
 IG_FORMS = {"scgpt": tuple(FORMS)}
 # Scores (folder prefix -> label)
-SCORE_NAMES = {"attention": "attention", "ig": "IG", "igsigned": "IG±"}
+SCORE_NAMES = {"attention": "attention", "ig": "IG", "igsigned": "IG±", "rollout": "rollout",
+               "rolloutsigned": "rollout±", "gradrollout": "gradrollout", "gradrolloutsigned": "gradrollout±"}
+# Scores only scGPT has (attention rollout and its gradient-weighted version, rollout_scgpt)
+SCGPT_ONLY_SCORES = ("rollout", "rolloutsigned", "gradrollout", "gradrolloutsigned")
 
 
 def ig_forms(model: str) -> tuple:
@@ -103,7 +106,8 @@ for _model in MODELS:
     # folder and OLS in another
     for _score, _score_label in SCORE_NAMES.items():
         for _form, (_model_form, _form_label) in FORMS.items():
-            if (_score, _form) == ("attention", "zero_shot") or (_score != "attention" and _form not in ig_forms(_model)):
+            if (_score, _form) == ("attention", "zero_shot") or (_score != "attention" and _form not in ig_forms(_model)) \
+                    or (_score in SCGPT_ONLY_SCORES and _model != "scgpt"):
                 continue
             _label = f"{_form_label} {_score_label}"
             _dir = f"{_score}_{_form}_{_model}/{{ct}}"

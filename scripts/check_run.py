@@ -79,12 +79,12 @@ def _read_json(path: Path):
 DATASET_SCOPE = {"A+B": {("geneformer", "zero-shot")}}
 # Models and model forms the checked run covers (--models, --forms)
 MODEL_FORMS = [mf for mf, _ in FORMS.values()]
-SCORES = ["attention", "ig", "igsigned"]
+SCORES = ["attention", "ig", "igsigned", "rollout", "rolloutsigned", "gradrollout", "gradrolloutsigned"]
 SCOPE = {"models": list(MODELS), "forms": list(MODEL_FORMS), "scores": list(SCORES), "post": "all"}
 
 
 def _score_of(name: str) -> str:
-    """Score of a task, results folder or method name (attention, ig or igsigned)."""
+    """Score of a task, results folder or method name (attention, ig, igsigned, rollout or rolloutsigned)."""
     return name.split("_", 1)[0]
 
 
@@ -189,7 +189,7 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
             if meta is None:
                 rep.fail(f"{folder} {ct}: cssi_metadata.json missing")
                 continue
-            if ((results_dir / folder / ct / "ig_checkpoint.npz").exists()
+            if (any((results_dir / folder / ct / f"{k}_checkpoint.npz").exists() for k in ("ig", "rollout"))
                     and not (results_dir / folder / ct / "done.json").exists()):
                 rep.fail(f"{folder} {ct}: IG checkpoint left, the task did not finish this cell type")
             if meta["n_cells"] != expected[model].get(ct):

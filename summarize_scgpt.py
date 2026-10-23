@@ -36,18 +36,19 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 ROWS = ["ModelForm", "Score", "Ranking", "TopN"]
-VALUES = ["SimPD", "FG", "FGcell"]
+VALUES = ["SimPD", "FG", "FGCell"]
 BASELINE = ["SimPD_null", "SimPD_z", "SimPD_p", "SimPD_z_uniform"]
 # simpd_baseline.py's names -> the macrotable's labels
 FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step2.5", "mlp": "zero-shot+MLP", "lora": "LoRA"}
-SCORE_LABELS = {"ig": "IG", "igsigned": "IG±"}
+SCORE_LABELS = {"ig": "IG", "igsigned": "IG±", "rollout": "rollout", "rolloutsigned": "rollout±",
+                "gradrollout": "gradrollout", "gradrolloutsigned": "gradrollout±"}
 RANKING_LABELS = {None: "pooled", "cssi_": "CSSI", "residualized_ols_": "residualized"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 # Table order of the key values
 ORDER = {"ModelForm": ["zero-shot", "Step2.5", "zero-shot+MLP", "LoRA"],
-         "Score": ["IG", "IG±", "attention"],
+         "Score": ["IG", "IG±", "rollout", "rollout±", "gradrollout", "gradrollout±", "attention"],
          "Ranking": ["pooled", "CSSI", "residualized"],
          "TopN": ["top30", "zscore", "elbow"]}
 
@@ -64,7 +65,7 @@ def _baseline(results_root: Path, dataset: str, part: str):
     if not path.exists():
         return None
     df = pd.read_csv(path)
-    keys = df["method"].str.extract(r"^(igsigned|ig)_(cssi_|residualized_ols_)?(.*)_scgpt$")
+    keys = df["method"].str.extract(r"^(igsigned|ig|gradrolloutsigned|gradrollout|rolloutsigned|rollout)_(cssi_|residualized_ols_)?(.*)_scgpt$")
     out = pd.DataFrame({"ModelForm": keys[2].map(FORM_LABELS), "Score": keys[0].map(SCORE_LABELS),
                         "Ranking": keys[1].map(lambda r: RANKING_LABELS[r if isinstance(r, str) else None]),
                         "TopN": df["selection"].map(TOPN_LABELS),
@@ -83,7 +84,7 @@ def _fg_vs_simpd(aggregates: dict) -> pd.DataFrame:
                                values="SimPD_z" if "SimPD_z" in agg else "SimPD")[ORDER["TopN"]]
         wide.columns = [f"{dataset}_SimPD_{'z' if 'SimPD_z' in agg else 'raw'}_{c}" for c in wide.columns]
         fg = agg.drop_duplicates(["ModelForm", "Score", "Ranking"]).set_index(["ModelForm", "Score", "Ranking"])
-        parts.append(pd.concat([fg[["FGcell", "FG"]].add_prefix(f"{dataset}_"), wide], axis=1))
+        parts.append(pd.concat([fg[["FGCell", "FG"]].add_prefix(f"{dataset}_"), wide], axis=1))
     return _sorted(pd.concat(parts, axis=1).reset_index(), ["ModelForm", "Score", "Ranking"])
 
 
@@ -91,16 +92,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--results-root", type=Path, default=HERE / "results" / "scgpt")
     p.add_argument("--with-attention", action="store_true", help="Keep the attention rows.")
+    p.add_argument("--macrotable", default="macrotable", help="Macrotable folder under --results-root.")
+    p.add_argument("--tables-dir", default="tables", help="Output folder under --results-root.")
+    p.add_argument("--scores", nargs="+", default=["IG", "IG±"],
+                   help="Scores of the tables (labels; default: IG IG±; also rollout, rollout±, gradrollout, gradrollout±).")
     args = p.parse_args()
 
-    table = pd.read_csv(args.results_root / "macrotable" / "macrotable.csv")
+    table = pd.read_csv(args.results_root / args.macrotable / "macrotable.csv")
     table = table[table["Model"] == "scGPT"]
-    if not args.with_attention:
-        table = table[table["Score"] != "attention"]
+    keep = set(args.scores) | ({"attention"} if args.with_attention else set())
+    table = table[table["Score"].isin(keep)]
     missing = [c for c in VALUES if c not in table.columns]
     if missing:
         raise SystemExit(f"macrotable.csv has no {missing}: build it with --modules similarity faithfulness")
-    out_dir = args.results_root / "tables"
+    out_dir = args.results_root / args.tables_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     aggregates = {}
@@ -122,19 +127,21 @@ def main():
         agg.to_csv(out_dir / f"{tag}_aggregate.csv", index=False)
         aggregates[str(dataset)] = agg
 
-        # FG does not depend on the cut-off: one row per ranking, plus the per-cell IG of each form
+        # FG does not depend on the cut-off: one row per ranking, plus each form's per-cell
+        # explanations (IG for the IG scores, rollout for the rollout ones)
         rank_fg = ds.drop_duplicates(["ModelForm", "Score", "Ranking", "CellType"]) \
             .pivot_table(index=["ModelForm", "Score", "Ranking"], columns="CellType", values="FG")
-        cell_fg = ds.drop_duplicates(["ModelForm", "CellType"]) \
-            .pivot_table(index="ModelForm", columns="CellType", values="FGcell")
-        cell_fg.index = pd.MultiIndex.from_tuples([(f, "per-cell IG", "") for f in cell_fg.index],
-                                                  names=rank_fg.index.names)
+        explanation = ds["Score"].map(lambda s: "per-cell " + next((m for m in ("gradrollout", "rollout")
+                                                                     if s.startswith(m)), "IG"))
+        cell_fg = ds.assign(Score=explanation).drop_duplicates(["ModelForm", "Score", "CellType"]) \
+            .pivot_table(index=["ModelForm", "Score"], columns="CellType", values="FGCell")
+        cell_fg.index = pd.MultiIndex.from_tuples([(f, s, "") for f, s in cell_fg.index], names=rank_fg.index.names)
         fg = pd.concat([rank_fg, cell_fg])
         fg["mean"] = fg.mean(axis=1)
-        # Forms in table order, each form's per-cell IG first and then its rankings
+        # Forms in table order, each form's per-cell explanations first and then its rankings
         fg = fg.reset_index()
         fg = fg.assign(_form=fg["ModelForm"].map({v: i for i, v in enumerate(ORDER["ModelForm"])}),
-                       _cell=fg["Score"] != "per-cell IG") \
+                       _cell=~fg["Score"].str.startswith("per-cell")) \
             .sort_values(["_form", "_cell"], kind="stable").drop(columns=["_form", "_cell"])
         fg.to_csv(out_dir / f"{tag}_fg.csv", index=False)
 

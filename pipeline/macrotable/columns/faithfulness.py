@@ -3,11 +3,12 @@
 From evaluate_attributions.py --curves --rankings, in
 <results>/dataset_<x>/attribution_eval/<model>_<form>/fg_by_cell_type.csv
 (mean FG per method and cell type):
-  FG       the ranking itself (its pooled / CSSI / OLS scores of score IG or
-           IG±) used as every cell's attribution: Problem B, evaluated like A.
-           The same for every TopN of the ranking.
-  FGcell   the form's per-cell signed IG (method `ig`): Problem A, the same
-           for every ranking and TopN of the form.
+  FG       the ranking itself (its pooled / CSSI / OLS scores of score IG,
+           IG±, rollout, rollout±, gradrollout or gradrollout±) used as every cell's attribution:
+           Problem B, evaluated like A. The same for every TopN of the ranking.
+  FGCell   the form's per-cell explanation the score comes from (method `ig`
+           for IG and IG±, `rollout` / `gradrollout` for the rollout ones): Problem A, the
+           same for every ranking and TopN of the form and score.
 FG = 1 - deletion AUC / deletion AUC of a random attribution on the same
 cell (0 = random, higher = better). NaN where the evaluation has not run
 (attention rankings are not evaluated).
@@ -39,5 +40,7 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
         ranking = f"rank_{meta['score']}_{meta['ranking']}"
         lookup = lambda method: (float(fg.at[method, e.cell_type])
                                  if fg is not None and method in fg.index and e.cell_type in fg.columns else np.nan)
-        rows.append({"FG": lookup(ranking) if meta["score"] != "attention" else np.nan, "FGcell": lookup("ig")})
-    return pd.DataFrame(rows, index=experiments.index, columns=["FG", "FGcell"])
+        cell_method = next((m for m in ("gradrollout", "rollout") if meta["score"].startswith(m)), "ig")
+        rows.append({"FG": lookup(ranking) if meta["score"] != "attention" else np.nan,
+                     "FGCell": lookup(cell_method)})
+    return pd.DataFrame(rows, index=experiments.index, columns=["FG", "FGCell"])

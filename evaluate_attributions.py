@@ -20,7 +20,13 @@ run (run_tasks.py --task scgpt, read from --results-dir):
            cell's attribution. IG± is flipped for control cells only for an
            encoder (its PD - control mean of the SIGnature IG points to PD);
            for a classifier it is already the mean IG towards the true class
-           of both conditions, like the cell's own ig. |IG| is not
+           of both conditions, like the cell's own ig. rollout and
+           gradrollout: the cell's attention rollout and gradient-weighted
+           rollout (rollout_ / gradrollout_<form>_scgpt, when those tasks ran;
+           the same for both targets), and their rankings like the IG ones
+           (rollout± and gradrollout± flipped for control cells in every
+           form, as PD - control contrasts of non-negative scores). --add-missing evaluates only the methods a cell type's
+           file lacks (random's AUC of the same cell is reused). |IG| is not
            evaluated: its FG was far lower than the signed IG's on every model
            (0.19 / 0.17 / 0.03 against 0.93 / 0.78 / 0.66, scCello /
            Geneformer / scGPT LoRA, dataset A), as it adds up genes that push
@@ -330,12 +336,26 @@ def run_scgpt(args) -> None:
         for form, model in models.items():
             out_dir = eval_dir / f"scgpt_{form}"
             ct_csv = out_dir / "cells" / f"{slug}.csv"
-            if args.skip_done and ct_csv.exists():
-                print(f"  {form}: done ({ct_csv}), kept", flush=True)
-                continue
+            done = pd.read_csv(ct_csv) if ct_csv.exists() and (args.skip_done or args.add_missing) else None
             ct_csv.parent.mkdir(parents=True, exist_ok=True)
             ig_scores = _PipelineIG(results_dir / f"ig_{form}_scgpt" / slug / "cell_scores.npz")
+            # Per-cell rollout and gradient-weighted rollout, when their tasks ran
+            per_cell = {}
+            for kind in ("rollout", "gradrollout"):
+                npz = results_dir / f"{kind}_{form}_scgpt" / slug / "cell_scores.npz"
+                if npz.exists():
+                    per_cell[kind] = _PipelineIG(npz)
             rankings = _ranking_methods("scgpt", form, rankings_dir, args.dataset, slug, names)
+            methods = ["ig", "random", *per_cell, *rankings]
+            # Methods to compute: all, or (--add-missing) those the saved file lacks
+            todo = set(methods)
+            if done is not None:
+                todo = set(methods) - set(done["method"]) if args.add_missing else set()
+            if not todo:
+                print(f"  {form}: done ({ct_csv}), kept", flush=True)
+                continue
+            if done is not None:
+                print(f"  {form}: adding {sorted(todo)} to {ct_csv}", flush=True)
             rows, curves_npz = [], {}
             for i in progress(sel, desc=f"scgpt_{form} {slug}", unit="cell"):
                 i = int(i)
@@ -353,8 +373,11 @@ def run_scgpt(args) -> None:
                 attributions = {"ig": ig[None, None, :]}
                 np.random.seed(SEED + i)
                 attributions["random"] = scgpt_model.explain_random(model, x, y)
+                for kind, scores in per_cell.items():
+                    attributions[kind] = scores.cell(i, tokens)[None, None, :]
                 for method, explain in rankings.items():
                     attributions[method] = explain(model, x, y)
+                attributions = {m: a for m, a in attributions.items() if m in todo}
                 start = time.perf_counter()
                 curves = (_quantus_morf(model, x, label, attributions, device) if args.engine == "quantus"
                           else _morf_curves(model, x, label, attributions, args.chunk))
@@ -364,8 +387,16 @@ def run_scgpt(args) -> None:
                                  "n_tokens": x.shape[-1], "method": method, "deletion_auc": _auc(curve),
                                  "curve_s": seconds})
                     curves_npz[f"{slug}:{i}:{method}"] = curve
-            _add_fg(pd.DataFrame(rows)).to_csv(ct_csv, index=False)
-            np.savez_compressed(out_dir / "cells" / f"{slug}_curves.npz", **curves_npz)
+            new = pd.DataFrame(rows)
+            curves_path = out_dir / "cells" / f"{slug}_curves.npz"
+            if done is not None:
+                # Keep the saved methods (and random's AUC, the FG reference) and their curves
+                new = pd.concat([done.drop(columns="fg"), new], ignore_index=True)
+                if curves_path.exists():
+                    with np.load(curves_path) as old:
+                        curves_npz = {**{k: old[k] for k in old.files}, **curves_npz}
+            _add_fg(new).to_csv(ct_csv, index=False)
+            np.savez_compressed(curves_path, **curves_npz)
 
     # Per form: every cell type's rows, the mean FG per method and cell type, and over all cells
     for form in args.forms:
@@ -409,8 +440,9 @@ def _ranking_methods(model_name: str, form: str, rankings_dir: Path, dataset: st
         df = pd.read_csv(path)
         scores = {gid: float(score) for gene, score in zip(df["gene"].astype(str), df["score"])
                   for gid in tokens_of.get(gene, [])}
-        methods[f"rank_{meta['score']}_{meta['ranking']}"] = scgpt_model.ranking_explainer(
-            scores, signed=meta["score"] == "igsigned" and form not in rt.CLASSIFIER_FORMS)
+        signed = ((meta["score"] == "igsigned" and form not in rt.CLASSIFIER_FORMS)
+                  or meta["score"] in ("rolloutsigned", "gradrolloutsigned"))
+        methods[f"rank_{meta['score']}_{meta['ranking']}"] = scgpt_model.ranking_explainer(scores, signed=signed)
     return methods
 
 
@@ -520,6 +552,8 @@ def main():
                    help="scGPT deletion curves: batched (default) or quantus.PixelFlipping step by step.")
     p.add_argument("--chunk", type=int, default=64, help="scGPT: perturbed inputs per forward pass.")
     p.add_argument("--skip-done", action="store_true", help="scGPT: keep the (form, cell type) already written.")
+    p.add_argument("--add-missing", action="store_true",
+                   help="scGPT: for a (form, cell type) already written, add only the methods it lacks.")
     p.add_argument("--rankings-dir", type=Path, default=None,
                    help="Results root holding the rankings (default: --results-dir).")
     p.add_argument("--methods", nargs="+", choices=list(rank_model.EXPLAIN_FUNCS), default=["ig", "random"],
