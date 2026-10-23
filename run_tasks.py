@@ -53,6 +53,7 @@ from pipeline.postprocess.gene_matrix import task_gene_matrix
 from pipeline.postprocess.gene_sets import SELECTIONS
 from pipeline.postprocess.gwas_similarity import DEFAULT_DISTANCES as GO3_DISTANCES, task_gwas_similarity
 from pipeline.postprocess.plots import task_plots
+from pipeline.postprocess.termset_similarity import GROUPWISE as TERMSET_GROUPWISE, task_termset_similarity
 from pipeline.steps import _step7_common as common
 from pipeline.steps import _step7_geneformer as gf
 from pipeline.steps import attention_cssi_leiden as cssi
@@ -921,8 +922,10 @@ POSTPROCESS_TASKS = {
     "gene_matrix": task_gene_matrix,
     "plots": task_plots,
 }
+# Optional post-hoc tasks, outside --task postprocess: they run only when named
+OPTIONAL_TASKS = {"termset_similarity": task_termset_similarity}
 
-TASKS = {**MODEL_TASKS, **DERIVED_TASKS, **POSTPROCESS_TASKS}
+TASKS = {**MODEL_TASKS, **DERIVED_TASKS, **POSTPROCESS_TASKS, **OPTIONAL_TASKS}
 # --task scgpt: the model and OLS tasks of scGPT's four forms (the current scope)
 SCGPT_TASKS = [t for t in list(MODEL_TASKS) + list(DERIVED_TASKS) if t.endswith("_scgpt")]
 # Post-hoc tasks that compute GO3 similarities (take --distances)
@@ -1070,6 +1073,10 @@ def main():
     p.add_argument("--distances", nargs="+", choices=GO3_DISTANCES, default=GO3_DISTANCES,
                    help="GO term similarities for gwas_similarity/gene_matrix (default: all three; "
                         "the plots use SimRel).")
+    p.add_argument("--termset-groupwise", nargs="+", choices=TERMSET_GROUPWISE, default=["bma"],
+                   help="Comparison of two enriched term sets for termset_similarity (default: bma).")
+    p.add_argument("--termset-distances", nargs="+", choices=GO3_DISTANCES, default=["SimRel"],
+                   help="GO term similarity for termset_similarity (default: SimRel; simgic ignores it).")
     args = p.parse_args()
     if args.batch_scale != "auto" and not args.batch_scale.isdigit():
         p.error("--batch-scale must be 'auto' or a positive integer")
@@ -1108,6 +1115,9 @@ def main():
             TASKS[name](data_dir, results_dir, opts)
         elif name in GO3_TASKS:
             TASKS[name](results_dir, selections, distances=args.distances)
+        elif name in OPTIONAL_TASKS:
+            TASKS[name](_single_dir(data_dir, name), results_dir, selections,
+                        groupwise=args.termset_groupwise, distances=args.termset_distances)
         else:
             TASKS[name](results_dir, selections)
 
