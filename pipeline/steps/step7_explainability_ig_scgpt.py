@@ -15,8 +15,8 @@ How it works:
     from baseline to the real cell, using `n_steps` Gauss-Legendre points.
   - IG(gene) = (real_value - baseline_value) * integrated_gradient.
   - We keep only correctly classified cells and score each gene by the MEAN
-    ABSOLUTE attribution over all of them, a cell without the gene counting
-    as 0 (non-negative, like RF importance).
+    ABSOLUTE attribution over the ones that have it (non-negative, like RF
+    importance), if at least C.MIN_PRESENT_FRAC of them have it.
   - The CSSI version (stratified_ig_scores) takes, per gene, the maximum of
     that mean over the Leiden strata of the LoRA model's own cell embedding.
 
@@ -131,18 +131,25 @@ def remove_checkpoint(checkpoint: Path) -> None:
 
 
 def _named_means(gids: np.ndarray, weights: np.ndarray, n_cells: int, names: dict) -> Dict[str, float]:
-    """Sum of `weights` per token id over `n_cells` cells, named by `names` (token id -> gene)."""
+    """Mean of `weights` per token id over the cells that have it, named by `names` (token id -> gene).
+
+    `gids` are the tokens of `n_cells` cells. A cell has each gene once, so a
+    gene's token count is its number of cells, and only genes in at least
+    C.MIN_PRESENT_FRAC of the `n_cells` get a mean.
+    """
     if gids.size == 0 or n_cells == 0:
         return {}
     sums = np.bincount(gids, weights=weights)
+    cells_with_gene = np.bincount(gids)
     seen_ids = np.unique(gids)
-    return {names[int(gid)]: float(sums[gid]) / n_cells for gid in seen_ids}
+    return {names[int(gid)]: float(sums[gid]) / cells_with_gene[gid] for gid in seen_ids
+            if cells_with_gene[gid] >= C.MIN_PRESENT_FRAC * n_cells}
 
 
 @dataclass
 class IGResult:
     """Pooled IG scores of one cell type, plus what the stratified (CSSI) score needs."""
-    mean_abs: Dict[str, float]  # mean |IG| per gene over the correctly classified cells
+    mean_abs: Dict[str, float]  # mean |IG| per gene over the correctly classified cells with it
     gate: dict
     embeddings: np.ndarray      # (n_cells, d) residual-stream CLS embedding entering the attention layer
     labels: np.ndarray          # (n_cells,) 0 = control, 1 = PD
@@ -154,9 +161,8 @@ class IGResult:
     @classmethod
     def from_tokens(cls, token_cells, token_gids, token_abs_ig, embeddings, labels, correct,
                     names: dict) -> "IGResult":
-        # The mean IG per gene over every correctly classified cell, a cell
-        # without the gene adds 0, so a gene seen in a handful of cells cannot
-        # outrank one seen in all of them
+        # The mean IG per gene over the correctly classified cells that have it,
+        # for the genes in at least C.MIN_PRESENT_FRAC of them
         n_used = int(correct.sum())
         ok = n_used > 0
         gate = {"ok": ok, "reason": "" if ok else "no correctly-classified cells", "mode": "ig_predictions"}
@@ -181,8 +187,8 @@ def stratified_ig_scores(result: IGResult, strata: np.ndarray, names: dict,
                          min_cells_per_condition: int = 20) -> Tuple[Dict[str, float], int]:
     """CSSI-max IG: per gene, the maximum over strata of its mean |IG| in the stratum.
 
-    The mean is over the stratum's correctly classified cells (a cell without
-    the gene adding 0), and a stratum needs min_cells_per_condition of them
+    The mean is over the stratum's correctly classified cells that have the
+    gene (at least C.MIN_PRESENT_FRAC of them), and a stratum needs min_cells_per_condition of them
     per condition, as the attention CSSI (the LoRA embedding groups cells by
     the model's prediction, so few strata qualify). Returns (scores, number
     of valid strata); without any valid stratum the scores are the pooled ones.

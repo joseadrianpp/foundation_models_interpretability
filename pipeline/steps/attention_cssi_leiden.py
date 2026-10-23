@@ -15,9 +15,9 @@ One forward pass per cell type fills an `AttentionCache` (model specific:
 donor-level matrices in attention_dynamic_selection.py) only reads the cache,
 so it is the same code for every model.
 
-Every mean is over all the cells of the group (condition, stratum or donor),
-a cell without the gene adding 0: a gene seen in a handful of cells cannot
-outrank one seen in all of them.
+Every mean is over the cells of the group (condition, stratum or donor) that
+have the gene, and only for genes in at least C.MIN_PRESENT_FRAC of the
+group's cells: a gene seen in a handful of cells gets no score.
 """
 
 from concurrent.futures import ProcessPoolExecutor
@@ -304,11 +304,11 @@ def collect_geneformer(model, pt: Dict, token_dict: dict, gene_names: dict, devi
 # ---------------------------------------------------------------------------
 def condition_means(cache: AttentionCache,
                     cell_mask: Optional[np.ndarray] = None) -> Dict[int, Dict[str, float]]:
-    """Mean attention per gene per condition over the cells in `cell_mask`.
+    """Mean attention per gene per condition over the cells in `cell_mask` that have the gene.
 
-    The denominator is the number of cells of the condition, so a cell
-    without the gene adds 0. Genes absent from a condition are left out of its
-    dict (common._gene_scores treats them as 0).
+    A gene gets a mean in a condition only if at least C.MIN_PRESENT_FRAC of
+    the condition's cells have it; the others are left out of its dict
+    (common._gene_scores only scores the genes with a mean in both).
     """
     n_genes = cache.genes.size
     token_cells = cache.token_cells
@@ -323,8 +323,11 @@ def condition_means(cache: AttentionCache,
         tokens = cells[token_cells]
         gidx = cache.gene_idx[tokens]
         sums = np.bincount(gidx, weights=cache.attn[tokens], minlength=n_genes)
-        present = np.bincount(gidx, minlength=n_genes) > 0
-        means[cond] = dict(zip(cache.genes[present].tolist(), (sums[present] / n_used).tolist()))
+        # A cell has each gene once, so a gene's token count is its number of cells
+        cells_with_gene = np.bincount(gidx, minlength=n_genes)
+        kept = (cells_with_gene > 0) & (cells_with_gene >= C.MIN_PRESENT_FRAC * n_used)
+        means[cond] = dict(zip(cache.genes[kept].tolist(),
+                               (sums[kept] / cells_with_gene[kept]).tolist()))
     return means
 
 

@@ -354,7 +354,8 @@ def _input_size(path: Path) -> int:
 def _done_info(task: str, n_cells: int, inputs, **params) -> dict:
     """What a cell type's outputs depend on: task, cells, input files (by size) and settings."""
     return {"task": task, "n_cells": int(n_cells),
-            "inputs": {str(p.relative_to(DATA_DIR)): _input_size(p) for p in inputs}, **params}
+            "inputs": {str(p.relative_to(DATA_DIR)): _input_size(p) for p in inputs},
+            "min_present_frac": C.MIN_PRESENT_FRAC, **params}
 
 
 def _is_done(out_dir: Path, info: dict, opts: dict) -> bool:
