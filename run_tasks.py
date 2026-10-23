@@ -60,6 +60,7 @@ from pipeline.steps import attention_dynamic_selection as dynamic
 from pipeline.steps import step7_attention_residualized_ols as residualized_ols
 from pipeline.steps import step7_explainability_ig_geneformer as ig_gf
 from pipeline.steps import step7_explainability_ig_scgpt as ig
+from pipeline.steps import rollout_scgpt as rollout
 from pipeline.utils import progress
 from pipeline.utils.geneformer_model import (EMB_HIDDEN_LAYER, SCCELLO_EMB_HIDDEN_LAYER,
                                              load_gene_names, load_token_dictionary)
@@ -91,6 +92,17 @@ STEP2_5_WEIGHTS_SCGPT = Path("step2_5_scgpt") / "best_model.pt"
 # <score>_<form>_<model>
 FORMS = ["zero_shot", "step2_5", "mlp", "lora"]
 CLASSIFIER_FORMS = ("mlp", "lora")
+# Integrated Gradients of the classifiers' PD logit; scGPT's encoders without a
+# head also get SIGnature's IG of their cell embedding (step7_explainability_ig_scgpt)
+IG_FORMS = {"scgpt": FORMS}
+# The two scores of one IG run: IG (mean |IG|, as JA's IG and SIGnature) and
+# IG± (signed IG, PD - control), in ig_<form>_<model>/ and igsigned_<form>_<model>/
+IG_SCORES = ("ig", "igsigned")
+# The two scores of scGPT's attention rollout (rollout_scgpt), written like IG's:
+# rollout (mean) in rollout_<form>_scgpt/, rollout± (PD - control) in rolloutsigned_<form>_scgpt/
+ROLLOUT_SCORES = ("rollout", "rolloutsigned")
+# Gradient-weighted rollout (Chefer et al. 2021): gradrollout_<form>_scgpt/, gradrolloutsigned_<form>_scgpt/
+GRAD_ROLLOUT_SCORES = ("gradrollout", "gradrolloutsigned")
 FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "zero-shot + MLP", "lora": "LoRA"}
 # Forms with the same cell embeddings (the MLP head sits on the frozen zero-shot
 # encoder), which therefore share their Leiden strata
@@ -151,7 +163,8 @@ def _task_name(score: str, form: str, name: str) -> str:
 
 def _strata_dirs(results_dir: Path, name: str, form: str, slug: str) -> list:
     """Output folders of the forms with the same embeddings, where saved Leiden strata are looked for."""
-    return [results_dir / f"{score}_{f}_{name}" / slug for f in SAME_EMBEDDING[form] for score in ("attention", "ig")]
+    return [results_dir / f"{score}_{f}_{name}" / slug for f in SAME_EMBEDDING[form]
+            for score in ("attention", *IG_SCORES, *ROLLOUT_SCORES, *GRAD_ROLLOUT_SCORES)]
 
 
 def _write_top_n(score_map: dict, out_csv: Path, n: int = TOP_N) -> None:
@@ -482,13 +495,16 @@ def _rank_inputs(spec: dict, data_dir, form: str) -> list:
     return inputs + [spec["model_dir"], form_dir / spec["mlp_head" if form == "mlp" else "lora_dir"]]
 
 
-def _write_ig_outputs(result: ig.IGResult, names: dict, out_dir: Path, strata_dirs, source: str,
-                      desc: str) -> None:
-    """Pooled and CSSI IG scores, selections, Leiden artifacts and per-cell |IG| of one cell type.
+def _write_ig_outputs(result: ig.IGResult, names: dict, out_dir: Path, signed_dir: Path, strata_dirs,
+                      source: str, desc: str) -> None:
+    """The two IG scores of one cell type: IG in `out_dir`, IG± in `signed_dir`.
 
-    CSSI: Leiden strata of the classifier's own cell embedding (the ones its
-    attention task saved in `strata_dirs` if it ran first), each gene scored
-    by its largest mean |IG| over the valid strata.
+    IG: pooled mean |IG|, CSSI (each gene's largest mean |IG| over the valid
+    Leiden strata of the model's own cell embedding; the ones its attention
+    task saved in `strata_dirs` if it ran first), selections, Leiden
+    artifacts and the per-cell signed IG (cell_scores.npz). IG±: the signed
+    IG through the attention outputs (PD - control mean, CSSI, selections),
+    on the same cells and strata.
     """
     saved = _saved_strata([out_dir, *strata_dirs], result.embeddings, source)
     strata, meta = saved if saved is not None else cssi._leiden_from_embeddings(
@@ -498,8 +514,11 @@ def _write_ig_outputs(result: ig.IGResult, names: dict, out_dir: Path, strata_di
     meta.update(valid_strata=valid_strata, n_cells=int(result.labels.size),
                 n_cells_scored=int(result.correct.sum()), n_embedding_dims=int(result.embeddings.shape[1]))
     _write_score_outputs(result.mean_abs, cssi_scores, strata, meta, result.embeddings, out_dir)
-    # Per-cell |IG| of every token, so CSSI can be recomputed without the model
+    # Per-cell signed IG of every token, so both scores can be recomputed without the model
     result.save(out_dir / "cell_scores.npz")
+    print(f"  IG±: signed IG, PD - control", flush=True)
+    _write_attention_outputs(result.to_signed_cache(names, source), signed_dir, cell_mask=result.correct,
+                             strata_dirs=[out_dir])
 
 
 def _correct_counts_ok(cache: cssi.AttentionCache) -> bool:
@@ -591,10 +610,17 @@ def task_attention_scgpt(form: str, data_dir: Path, results_dir: Path, device: t
 
 def task_ig_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.device,
                   cell_types=None, opts=None) -> None:
-    """Integrated Gradients of the PD logit of a scGPT classifier (zero-shot + MLP or LoRA)."""
+    """Integrated Gradients of one scGPT form: scores IG and IG±.
+
+    The classifiers (zero-shot + MLP, LoRA): IG of the PD logit over their
+    correctly classified cells. The encoders without a head (zero-shot, Step
+    2.5): SIGnature's IG of the cell embedding, over every cell.
+    """
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
     task = _task_name("ig", form, "scgpt")
+    classifier = form in CLASSIFIER_FORMS
+    output = "pd_logit" if classifier else "signature"
     vocab, model_configs = load_vocab(), load_model_configs()
     gene_names = _load_scgpt_gene_names(data_dir)
     adata = _load_full_dataset_scgpt(data_dir)
@@ -605,27 +631,113 @@ def task_ig_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.de
     for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
         print(f"\n=== {task} | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
         out_dir = results_dir / task / slug
-        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form),
-                          max_seq_len=C.MAX_SEQ_LEN, ig_steps=ig.IG_STEPS)
+        signed_dir = results_dir / f"igsigned_{form}_scgpt" / slug
+        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form), max_seq_len=C.MAX_SEQ_LEN,
+                          ig_steps=ig.IG_STEPS, ig_output=output, scores=list(IG_SCORES))
         if _is_done(out_dir, info, opts):
             continue
         pt = common._tokenise(sub, vocab)
 
-        # The correctly classified cells and the embeddings: the attention_<form>_scgpt pass
-        cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale,
-                                        f"{task} {slug} classify [{device}]")
-        if not _correct_counts_ok(cache):
-            continue
+        # The cells and the embeddings: the attention_<form>_scgpt pass
+        desc = f"{task} {slug} {'classify' if classifier else 'embed'} [{device}]"
+        if classifier:
+            cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale, desc)
+            if not _correct_counts_ok(cache):
+                continue
+        else:
+            cache = cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=2,
+                                       batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc,
+                                       label=SCGPT_LABELS[form])
         out_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = out_dir / "ig_checkpoint.npz"
         result = ig.compute_ig_result(
             model, pt, cache, vocab, gene_names, device, batch_size=ig.IG_BATCH_SIZE * scale,
             internal_batch_size=ig.IG_INTERNAL_BATCH_SIZE * scale, checkpoint=checkpoint,
-            desc=f"{task} {slug} [{device}]")
-        _write_ig_outputs(result, gene_names, out_dir, _strata_dirs(results_dir, "scgpt", form, slug),
+            desc=f"{task} {slug} [{device}]", output=output)
+        _write_ig_outputs(result, gene_names, out_dir, signed_dir, _strata_dirs(results_dir, "scgpt", form, slug),
                           cache.embedding_source, f"{task} {slug}")
         ig.remove_checkpoint(checkpoint)
         _mark_done(out_dir, info)
+        _mark_done(signed_dir, info)
+
+    del model
+    torch.cuda.empty_cache()
+
+
+def task_rollout_scgpt(form: str, data_dir: Path, results_dir: Path, device: torch.device,
+                       cell_types=None, opts=None, kind: str = "rollout") -> None:
+    """Attention rollout of one scGPT form: scores rollout and rollout± (kind="rollout"),
+    or gradient-weighted rollout: gradrollout and gradrollout± (kind="gradrollout").
+
+    The cells are those of the form's IG: every cell for the encoders without
+    a head (zero-shot, Step 2.5), the correctly classified ones for the
+    classifiers. Plain rollout does not see the head, so the zero-shot + MLP
+    form's is the zero-shot one (run rollout_zero_shot_scgpt first) on the
+    cells the MLP classifies correctly (read from ig_mlp_scgpt/<cell
+    type>/cell_scores.npz). The gradient-weighted rollout follows the output
+    the form's IG explains (PD logit towards the true class, or SIGnature's),
+    so it is computed for every form.
+    """
+    opts = {**DEFAULT_OPTS, **(opts or {})}
+    scale = _batch_scale(device, opts)
+    task = _task_name(kind, form, "scgpt")
+    grad = kind == "gradrollout"
+    reuse_zero_shot = form == "mlp" and not grad
+    vocab, model_configs = load_vocab(), load_model_configs()
+    gene_names = _load_scgpt_gene_names(data_dir)
+    adata = _load_full_dataset_scgpt(data_dir)
+    model = None
+    if not reuse_zero_shot:
+        print(f"[{device}] loading {FORM_LABELS[form]} model...", flush=True)
+        model = _load_scgpt(form, data_dir, vocab, model_configs, device)
+
+    for ct, slug, sub in _cell_type_subsets_scgpt(adata, cell_types, opts["max_cells_per_type"]):
+        print(f"\n=== {task} | {ct} | {sub.n_obs:,} cells | {device} | batch x{scale} ===", flush=True)
+        out_dir = results_dir / task / slug
+        signed_dir = results_dir / f"{kind}signed_{form}_scgpt" / slug
+        info = _done_info(task, sub.n_obs, _scgpt_inputs(data_dir, form), max_seq_len=C.MAX_SEQ_LEN,
+                          scores=list(GRAD_ROLLOUT_SCORES if grad else ROLLOUT_SCORES))
+        if _is_done(out_dir, info, opts):
+            continue
+        source = SCGPT_LABELS[form]
+        if reuse_zero_shot:
+            # The zero-shot rollout on the MLP's correctly classified cells
+            zs_dir = results_dir / _task_name("rollout", "zero_shot", "scgpt") / slug
+            ig_mlp = results_dir / _task_name("ig", "mlp", "scgpt") / slug / "cell_scores.npz"
+            if not (zs_dir / "done.json").exists() or not ig_mlp.exists():
+                raise SystemExit(f"{task}: needs {zs_dir} (rollout_zero_shot_scgpt) and {ig_mlp} (ig_mlp_scgpt)")
+            embeddings = np.load(zs_dir / "cell_embeddings.npy")
+            with np.load(ig_mlp) as z:
+                correct = z["correct"]
+            result = rollout.subset_result(ig.IGResult.load(zs_dir / "cell_scores.npz", embeddings, gene_names),
+                                           correct, gene_names)
+        else:
+            pt = common._tokenise(sub, vocab)
+            desc = f"{task} {slug} {'classify' if form in CLASSIFIER_FORMS else 'embed'} [{device}]"
+            if form in CLASSIFIER_FORMS:
+                cache = _classifier_scgpt_cache(model, form, pt, vocab, gene_names, model_configs, device, scale,
+                                                desc)
+                if not _correct_counts_ok(cache):
+                    continue
+                scored = cache.correct
+            else:
+                cache = cssi.collect_scgpt(model, pt, vocab, gene_names, model_configs["nheads"], device, n_cls=2,
+                                           batch_size=cssi.SCGPT_ATTN_BATCH_SIZE * scale, desc=desc, label=source)
+                scored = np.ones(cache.n_cells, dtype=bool)
+            source = cache.embedding_source
+            out_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint = out_dir / "rollout_checkpoint.npz"
+            output = ("pd_logit" if form in CLASSIFIER_FORMS else "signature") if grad else None
+            batch = rollout.GRAD_ROLLOUT_BATCH_SIZE if grad else rollout.ROLLOUT_BATCH_SIZE
+            result = rollout.compute_rollout_result(
+                model, pt, cache, vocab, gene_names, device, model_configs["nheads"], scored,
+                batch_size=batch * scale, checkpoint=checkpoint, desc=f"{task} {slug} [{device}]", output=output)
+            ig.remove_checkpoint(checkpoint)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _write_ig_outputs(result, gene_names, out_dir, signed_dir, _strata_dirs(results_dir, "scgpt", form, slug),
+                          source, f"{task} {slug}")
+        _mark_done(out_dir, info)
+        _mark_done(signed_dir, info)
 
     del model
     torch.cuda.empty_cache()
@@ -701,7 +813,7 @@ def task_attention_rank(spec: dict, form: str, data_dir: Path, results_dir: Path
 
 def task_ig_rank(spec: dict, form: str, data_dir: Path, results_dir: Path, device: torch.device,
                  cell_types=None, opts=None) -> None:
-    """Integrated Gradients of a Geneformer or scCello classifier (zero-shot + MLP or LoRA)."""
+    """Integrated Gradients of a Geneformer or scCello classifier (zero-shot + MLP or LoRA): IG and IG±."""
     opts = {**DEFAULT_OPTS, **(opts or {})}
     scale = _batch_scale(device, opts)
     name = spec["name"]
@@ -714,7 +826,9 @@ def task_ig_rank(spec: dict, form: str, data_dir: Path, results_dir: Path, devic
     for ct, slug, sub in _cell_type_subsets_geneformer(ds, cell_types, opts["max_cells_per_type"]):
         print(f"\n=== {task} | {ct} | {sub.num_rows:,} cells | {device} | batch x{scale} ===", flush=True)
         out_dir = results_dir / task / slug
-        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, form), ig_steps=ig.IG_STEPS)
+        signed_dir = results_dir / f"igsigned_{form}_{name}" / slug
+        info = _done_info(task, sub.num_rows, _rank_inputs(spec, data_dir, form), ig_steps=ig.IG_STEPS,
+                          scores=list(IG_SCORES))
         if _is_done(out_dir, info, opts):
             continue
         # The correctly classified cells and the embeddings: the attention_<form>_<model> pass
@@ -728,10 +842,11 @@ def task_ig_rank(spec: dict, form: str, data_dir: Path, results_dir: Path, devic
             model, gf._to_inputs(sub), cache, token_dict, gene_names, device,
             tokens_per_batch=spec["ig_tokens_per_batch"] * scale, checkpoint=checkpoint,
             desc=f"{task} {slug} [{device}]")
-        _write_ig_outputs(result, gene_names, out_dir, _strata_dirs(results_dir, name, form, slug),
+        _write_ig_outputs(result, gene_names, out_dir, signed_dir, _strata_dirs(results_dir, name, form, slug),
                           cache.embedding_source, f"{task} {slug}")
         ig.remove_checkpoint(checkpoint)
         _mark_done(out_dir, info)
+        _mark_done(signed_dir, info)
 
     del model
     torch.cuda.empty_cache()
@@ -769,25 +884,32 @@ def task_residualized_ols_rank(spec: dict, source: str, target: str, data_dir: P
 
 
 # Model tasks of every model: the attention of its four forms and the IG of its
-# two classifiers
+# two classifiers (of every form for scGPT)
 MODEL_TASKS = {}
 for _name in ["scgpt", *RANK_MODELS]:
     for _form in FORMS:
         MODEL_TASKS[_task_name("attention", _form, _name)] = (
             partial(task_attention_scgpt, _form) if _name == "scgpt"
             else partial(task_attention_rank, RANK_MODELS[_name], _form))
-        if _form in CLASSIFIER_FORMS:
+        if _form in IG_FORMS.get(_name, CLASSIFIER_FORMS):
             MODEL_TASKS[_task_name("ig", _form, _name)] = (
                 partial(task_ig_scgpt, _form) if _name == "scgpt"
                 else partial(task_ig_rank, RANK_MODELS[_name], _form))
+        if _name == "scgpt":
+            MODEL_TASKS[_task_name("rollout", _form, _name)] = partial(task_rollout_scgpt, _form)
+            MODEL_TASKS[_task_name("gradrollout", _form, _name)] = partial(task_rollout_scgpt, _form,
+                                                                            kind="gradrollout")
 
 # CPU tasks computed from the model tasks' output: the OLS residual of each pooled
 # score, <target>: <source> (as in the README)
 DERIVED_TASKS = {}
 for _name in ["scgpt", *RANK_MODELS]:
-    for _score, _form in [("attention", f) for f in FORMS] + [("ig", f) for f in CLASSIFIER_FORMS]:
+    for _score, _form in ([("attention", f) for f in FORMS]
+                          + [(score, f) for f in IG_FORMS.get(_name, CLASSIFIER_FORMS) for score in IG_SCORES]
+                          + ([(score, f) for f in FORMS for score in ROLLOUT_SCORES + GRAD_ROLLOUT_SCORES]
+                             if _name == "scgpt" else [])):
         _source = f"{_score}_{_form}_{_name}"
-        _target = (f"attention_residualized_ols_{_name}" if _form == "zero_shot"
+        _target = (f"attention_residualized_ols_{_name}" if (_score, _form) == ("attention", "zero_shot")
                    else f"{_score}_residualized_ols_{_form}_{_name}")
         DERIVED_TASKS[_target] = (partial(task_residualized_ols_scgpt, _source, _target) if _name == "scgpt"
                                   else partial(task_residualized_ols_rank, RANK_MODELS[_name], _source, _target))
@@ -801,6 +923,8 @@ POSTPROCESS_TASKS = {
 }
 
 TASKS = {**MODEL_TASKS, **DERIVED_TASKS, **POSTPROCESS_TASKS}
+# --task scgpt: the model and OLS tasks of scGPT's four forms (the current scope)
+SCGPT_TASKS = [t for t in list(MODEL_TASKS) + list(DERIVED_TASKS) if t.endswith("_scgpt")]
 # Post-hoc tasks that compute GO3 similarities (take --distances)
 GO3_TASKS = {"gwas_similarity", "gene_matrix"}
 
@@ -910,8 +1034,9 @@ def main():
     np.random.seed(SEED)
 
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=list(TASKS) + ["all", "postprocess"], default="all",
-                   help="all: model tasks + OLS tasks; postprocess: every post-hoc task in order.")
+    p.add_argument("--task", choices=list(TASKS) + ["all", "scgpt", "postprocess"], default="all",
+                   help="all: model tasks + OLS tasks; scgpt: the same for scGPT only; "
+                        "postprocess: every post-hoc task in order.")
     p.add_argument("--dataset", choices=list(DATASET_DIRS), default="A")
 
     # Single-GPU device for model tasks.
@@ -973,7 +1098,7 @@ def main():
 
     # --task all runs the GPU-bound model tasks and then the OLS tasks built on
     # their output; --task postprocess runs the post-hoc analyses in order.
-    names = {"all": list(MODEL_TASKS) + list(DERIVED_TASKS),
+    names = {"all": list(MODEL_TASKS) + list(DERIVED_TASKS), "scgpt": SCGPT_TASKS,
              "postprocess": list(POSTPROCESS_TASKS)}.get(args.task, [args.task])
     for name in names:
         print(f"\n# {name} | Dataset {args.dataset} #", flush=True)

@@ -90,7 +90,7 @@ def compute_ig_result(
     device: torch.device, n_steps: int = IG_STEPS, tokens_per_batch: int = IG_TOKENS_PER_BATCH,
     checkpoint: Optional[Path] = None, desc: str = "IG",
 ) -> IGResult:
-    """Mean absolute IG per gene over the correctly classified cells, keeping every token's |IG|.
+    """Mean absolute IG per gene over the correctly classified cells, keeping every token's signed IG.
 
     `cache` is the LoRA model's AttentionCache of the same cells
     (collect_geneformer with use_predictions): its correctly classified cells
@@ -118,7 +118,7 @@ def compute_ig_result(
         gids = ids.cpu().numpy()
         keep = ~np.isin(gids, special_arr)
         keep[:, 0] = False
-        return gids, np.abs(ig), keep
+        return gids, ig, keep
 
     # Longest cells first, so each batch pads to cells of similar length and a
     # batch too large for the GPU fails at the start. The scores do not depend

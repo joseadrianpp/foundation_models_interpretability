@@ -33,23 +33,26 @@ def _ranking(method: str) -> str:
     return ranking if ranking in ("cssi", "ols") else "pooled"
 
 
-def _family(method: str) -> str:
+def _family(method: str) -> tuple:
     meta = METHOD_META[method]
-    if meta["model_form"] == "zero-shot":
-        return "zero_shot"
-    return f"{meta['model_form']}_{meta['score']}"
+    return meta["model_form"], meta["score"]
 
 
-# Eighteen methods per model are more than the categorical palette holds, so the
-# encoding is composite: the first three slots of the fixed categorical order
-# (blue, orange, aqua; CVD safe for every pair, validated on the plot surface)
-# for the ranking, and a texture for the form and score
+# More methods per model than the categorical palette holds, so the encoding
+# is composite: the first three slots of the fixed categorical order (blue,
+# orange, aqua; CVD safe for every pair, validated on the plot surface) for
+# the ranking, and a texture for the form and score (solid: zero-shot attention)
 RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a"}
-FAMILY_HATCH = {"zero_shot": None, "step2_5_attention": "....", "mlp_attention": "\\\\\\\\",
-                "mlp_ig": "++++", "lora_attention": "////", "lora_ig": "xxxx"}
 RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS"}
-FAMILY_SHORT = {"zero_shot": "", "step2_5_attention": "Step 2.5 attn.", "mlp_attention": "MLP attn.",
-                "mlp_ig": "MLP IG", "lora_attention": "LoRA attn.", "lora_ig": "LoRA IG"}
+FORM_SHORT = {"zero-shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "MLP", "lora": "LoRA"}
+SCORE_SHORT = {"attention": "attn.", "ig": "IG", "igsigned": "IG±", "rollout": "roll.", "rolloutsigned": "roll.±",
+               "gradrollout": "g.roll.", "gradrolloutsigned": "g.roll.±"}
+ZERO_SHOT_ATTENTION = ("zero-shot", "attention")
+_HATCHES = ["////", "xxxx", "....", "\\\\", "++++", "oo", "**", "||||", "----", "O.", "x.", "/.", "+.", "\\."]
+_FAMILIES = [f for f in dict.fromkeys(_family(m) for m in METHODS) if f != ZERO_SHOT_ATTENTION]
+FAMILY_HATCH = {ZERO_SHOT_ATTENTION: None, **{f: _HATCHES[i % len(_HATCHES)] for i, f in enumerate(_FAMILIES)}}
+FAMILY_SHORT = {f: "" if f == ZERO_SHOT_ATTENTION else f"{FORM_SHORT[f[0]]} {SCORE_SHORT[f[1]]}"
+                for f in FAMILY_HATCH}
 METHOD_COLORS = {m: RANKING_COLORS[_ranking(m)] for m in METHODS}
 METHOD_HATCH = {m: FAMILY_HATCH[_family(m)] for m in METHODS}
 # Labels inside a figure: the model is already in the title
