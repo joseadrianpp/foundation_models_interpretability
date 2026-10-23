@@ -86,10 +86,14 @@ def load_pd_panels(out_dir: Path) -> dict:
         pd.DataFrame({"gene": genes}).to_csv(out_dir / f"{key}_genes.csv", index=False)
     return panels
 
-# This function gets all Gene symbols at least one GO annotation
+# Gene symbols with at least one informative GO annotation in each
+# sub-ontology. A NOT qualifier says the gene lacks the function and the ND
+# evidence code says that nothing is known, so neither annotates the gene
+# (the rule of pipeline_unified's GO aggregation)
 def gaf_symbols_by_go_source() -> dict:
-    gaf = pd.read_csv(GAF_PATH, sep="\t", comment="!", header=None, usecols=[2, 8],
-                      names=["symbol", "aspect"], dtype=str, low_memory=False)
+    gaf = pd.read_csv(GAF_PATH, sep="\t", comment="!", header=None, usecols=[2, 3, 6, 8],
+                      names=["symbol", "qualifier", "evidence", "aspect"], dtype=str, low_memory=False)
+    gaf = gaf[~gaf["qualifier"].str.contains("NOT", na=False) & (gaf["evidence"] != "ND")]
     return {go_source: set(gaf.loc[gaf["aspect"] == aspect, "symbol"])
             for aspect, go_source in ASPECT_TO_GO_SOURCE.items()}
 
@@ -204,9 +208,24 @@ def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_
     return PairMatrix(all_genes, all_refs, values)
 
 
+# Gene x reference-gene block, NaN in the rows and columns of the genes without
+# an informative annotation in the ontology (`annotated`, gaf_symbols_by_go_source):
+# go3 gives such a gene 0 with every other gene, but its similarity is
+# unknown, not low, so it must not pull a set's similarity down
+def annotated_block(pm: PairMatrix, genes: list, refs: list, annotated: set) -> np.ndarray:
+    block = pm.block(genes, refs)
+    block[np.array([g not in annotated for g in genes], dtype=bool), :] = np.nan
+    block[:, np.array([r not in annotated for r in refs], dtype=bool)] = np.nan
+    return block
+
+
 # Best-match average of a gene x gene block: every gene's best match in the
-# other set, averaged over both sets' genes, exactly as go3 groupwise "bma"
+# other set, averaged over both sets' genes, exactly as go3 groupwise "bma".
+# The all-NaN rows and columns (unannotated genes, annotated_block) are left
+# out, so a set with no annotated gene gives NaN
 def bma(block: np.ndarray) -> float:
+    block = block[~np.isnan(block).all(axis=1)]
+    block = block[:, ~np.isnan(block).all(axis=0)]
     if block.size == 0:
         return float("nan")
     return float((block.max(axis=1).sum() + block.max(axis=0).sum()) / (block.shape[0] + block.shape[1]))

@@ -221,13 +221,14 @@ DISTANCE = "SimRel"
 DISEASE = "parkinson"
 
 # Per-gene closest match (row max) to one PD reference, tagged by method;
-# read straight from gene_matrix.py's matrix, not the pre-aggregated summary
+# read straight from gene_matrix.py's matrix, not the pre-aggregated summary.
+# Unannotated genes have all-NaN rows and no best match, so they are left out
 def _bestmatch_per_gene(results_dir: Path, selection: str, reference: str, cell_type: str,
                         ontology: str) -> pd.DataFrame:
     path = (output_dir(results_dir, "gene_matrix", selection) / "matrices" / cell_type
             / f"{reference}__{DISTANCE}__{ontology}.csv")
     mat = pd.read_csv(path, index_col=[0, 1])
-    return mat.max(axis=1).rename("bestmatch").reset_index()
+    return mat.max(axis=1).dropna().rename("bestmatch").reset_index()
 
 def _draw_gwas_panel(ax, results_dir: Path, selection: str, reference: str, methods: list,
                      ontology: str) -> None:

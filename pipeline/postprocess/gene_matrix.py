@@ -6,7 +6,9 @@ For every (selection x cell_type x disease x distance x ontology) builds a
 matrix of shape (sum of method gene-set sizes) x (n_disease_genes), each cell
 the gene-pair similarity from go3.compare_gene_pairs_batch (groupwise BMA).
 Lin/SimRel are GO term-similarity measures, so the cell values are
-*similarities* (higher = closer).
+*similarities* (higher = closer). The rows and columns of genes without an
+informative annotation in the ontology are NaN (unknown, not dissimilar) and
+the statistics leave them out.
 
 Adapted from code/comparison_geneset_ref/compute_genematrix_disease.py, dropped
 to a single dataset and the methods this package actually produces (no
@@ -50,9 +52,11 @@ def _load_refs(refs_dir: Path, diseases: list) -> dict:
 
 
 # (len(genes) x len(ref_genes)) matrix of similarities, read from the shared
-# gene-pair cache (_go3_common.pair_similarities, groupwise BMA per gene pair)
-def _build_matrix(genes: list, ref_genes: list, pm: g3c.PairMatrix) -> pd.DataFrame:
-    return pd.DataFrame(pm.block(genes, ref_genes), index=genes, columns=ref_genes, dtype=float)
+# gene-pair cache (_go3_common.pair_similarities, groupwise BMA per gene pair),
+# NaN for the genes not in `annotated`
+def _build_matrix(genes: list, ref_genes: list, pm: g3c.PairMatrix, annotated: set) -> pd.DataFrame:
+    return pd.DataFrame(g3c.annotated_block(pm, genes, ref_genes, annotated),
+                        index=genes, columns=ref_genes, dtype=float)
 
 
 # Distribution stats of one block of matrix cells (`values`) plus, per gene,
@@ -69,26 +73,24 @@ def _block_stats(values: np.ndarray, bestmatch: np.ndarray) -> dict:
     return out
 
 
-# Per-method-block + all-methods statistics, computed both over all genes and
-# over GO-annotated method genes only (zeros from unannotated genes otherwise
-# depress the means, since they can never match a disease gene)
+# Per-method-block + all-methods statistics over the annotated method genes and
+# annotated disease genes only: the unannotated ones are NaN, unknown rather
+# than dissimilar
 def _summarize(matrix: pd.DataFrame, ann_set: set, meta: dict) -> list:
     rows = []
     by_method = matrix.groupby(level="method", sort=False)
     groups = [(m, by_method.get_group(m)) for m in matrix.index.unique("method")]
     groups.append(("all_methods", matrix))
+    ref_mask = matrix.columns.isin(ann_set)
     for method, block in groups:
-        genes = block.index.get_level_values("gene")
-        ann_mask = genes.isin(ann_set)
-        for scope, mask in [("all", np.ones(len(genes), bool)), ("annotated", ann_mask)]:
-            sub = block.to_numpy()[mask]
-            if sub.size == 0:
-                continue
-            # Row maxima = each gene's single closest match among the disease genes
-            stats = _block_stats(sub.ravel(), sub.max(axis=1))
-            rows.append({**meta, "method": method, "scope": scope,
-                         "n_genes": int(mask.sum()), "n_annotated": int(ann_mask.sum()),
-                         "n_ref_genes": matrix.shape[1], **stats})
+        ann_mask = block.index.get_level_values("gene").isin(ann_set)
+        sub = block.to_numpy()[np.ix_(ann_mask, ref_mask)]
+        if sub.size == 0:
+            continue
+        # Row maxima = each gene's single closest match among the disease genes
+        stats = _block_stats(sub.ravel(), sub.max(axis=1))
+        rows.append({**meta, "method": method, "n_genes": len(block), "n_annotated": int(ann_mask.sum()),
+                     "n_ref_genes": matrix.shape[1], "n_ref_annotated": int(ref_mask.sum()), **stats})
     return rows
 
 
@@ -118,7 +120,7 @@ def _gene_matrix_for_selection(results_dir: Path, selection: str, entries: list,
                 blocks = []
                 for e in ents:
                     # Create the matrix of our method genes vs the GWAS disease reference gene-set
-                    mat = _build_matrix(e["genes"], ref_genes, pm)
+                    mat = _build_matrix(e["genes"], ref_genes, pm, ann[ont])
                     mat.index = pd.MultiIndex.from_product([[e["method"]], mat.index], names=["method", "gene"])
                     blocks.append(mat)
                 full = pd.concat(blocks)
