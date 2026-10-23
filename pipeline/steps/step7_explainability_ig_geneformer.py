@@ -13,8 +13,8 @@ as in pipeline_unified:
   - IG(gene) = sum over the embedding dimensions of
     (real - baseline) * integrated_gradient, its signed total contribution.
   - We keep only correctly classified cells and score each gene by the MEAN
-    ABSOLUTE attribution over all of them, a cell without the gene counting
-    as 0 (non-negative, like RF importance).
+    ABSOLUTE attribution over the ones that have it (non-negative, like RF
+    importance), if at least C.MIN_PRESENT_FRAC of them have it.
 
 As for scGPT, the correctly classified cells and the cell embeddings come from
 the LoRA model's attention pass (attention_cssi_leiden.collect_geneformer, the

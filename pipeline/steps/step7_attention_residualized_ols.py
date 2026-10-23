@@ -142,10 +142,12 @@ def _ols_residualize(
     rows = []
     for gene in genes:
         gene = str(gene)
+        # A gene the score left out (in too few cells) is NaN, so it stays out
+        # of the fit and gets no residual
         rows.append(
             {
                 "gene": gene,
-                "attention_score": float(attention_scores.get(gene, 0.0)),
+                "attention_score": float(attention_scores.get(gene, np.nan)),
                 **features[gene],
             }
         )

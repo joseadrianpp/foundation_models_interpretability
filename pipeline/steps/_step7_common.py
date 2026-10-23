@@ -186,8 +186,9 @@ def _gene_scores(
     means: Dict[int, Dict[str, float]],
     score_fn: Callable[[float, float], float],
 ) -> Dict[str, float]:
-    all_genes = set(means[0].keys()) | set(means[1].keys())
+    # Only genes with a mean in both conditions (in enough cells of each) are scored
+    both_genes = set(means[0].keys()) & set(means[1].keys())
     scores: Dict[str, float] = {}
-    for g in all_genes:
-        scores[g] = float(score_fn(means[1].get(g, 0.0), means[0].get(g, 0.0)))
+    for g in both_genes:
+        scores[g] = float(score_fn(means[1][g], means[0][g]))
     return scores
