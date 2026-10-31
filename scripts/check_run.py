@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 import pandas as pd
 
 import run_tasks as rt
+from pipeline import config as C
 from pipeline.postprocess.gene_matrix import DEFAULT_DISEASES
 from pipeline.postprocess.gene_sets import (CELL_TYPES, FORMS, GENE_LIST_PATHS, METHOD_META, METHODS, MODELS,
                                             SELECTIONS, SUMMARY_PATHS, gene_list_path, methods_for,
@@ -209,6 +210,34 @@ def check_cells_and_cssi(results_dir: Path, dataset: str, max_cells, rep: Report
         print(pd.DataFrame(rows).to_string(index=False))
 
 
+def check_scgpt_ig_scores(results_dir: Path, dataset: str, rep: Report) -> None:
+    """The scGPT IG scores follow the current mean rule, and the cases / controls ones the current IG."""
+    if "scgpt" not in SCOPE["models"] or "ig" not in SCOPE["scores"]:
+        return
+    _section(f"{dataset}: scGPT IG scores (mean rule, cases / controls)")
+    rows = []
+    for form in rt.IG_FORMS["scgpt"]:
+        if not _in_scope(dataset, "scgpt", FORMS[form][0]):
+            continue
+        for ct in CELL_TYPES:
+            done = _read_json(results_dir / f"ig_{form}_scgpt" / ct / "done.json")
+            if done is None:
+                continue
+            if done.get("min_present_frac") != C.MIN_PRESENT_FRAC:
+                rep.fail(f"ig_{form}_scgpt {ct}: scored with min_present_frac {done.get('min_present_frac')}, "
+                         f"not {C.MIN_PRESENT_FRAC}: run --task rescore_ig_scgpt")
+            row = {"form": form, "cell_type": ct}
+            for name in rt.CONDITIONS:
+                cond = _read_json(results_dir / f"ig_{name}_{form}_scgpt" / ct / "done.json")
+                if cond is None or cond.get("source") != done:
+                    rep.fail(f"ig_{name}_{form}_scgpt {ct}: missing or computed from another IG run: "
+                             "run --task ig_condition_scgpt")
+                row[f"n_{name}"] = None if cond is None else cond["n_cells"]
+            rows.append(row)
+    if rows:
+        print(pd.DataFrame(rows).to_string(index=False))
+
+
 def gene_list_inventory(results_dir: Path, dataset: str, rep: Report) -> pd.DataFrame:
     _section(f"{dataset}: gene lists")
     rows = []
@@ -291,6 +320,9 @@ def check_postprocess(results_dir: Path, dataset: str, inv: pd.DataFrame, distan
             rep.fail(f"{selection}: {sim_csv} missing")
         else:
             sim = pd.read_csv(sim_csv)
+            # Only the gene sets in scope (the file also has those left out by --models/--forms/--scores)
+            keys = set(zip(present["method"], present["cell_type"]))
+            sim = sim[[k in keys for k in zip(sim["method"], sim["cell_type"])]]
             expected = len(REFERENCES) * len(ONTOLOGIES) * len(distances) * n_sets
             if len(sim) != expected or set(sim["distance"]) != set(distances):
                 rep.fail(f"{selection}: gwas_similarity has {len(sim)} rows and distances "
@@ -355,6 +387,7 @@ def main():
             rep.fail(f"{results_dir} missing")
             continue
         check_cells_and_cssi(results_dir, dataset, args.max_cells_per_type, rep)
+        check_scgpt_ig_scores(results_dir, dataset, rep)
         inv = gene_list_inventory(results_dir, dataset, rep)
         check_postprocess(results_dir, dataset, inv, args.distances, rep)
         inventories.append(inv)

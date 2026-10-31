@@ -48,7 +48,7 @@ SELECTIONS = ["top30", "z-score", "elbow"]
 MODELS = ["scgpt", "geneformer", "sccello"]
 # Forms of a model (folder part -> model form, label); the IG runs on the
 # classifiers, and for scGPT on the encoders without a head too (SIGnature)
-FORMS = {"zero_shot": ("zero-shot", "zero-shot"), "step2_5": ("step2_5", "Step 2.5"),
+FORMS = {"zero_shot": ("zero-shot", "zero-shot"), "step2_5": ("step2_5", "self-supervised"),
          "mlp": ("mlp", "zero-shot + MLP"), "lora": ("lora", "LoRA")}
 CLASSIFIER_FORMS = ("mlp", "lora")
 IG_FORMS = {"scgpt": tuple(FORMS)}
@@ -122,6 +122,18 @@ for _model in MODELS:
                       f"{_label}, OLS residual",
                       _dynamic_lists(f"{_ols_dir}/csv/top30.csv", f"{_ols_dir}/csv"),
                       f"{_ols_dir}/csv/ols.csv", f"{_ols_dir}/csv/selection_summary.json")
+
+# scGPT IG of each condition alone (ig_condition_scgpt): the pooled score over
+# the PD cells (cases) or the control cells (controls) only
+for _form, (_model_form, _form_label) in FORMS.items():
+    if _form not in ig_forms("scgpt"):
+        continue
+    for _cond in ("cases", "controls"):
+        _dir = f"ig_{_cond}_{_form}_scgpt/{{ct}}"
+        _register(f"ig_{_cond}_{_form}_scgpt", _cond, "ig", "scgpt", _model_form,
+                  f"{_form_label} IG ({_cond} only)",
+                  _dynamic_lists(f"{_dir}/top30_genes.csv", f"{_dir}/csv"),
+                  f"{_dir}/csv/all_genes.csv", f"{_dir}/csv/selection_summary.json")
 
 METHODS = list(GENE_LIST_PATHS)
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 """Result tables of the scGPT study: FG and SimPD per form, score, ranking and cut-off.
 
-Reads <results-root>/macrotable/macrotable.csv, built with
+Reads <results-root>/<macrotable>/macrotable.csv (--macrotable, default
+macrotable), built with
 `python -m pipeline.macrotable.build --results-dir <results-root> --models scgpt
---modules similarity faithfulness`, and writes to <results-root>/tables/:
+--modules similarity faithfulness`, and writes to <results-root>/<tables-dir>/
+(default tables; only the --scores rows, default IG):
 
   <dataset>_<cell type>.csv   one row per (form, score, ranking, TopN): SimPD
                               of the gene set (Problem C), FG of the ranking
@@ -11,16 +13,20 @@ Reads <results-root>/macrotable/macrotable.csv, built with
                               (Problem A)
   <dataset>_aggregate.csv     the same rows, mean over the four cell types
   <dataset>_fg.csv            FG of every ranking and of the per-cell IG
-                              (rows) per cell type, and their mean (columns)
+                              (rows) per cell type, and their mean (columns);
+                              the per-cell IG of the cases / controls rankings
+                              on the cells of that condition only
   fg_vs_simpd.csv             one row per (form, score, ranking): FG of the
                               per-cell IG and of the ranking, and the SimPD
-                              z of each cut-off against chance, both datasets
+                              of each cut-off (its z against chance with
+                              --with-baseline), both datasets
 
-With simpd_baseline.py's outputs (<results-root>/simpd_baseline/), the
-SimPD rows also get its comparison with random gene sets drawn with the same
-detection rates: SimPD_null (their mean), SimPD_z and SimPD_p (one-sided),
-and SimPD_z_uniform (against sets of any genes); the aggregate rows, against
-the null of the mean over the cell types.
+With --with-baseline and simpd_baseline.py's outputs
+(<results-root>/simpd_baseline/), the SimPD rows also get its comparison with
+random gene sets drawn with the same detection rates: SimPD_null (their mean),
+SimPD_z and SimPD_p (one-sided), and SimPD_z_uniform (against sets of any
+genes); the aggregate rows, against the null of the mean over the cell types.
+Without it (the default) the tables report SimPD and FG only.
 
 The attention rows are left out (the study dropped raw attention) unless
 --with-attention.
@@ -39,17 +45,18 @@ ROWS = ["ModelForm", "Score", "Ranking", "TopN"]
 VALUES = ["SimPD", "FG", "FGCell"]
 BASELINE = ["SimPD_null", "SimPD_z", "SimPD_p", "SimPD_z_uniform"]
 # simpd_baseline.py's names -> the macrotable's labels
-FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step2.5", "mlp": "zero-shot+MLP", "lora": "LoRA"}
+FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "self-supervised", "mlp": "zero-shot+MLP", "lora": "LoRA"}
 SCORE_LABELS = {"ig": "IG", "igsigned": "IG±", "rollout": "rollout", "rolloutsigned": "rollout±",
                 "gradrollout": "gradrollout", "gradrolloutsigned": "gradrollout±"}
-RANKING_LABELS = {None: "pooled", "cssi_": "CSSI", "residualized_ols_": "residualized"}
+RANKING_LABELS = {None: "pooled", "cssi_": "CSSI", "residualized_ols_": "residualized", "cases_": "cases",
+                  "controls_": "controls"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 # Table order of the key values
-ORDER = {"ModelForm": ["zero-shot", "Step2.5", "zero-shot+MLP", "LoRA"],
+ORDER = {"ModelForm": ["zero-shot+MLP", "self-supervised", "zero-shot", "LoRA"],
          "Score": ["IG", "IG±", "rollout", "rollout±", "gradrollout", "gradrollout±", "attention"],
-         "Ranking": ["pooled", "CSSI", "residualized"],
+         "Ranking": ["pooled", "cases", "controls", "CSSI", "residualized"],
          "TopN": ["top30", "zscore", "elbow"]}
 
 
@@ -65,7 +72,7 @@ def _baseline(results_root: Path, dataset: str, part: str):
     if not path.exists():
         return None
     df = pd.read_csv(path)
-    keys = df["method"].str.extract(r"^(igsigned|ig|gradrolloutsigned|gradrollout|rolloutsigned|rollout)_(cssi_|residualized_ols_)?(.*)_scgpt$")
+    keys = df["method"].str.extract(r"^(igsigned|ig|gradrolloutsigned|gradrollout|rolloutsigned|rollout)_(cssi_|residualized_ols_|cases_|controls_)?(.*)_scgpt$")
     out = pd.DataFrame({"ModelForm": keys[2].map(FORM_LABELS), "Score": keys[0].map(SCORE_LABELS),
                         "Ranking": keys[1].map(lambda r: RANKING_LABELS[r if isinstance(r, str) else None]),
                         "TopN": df["selection"].map(TOPN_LABELS),
@@ -77,12 +84,12 @@ def _baseline(results_root: Path, dataset: str, part: str):
 
 
 def _fg_vs_simpd(aggregates: dict) -> pd.DataFrame:
-    """One row per (form, score, ranking): FG of the per-cell IG and of the ranking, SimPD z per cut-off."""
+    """One row per (form, score, ranking): FG of the per-cell IG and of the ranking, SimPD (or its z) per cut-off."""
     parts = []
     for dataset, agg in aggregates.items():
         wide = agg.pivot_table(index=["ModelForm", "Score", "Ranking"], columns="TopN",
                                values="SimPD_z" if "SimPD_z" in agg else "SimPD")[ORDER["TopN"]]
-        wide.columns = [f"{dataset}_SimPD_{'z' if 'SimPD_z' in agg else 'raw'}_{c}" for c in wide.columns]
+        wide.columns = [f"{dataset}_SimPD_{'z_' if 'SimPD_z' in agg else ''}{c}" for c in wide.columns]
         fg = agg.drop_duplicates(["ModelForm", "Score", "Ranking"]).set_index(["ModelForm", "Score", "Ranking"])
         parts.append(pd.concat([fg[["FGCell", "FG"]].add_prefix(f"{dataset}_"), wide], axis=1))
     return _sorted(pd.concat(parts, axis=1).reset_index(), ["ModelForm", "Score", "Ranking"])
@@ -92,10 +99,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--results-root", type=Path, default=HERE / "results" / "scgpt")
     p.add_argument("--with-attention", action="store_true", help="Keep the attention rows.")
+    p.add_argument("--with-baseline", action="store_true",
+                   help="Add simpd_baseline.py's comparison with random gene sets (z, p).")
     p.add_argument("--macrotable", default="macrotable", help="Macrotable folder under --results-root.")
     p.add_argument("--tables-dir", default="tables", help="Output folder under --results-root.")
-    p.add_argument("--scores", nargs="+", default=["IG", "IG±"],
-                   help="Scores of the tables (labels; default: IG IG±; also rollout, rollout±, gradrollout, gradrollout±).")
+    p.add_argument("--scores", nargs="+", default=["IG"],
+                   help="Scores of the tables (labels; default: IG; also IG±, rollout, rollout±, gradrollout, gradrollout±).")
     args = p.parse_args()
 
     table = pd.read_csv(args.results_root / args.macrotable / "macrotable.csv")
@@ -111,7 +120,7 @@ def main():
     aggregates = {}
     for dataset, ds in table.groupby("Dataset"):
         tag = str(dataset).lower()
-        per_ct = _baseline(args.results_root, str(dataset), "methods")
+        per_ct = _baseline(args.results_root, str(dataset), "methods") if args.with_baseline else None
         if per_ct is not None:
             ds = ds.merge(per_ct, on=["CellType"] + ROWS, how="left")
         values = VALUES + (BASELINE if per_ct is not None else [])
@@ -120,7 +129,7 @@ def main():
         agg = ds.groupby(ROWS)[VALUES].mean().reset_index()
         agg["n_cell_types"] = ds.groupby(ROWS)["CellType"].nunique().to_numpy()
         # The mean over the cell types against the null of that mean (not the mean of the z)
-        mean_null = _baseline(args.results_root, str(dataset), "aggregate")
+        mean_null = _baseline(args.results_root, str(dataset), "aggregate") if args.with_baseline else None
         if mean_null is not None:
             agg = agg.merge(mean_null, on=ROWS, how="left")
         agg = _sorted(agg, ROWS)
@@ -128,11 +137,13 @@ def main():
         aggregates[str(dataset)] = agg
 
         # FG does not depend on the cut-off: one row per ranking, plus each form's per-cell
-        # explanations (IG for the IG scores, rollout for the rollout ones)
+        # explanations (IG for the IG scores, rollout for the rollout ones; on the cells of
+        # one condition for the cases / controls rankings)
         rank_fg = ds.drop_duplicates(["ModelForm", "Score", "Ranking", "CellType"]) \
             .pivot_table(index=["ModelForm", "Score", "Ranking"], columns="CellType", values="FG")
-        explanation = ds["Score"].map(lambda s: "per-cell " + next((m for m in ("gradrollout", "rollout")
-                                                                     if s.startswith(m)), "IG"))
+        explanation = ds.apply(lambda r: "per-cell " + next((m for m in ("gradrollout", "rollout")
+                                                             if r["Score"].startswith(m)), "IG")
+                               + (f" ({r['Ranking']})" if r["Ranking"] in ("cases", "controls") else ""), axis=1)
         cell_fg = ds.assign(Score=explanation).drop_duplicates(["ModelForm", "Score", "CellType"]) \
             .pivot_table(index=["ModelForm", "Score"], columns="CellType", values="FGCell")
         cell_fg.index = pd.MultiIndex.from_tuples([(f, s, "") for f, s in cell_fg.index], names=rank_fg.index.names)

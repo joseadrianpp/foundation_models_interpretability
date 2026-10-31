@@ -42,9 +42,10 @@ def _family(method: str) -> tuple:
 # is composite: the first three slots of the fixed categorical order (blue,
 # orange, aqua; CVD safe for every pair, validated on the plot surface) for
 # the ranking, and a texture for the form and score (solid: zero-shot attention)
-RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a"}
-RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS"}
-FORM_SHORT = {"zero-shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "MLP", "lora": "LoRA"}
+RANKING_COLORS = {"pooled": "#2a78d6", "cssi": "#eb6834", "ols": "#1baf7a", "cases": "#c3389a",
+                  "controls": "#8a6d00"}
+RANKING_SHORT = {"pooled": "", "cssi": "CSSI", "ols": "OLS", "cases": "cases", "controls": "controls"}
+FORM_SHORT = {"zero-shot": "zero-shot", "step2_5": "self-sup.", "mlp": "MLP", "lora": "LoRA"}
 SCORE_SHORT = {"attention": "attn.", "ig": "IG", "igsigned": "IG±", "rollout": "roll.", "rolloutsigned": "roll.±",
                "gradrollout": "g.roll.", "gradrolloutsigned": "g.roll.±"}
 ZERO_SHOT_ATTENTION = ("zero-shot", "attention")

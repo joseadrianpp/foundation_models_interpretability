@@ -4,9 +4,11 @@
   python -m pipeline.macrotable.build --modules classifier  # recompute one part, rejoin all
   python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt \
       --modules similarity faithfulness                     # the scGPT study (then summarize_scgpt.py)
+  python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt --forms mlp step2_5 \
+      --scores ig --rankings pooled --modules similarity faithfulness   # its 48-row table
 
 Parts go to <results>/<name>/parts/<module>.csv and the joined table to
-<results>/<name>/macrotable.csv (--name, default macrotable; --scores keeps only those scores): KEY columns first, then each module's
+<results>/<name>/macrotable.csv (--name, default macrotable; --scores and --rankings keep only those): KEY columns first, then each module's
 columns in MODULES order, and the long gene list (`genes`) last. The per-ontology similarities (Sim<R>_BP/CC/MF)
 stay in parts/similarity.csv only, so the scGPT study's table is KEY, SimPDGWAS, SimPDGE, SimPDGO, SimAD,
 SimKidney, SimCAD, SimPD, FG, FGCell. Modules not run this time are taken from their
@@ -49,8 +51,8 @@ def _read_part(path: Path) -> pd.DataFrame:
 
 
 def build(settings: Settings, modules=None, datasets=None, model_forms=DEFAULT_MODEL_FORMS,
-          models=None, scores=None, name: str = "macrotable") -> pd.DataFrame:
-    experiments = load_experiments(settings.results_root, datasets, model_forms, models, scores)
+          models=None, scores=None, name: str = "macrotable", rankings=None) -> pd.DataFrame:
+    experiments = load_experiments(settings.results_root, datasets, model_forms, models, scores, rankings)
     print(f"[macrotable] {len(experiments)} experiments", flush=True)
     parts_dir = Path(settings.results_root) / name / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,8 @@ def main():
                    help="Models (default: all).")
     p.add_argument("--scores", nargs="+", choices=list(gs.SCORE_NAMES), default=None,
                    help="Scores (default: every one), e.g. ig igsigned.")
+    p.add_argument("--rankings", nargs="+", choices=sorted({m["ranking"] for m in gs.METHOD_META.values()}),
+                   default=None, help="Rankings (default: every one), e.g. pooled cases controls.")
     p.add_argument("--distances", nargs="+", choices=DEFAULT_DISTANCES, default=["SimRel"],
                    help="GO3 distances of the similarity columns; the first has no suffix (default: SimRel).")
     p.add_argument("--rf-max-cells", type=int, default=20000, help="Cells per dataset and cell type for the RF.")
@@ -107,7 +111,7 @@ def main():
     settings = Settings(results_root=args.results_dir, distances=args.distances, rf_max_cells=args.rf_max_cells,
                         rf_trees=args.rf_trees, rf_folds=args.rf_folds, n_jobs=args.n_jobs)
     forms = ("zero-shot",) if args.zero_shot_only else tuple(args.forms)
-    build(settings, args.modules, args.datasets, forms, args.models, args.scores, args.name)
+    build(settings, args.modules, args.datasets, forms, args.models, args.scores, args.name, args.rankings)
 
 
 if __name__ == "__main__":

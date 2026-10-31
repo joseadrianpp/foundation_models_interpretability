@@ -8,7 +8,9 @@ From evaluate_attributions.py --curves --rankings, in
            Problem B, evaluated like A. The same for every TopN of the ranking.
   FGCell   the form's per-cell explanation the score comes from (method `ig`
            for IG and IG±, `rollout` / `gradrollout` for the rollout ones): Problem A, the
-           same for every ranking and TopN of the form and score.
+           same for every ranking and TopN of the form and score, except the cases /
+           controls rankings, whose FG and FGCell (`ig_cases`, `ig_controls`) are means
+           over the cells of that condition only.
 FG = 1 - deletion AUC / deletion AUC of a random attribution on the same
 cell (0 = random, higher = better). NaN where the evaluation has not run
 (attention rankings are not evaluated).
@@ -41,6 +43,9 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
         lookup = lambda method: (float(fg.at[method, e.cell_type])
                                  if fg is not None and method in fg.index and e.cell_type in fg.columns else np.nan)
         cell_method = next((m for m in ("gradrollout", "rollout") if meta["score"].startswith(m)), "ig")
+        if meta["ranking"] in ("cases", "controls"):
+            # The per-cell IG on the cells of that condition only
+            cell_method = f"{cell_method}_{meta['ranking']}"
         rows.append({"FG": lookup(ranking) if meta["score"] != "attention" else np.nan,
                      "FGCell": lookup(cell_method)})
     return pd.DataFrame(rows, index=experiments.index, columns=["FG", "FGCell"])

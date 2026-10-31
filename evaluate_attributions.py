@@ -20,7 +20,10 @@ run (run_tasks.py --task scgpt, read from --results-dir):
            cell's attribution. IG± is flipped for control cells only for an
            encoder (its PD - control mean of the SIGnature IG points to PD);
            for a classifier it is already the mean IG towards the true class
-           of both conditions, like the cell's own ig. rollout and
+           of both conditions, like the cell's own ig. rank_ig_cases /
+           rank_ig_controls (the IG of one condition's cells only) explain
+           only the cells of that condition, and fg_by_cell_type.csv adds
+           ig_cases / ig_controls, the per-cell ig on those cells. rollout and
            gradrollout: the cell's attention rollout and gradient-weighted
            rollout (rollout_ / gradrollout_<form>_scgpt, when those tasks ran;
            the same for both targets), and their rankings like the IG ones
@@ -138,6 +141,8 @@ SENS_FRACTION = 0.02
 SENS_SAMPLES = 10
 # Default cells per cell type (spread over the donors)
 CELLS_PER_TYPE = 200
+# Rankings of one condition's cells only (rank_<score>_cases / _controls) -> the label of the cells they explain
+CONDITION_LABELS = {"cases": 1, "controls": 0}
 
 
 def _features_in_step(n: int, steps: int = PF_STEPS) -> int:
@@ -336,7 +341,8 @@ def run_scgpt(args) -> None:
         for form, model in models.items():
             out_dir = eval_dir / f"scgpt_{form}"
             ct_csv = out_dir / "cells" / f"{slug}.csv"
-            done = pd.read_csv(ct_csv) if ct_csv.exists() and (args.skip_done or args.add_missing) else None
+            done = (pd.read_csv(ct_csv) if ct_csv.exists() and (args.skip_done or args.add_missing or args.redo)
+                    else None)
             ct_csv.parent.mkdir(parents=True, exist_ok=True)
             ig_scores = _PipelineIG(results_dir / f"ig_{form}_scgpt" / slug / "cell_scores.npz")
             # Per-cell rollout and gradient-weighted rollout, when their tasks ran
@@ -347,10 +353,13 @@ def run_scgpt(args) -> None:
                     per_cell[kind] = _PipelineIG(npz)
             rankings = _ranking_methods("scgpt", form, rankings_dir, args.dataset, slug, names)
             methods = ["ig", "random", *per_cell, *rankings]
-            # Methods to compute: all, or (--add-missing) those the saved file lacks
+            # Methods to compute: all, or (--add-missing) those the saved file lacks, plus
+            # (--redo) those to compute again (a ranking that changed)
             todo = set(methods)
             if done is not None:
-                todo = set(methods) - set(done["method"]) if args.add_missing else set()
+                todo = (set(methods) - set(done["method"]) if args.add_missing else set()) \
+                    | (set(args.redo) & set(methods))
+                done = done[~done["method"].isin(todo)]
             if not todo:
                 print(f"  {form}: done ({ct_csv}), kept", flush=True)
                 continue
@@ -376,8 +385,12 @@ def run_scgpt(args) -> None:
                 for kind, scores in per_cell.items():
                     attributions[kind] = scores.cell(i, tokens)[None, None, :]
                 for method, explain in rankings.items():
-                    attributions[method] = explain(model, x, y)
+                    # A ranking of one condition's cells only explains the cells of that condition
+                    if CONDITION_LABELS.get(method.rsplit("_", 1)[-1], label) == label:
+                        attributions[method] = explain(model, x, y)
                 attributions = {m: a for m, a in attributions.items() if m in todo}
+                if not attributions:
+                    continue
                 start = time.perf_counter()
                 curves = (_quantus_morf(model, x, label, attributions, device) if args.engine == "quantus"
                           else _morf_curves(model, x, label, attributions, args.chunk))
@@ -406,8 +419,13 @@ def run_scgpt(args) -> None:
             continue
         cells_df = pd.concat([pd.read_csv(f) for f in parts], ignore_index=True)
         cells_df.to_csv(out_dir / "curves.csv", index=False)
-        fg = cells_df.pivot_table(index="method", columns="cell_type", values="fg", aggfunc="mean")
-        fg["all"] = cells_df.groupby("method")["fg"].mean()
+        # The per-cell IG on the cells of one condition (ig_cases, ig_controls): the FGCell of
+        # the rankings of that condition, which are evaluated on those cells only
+        conditions = [cells_df[(cells_df["method"] == "ig") & (cells_df["label"] == label)]
+                      .assign(method=f"ig_{name}") for name, label in CONDITION_LABELS.items()]
+        cells_fg = pd.concat([cells_df, *conditions], ignore_index=True)
+        fg = cells_fg.pivot_table(index="method", columns="cell_type", values="fg", aggfunc="mean")
+        fg["all"] = cells_fg.groupby("method")["fg"].mean()
         fg.to_csv(out_dir / "fg_by_cell_type.csv")
         print(f"\n# scGPT {form} {args.dataset}: mean FG\n{fg.round(3).to_string()}", flush=True)
 
@@ -554,6 +572,9 @@ def main():
     p.add_argument("--skip-done", action="store_true", help="scGPT: keep the (form, cell type) already written.")
     p.add_argument("--add-missing", action="store_true",
                    help="scGPT: for a (form, cell type) already written, add only the methods it lacks.")
+    p.add_argument("--redo", nargs="+", default=[],
+                   help="scGPT: methods to compute again in a (form, cell type) already written, e.g. "
+                        "rank_ig_pooled after its ranking changed (random's AUC of the same cell is reused).")
     p.add_argument("--rankings-dir", type=Path, default=None,
                    help="Results root holding the rankings (default: --results-dir).")
     p.add_argument("--methods", nargs="+", choices=list(rank_model.EXPLAIN_FUNCS), default=["ig", "random"],

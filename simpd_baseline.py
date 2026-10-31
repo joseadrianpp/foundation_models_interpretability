@@ -3,8 +3,8 @@
 
 SimPD of a gene set (as pipeline/macrotable/columns/similarity.py): per
 reference, the GO3 set-level BMA similarity (SimRel) in BP, CC and MF,
-averaged over the three; then PD GWAS + PanelApp + ParkinsonsUK-UCL minus
-Alzheimer + kidney + CAD.
+averaged over the three; then the mean of PD GWAS, PanelApp and
+ParkinsonsUK-UCL minus the mean of Alzheimer, kidney and CAD.
 
 Two nulls per gene set of one dataset and cell type, --draws random sets
 each (seed 42), drawn from the cell type's universe (every gene the scGPT
@@ -44,8 +44,9 @@ from pipeline.postprocess import gene_sets as gs
 
 SEED = 42
 ONTOLOGIES = ["BP", "CC", "MF"]
-# Reference -> sign in SimPD (PD references minus the control diseases)
-SIGN = {"parkinson": 1, "panelapp": 1, "parkinsonsuk_ucl": 1, "alzheimer": -1, "kidney": -1, "cad": -1}
+# Reference -> weight in SimPD (mean of the PD references minus mean of the control diseases)
+SIGN = {"parkinson": 1 / 3, "panelapp": 1 / 3, "parkinsonsuk_ucl": 1 / 3,
+        "alzheimer": -1 / 3, "kidney": -1 / 3, "cad": -1 / 3}
 SELECTION_DIRS = {"top30": "", "z-score": "z-score", "elbow": "elbow"}
 NULLS = ("uniform", "expr")
 N_BINS = 10

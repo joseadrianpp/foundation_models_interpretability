@@ -103,7 +103,7 @@ IG_SCORES = ("ig", "igsigned")
 ROLLOUT_SCORES = ("rollout", "rolloutsigned")
 # Gradient-weighted rollout (Chefer et al. 2021): gradrollout_<form>_scgpt/, gradrolloutsigned_<form>_scgpt/
 GRAD_ROLLOUT_SCORES = ("gradrollout", "gradrolloutsigned")
-FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "Step 2.5", "mlp": "zero-shot + MLP", "lora": "LoRA"}
+FORM_LABELS = {"zero_shot": "zero-shot", "step2_5": "self-supervised", "mlp": "zero-shot + MLP", "lora": "LoRA"}
 # Forms with the same cell embeddings (the MLP head sits on the frozen zero-shot
 # encoder), which therefore share their Leiden strata
 SAME_EMBEDDING = {"zero_shot": ("zero_shot", "mlp"), "mlp": ("zero_shot", "mlp"),
@@ -883,6 +883,81 @@ def task_residualized_ols_rank(spec: dict, source: str, target: str, data_dir: P
                                                sub.num_rows, opts["permutation"], source=source, target=target)
 
 
+# ---------------------------------------------------------------------------
+# scGPT IG scores recomputed from the saved per-cell IG (CPU, no model)
+# ---------------------------------------------------------------------------
+# Rankings of the cells of one condition only (label 1 = PD, 0 = control),
+# folder ig_<name>_<form>_scgpt
+CONDITIONS = {"cases": 1, "controls": 0}
+
+
+def _saved_ig(results_dir: Path, form: str, names: dict):
+    """(cell type slug, IG folder, IGResult, its done.json) of every finished IG cell type of a form."""
+    for out_dir in sorted((results_dir / _task_name("ig", form, "scgpt")).glob("*/")):
+        npz, done = out_dir / "cell_scores.npz", out_dir / DONE_FILE
+        if not (npz.exists() and done.exists()):
+            continue
+        result = ig.IGResult.load(npz, np.load(out_dir / "cell_embeddings.npy"), names)
+        yield out_dir.name, out_dir, result, json.loads(done.read_text())
+
+
+def task_rescore_ig_scgpt(data_dir: Path, results_dir: Path, opts=None) -> None:
+    """Rewrite the IG and IG± scores of every finished scGPT IG task from its saved per-cell IG.
+
+    The scores are means over cells (C.MIN_PRESENT_FRAC); when that rule
+    changes, the IG itself (hours of GPU) does not, so the pooled, CSSI and
+    selection outputs of both scores are written again from cell_scores.npz,
+    with the saved Leiden strata, and done.json gets the current settings.
+    A cell type whose done.json already has them is kept.
+    """
+    names = _load_scgpt_gene_names(data_dir)
+    for form in IG_FORMS["scgpt"]:
+        task = _task_name("ig", form, "scgpt")
+        for slug, out_dir, result, done in _saved_ig(results_dir, form, names):
+            info = {**done, "min_present_frac": C.MIN_PRESENT_FRAC}
+            if done == info:
+                print(f"  {task} {slug}: already scored with these settings, kept", flush=True)
+                continue
+            print(f"\n# rescore {task} | {slug} | {int(result.correct.sum()):,} scored cells #", flush=True)
+            source = json.loads((out_dir / "cssi_metadata.json").read_text())["embedding_source"]
+            _write_ig_outputs(result, names, out_dir, results_dir / f"igsigned_{form}_scgpt" / slug,
+                              _strata_dirs(results_dir, "scgpt", form, slug), source, f"{task} {slug}")
+            _mark_done(out_dir, info)
+
+
+def task_ig_condition_scgpt(data_dir: Path, results_dir: Path, opts=None) -> None:
+    """Score IG of the PD cells only (cases) and of the control cells only (controls).
+
+    The pooled IG score (mean |IG| per gene) over the scored cells of one
+    condition, from the saved per-cell IG: the IG of a cell does not depend on
+    the other cells, so this is the score of running the model on that
+    condition alone. Same mean rule (C.MIN_PRESENT_FRAC, of the condition's
+    cells) and selections as pooled, in ig_cases_<form>_scgpt/ and
+    ig_controls_<form>_scgpt/.
+    """
+    names = _load_scgpt_gene_names(data_dir)
+    for form in IG_FORMS["scgpt"]:
+        for slug, _, result, done in _saved_ig(results_dir, form, names):
+            for name, label in CONDITIONS.items():
+                task = f"ig_{name}_{form}_scgpt"
+                out_dir = results_dir / task / slug
+                cells = result.correct & (result.labels == label)
+                info = {"task": task, "n_cells": int(cells.sum()), "source": done,
+                        "min_present_frac": C.MIN_PRESENT_FRAC}
+                if (out_dir / DONE_FILE).exists() and json.loads((out_dir / DONE_FILE).read_text()) == info:
+                    print(f"  {task} {slug}: already done, kept", flush=True)
+                    continue
+                tokens = cells[result.token_cells]
+                scores = ig._named_means(result.token_gids[tokens], np.abs(result.token_ig[tokens]),
+                                         int(cells.sum()), names)
+                _write_top_n(scores, out_dir / "top30_genes.csv")
+                _write_all_scores(scores, out_dir / "csv" / "all_genes.csv")
+                summary = dynamic.write_selection_family(scores, out_dir / "csv", random_state=SEED)
+                _mark_done(out_dir, info)
+                print(f"  {task} {slug}: {int(cells.sum()):,} cells, {len(scores):,} genes, "
+                      + ", ".join(f"{k}={v['n_selected']}" for k, v in summary.items()), flush=True)
+
+
 # Model tasks of every model: the attention of its four forms and the IG of its
 # two classifiers (of every form for scGPT)
 MODEL_TASKS = {}
@@ -900,9 +975,11 @@ for _name in ["scgpt", *RANK_MODELS]:
             MODEL_TASKS[_task_name("gradrollout", _form, _name)] = partial(task_rollout_scgpt, _form,
                                                                             kind="gradrollout")
 
-# CPU tasks computed from the model tasks' output: the OLS residual of each pooled
-# score, <target>: <source> (as in the README)
-DERIVED_TASKS = {}
+# CPU tasks computed from the model tasks' output: scGPT's IG scores rewritten
+# from the saved per-cell IG (a no-op after a fresh IG run), the OLS residual of
+# each pooled score, <target>: <source> (as in the README), and the scGPT IG of
+# each condition alone
+DERIVED_TASKS = {"rescore_ig_scgpt": task_rescore_ig_scgpt}
 for _name in ["scgpt", *RANK_MODELS]:
     for _score, _form in ([("attention", f) for f in FORMS]
                           + [(score, f) for f in IG_FORMS.get(_name, CLASSIFIER_FORMS) for score in IG_SCORES]
@@ -913,6 +990,8 @@ for _name in ["scgpt", *RANK_MODELS]:
                    else f"{_score}_residualized_ols_{_form}_{_name}")
         DERIVED_TASKS[_target] = (partial(task_residualized_ols_scgpt, _source, _target) if _name == "scgpt"
                                   else partial(task_residualized_ols_rank, RANK_MODELS[_name], _source, _target))
+
+DERIVED_TASKS["ig_condition_scgpt"] = task_ig_condition_scgpt
 
 POSTPROCESS_TASKS = {
     "enrichment": task_enrichment,

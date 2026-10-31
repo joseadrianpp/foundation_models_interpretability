@@ -16,16 +16,18 @@ from ..postprocess import gene_sets as gs
 
 # Columns that identify an experiment, in table order. Score is the per-cell
 # signal (attention, IG, IG±) and Ranking how it is aggregated over the cells
-# (pooled mean, CSSI-max, OLS residual): every score has the three rankings
+# (pooled mean, CSSI-max, OLS residual; scGPT's IG also over the PD cells only,
+# cases, or the control cells only, controls)
 KEY = ["Ranking", "Score", "TopN", "Model", "ModelForm", "Dataset", "CellType"]
 
 # Table labels of the gene_sets.py names
-RANKING_LABELS = {"pooled": "pooled", "cssi": "CSSI", "ols": "residualized"}
+RANKING_LABELS = {"pooled": "pooled", "cssi": "CSSI", "ols": "residualized", "cases": "cases",
+                  "controls": "controls"}
 SCORE_LABELS = {"attention": "attention", "ig": "IG", "igsigned": "IG±", "rollout": "rollout",
                 "rolloutsigned": "rollout±", "gradrollout": "gradrollout", "gradrolloutsigned": "gradrollout±"}
 TOPN_LABELS = {"top30": "top30", "z-score": "zscore", "elbow": "elbow"}
 MODEL_LABELS = {"scgpt": "scGPT", "geneformer": "Geneformer", "sccello": "scCello"}
-MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "step2_5": "Step2.5", "mlp": "zero-shot+MLP", "lora": "LoRA"}
+MODEL_FORM_LABELS = {"zero-shot": "zero-shot", "step2_5": "self-supervised", "mlp": "zero-shot+MLP", "lora": "LoRA"}
 CELL_TYPE_LABELS = {"astrocytes": "astrocyte", "da_neurons": "neuron", "microglia": "microglia",
                     "oligodendrocytes": "oligodendrocyte"}
 
@@ -62,8 +64,9 @@ def genes_hash(genes: Sequence[str]) -> str:
 def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = None,
                      model_forms: Sequence[str] = DEFAULT_MODEL_FORMS,
                      models: Optional[Sequence[str]] = None,
-                     scores: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    """One row per existing gene list, indexed by KEY (of `models` and `scores`, default every one).
+                     scores: Optional[Sequence[str]] = None,
+                     rankings: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """One row per existing gene list, indexed by KEY (of `models`, `scores` and `rankings`, default every one).
 
     Besides KEY: method, selection, model and cell_type (gene_sets.py names),
     results_dir (the dataset's results folder), gene_list (path) and genes
@@ -75,7 +78,8 @@ def load_experiments(results_root: Path, datasets: Optional[Sequence[str]] = Non
         for method in gs.METHODS:
             meta = gs.METHOD_META[method]
             if meta["model_form"] not in model_forms or (models is not None and meta["model"] not in models) \
-                    or (scores is not None and meta["score"] not in scores):
+                    or (scores is not None and meta["score"] not in scores) \
+                    or (rankings is not None and meta["ranking"] not in rankings):
                 continue
             for selection in gs.GENE_LIST_PATHS[method]:
                 for cell_type in gs.CELL_TYPES:

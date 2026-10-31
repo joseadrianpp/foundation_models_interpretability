@@ -5,9 +5,9 @@ gene list and reference R, in sub-ontology O (BP, CC, MF), with the first of
 settings.distances (SimRel by default).
 Sim<R>: the mean of Sim<R>_BP, Sim<R>_CC and Sim<R>_MF (over the ones
 available), the single value per reference of the table specification.
-SimPD: SimPDGWAS + SimPDGE + SimPDGO - SimAD - SimKidney - SimCAD, the
-similarity to the three PD references net of the three control diseases
-(NaN if any of the six is missing).
+SimPD: (SimPDGWAS + SimPDGE + SimPDGO) / 3 - (SimAD + SimKidney + SimCAD) / 3,
+the mean similarity to the three PD references net of the mean to the three
+control diseases (NaN if any of the six is missing).
 Column order: the six Sim<R>, then SimPD, then the per-ontology columns
 (these stay in parts/similarity.csv only; build.py leaves them out of the
 macrotable).
@@ -68,6 +68,6 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
     net = {}
     for dist in settings.distances:
         sim = lambda label: means[f"Sim{label}{_suffix(settings.distances, dist)}"]
-        net[f"SimPD{_suffix(settings.distances, dist)}"] = (sim("PDGWAS") + sim("PDGE") + sim("PDGO")
-                                                            - sim("AD") - sim("Kidney") - sim("CAD"))
+        net[f"SimPD{_suffix(settings.distances, dist)}"] = ((sim("PDGWAS") + sim("PDGE") + sim("PDGO")) / 3
+                                                            - (sim("AD") + sim("Kidney") + sim("CAD")) / 3)
     return pd.concat([pd.DataFrame(means), pd.DataFrame(net), per_ontology], axis=1)
