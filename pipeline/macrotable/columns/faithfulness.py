@@ -1,19 +1,20 @@
-"""Faithfulness gain (FG) of the experiment's ranking and of its model's per-cell IG.
+"""Faithfulness of the experiment's model: FGCell of its per-cell explanation.
 
-From evaluate_attributions.py --curves --rankings, in
+From evaluate_attributions.py, in
 <results>/dataset_<x>/attribution_eval/<model>_<form>/fg_by_cell_type.csv
-(mean FG per method and cell type):
-  FG       the ranking itself (its pooled / CSSI / OLS scores of score IG,
-           IG±, rollout, rollout±, gradrollout or gradrollout±) used as every cell's attribution:
-           Problem B, evaluated like A. The same for every TopN of the ranking.
+(mean faithfulness gain per method and cell type):
   FGCell   the form's per-cell explanation the score comes from (method `ig`
-           for IG and IG±, `rollout` / `gradrollout` for the rollout ones): Problem A, the
-           same for every ranking and TopN of the form and score, except the cases /
-           controls rankings, whose FG and FGCell (`ig_cases`, `ig_controls`) are means
-           over the cells of that condition only.
-FG = 1 - deletion AUC / deletion AUC of a random attribution on the same
-cell (0 = random, higher = better). NaN where the evaluation has not run
-(attention rankings are not evaluated).
+           for IG and IG±, `rollout` / `gradrollout` for the rollout ones),
+           each cell's genes removed in the order of its own attribution:
+           the same for every ranking and TopN of the form and score, except
+           the cases / controls rankings, whose FGCell (`ig_cases`,
+           `ig_controls`) is the mean over the cells of that condition only.
+FGCell = 1 - deletion AUC / deletion AUC of a random attribution on the same
+cell (0 = random, higher = better; above 1 is possible for an encoder, whose
+output can fall below that of the baseline). NaN where the evaluation has not
+run. The FG of the population rankings (every cell explained by the pooled
+ranking) was dropped on 2026-10-31: it is near chance for the classifiers and
+does not tell whether the explanation reflects each cell's decision.
 """
 
 import numpy as np
@@ -39,13 +40,10 @@ def compute(experiments: pd.DataFrame, settings) -> pd.DataFrame:
         if key not in tables:
             tables[key] = _fg_table(*key)
         fg = tables[key]
-        ranking = f"rank_{meta['score']}_{meta['ranking']}"
-        lookup = lambda method: (float(fg.at[method, e.cell_type])
-                                 if fg is not None and method in fg.index and e.cell_type in fg.columns else np.nan)
         cell_method = next((m for m in ("gradrollout", "rollout") if meta["score"].startswith(m)), "ig")
         if meta["ranking"] in ("cases", "controls"):
             # The per-cell IG on the cells of that condition only
             cell_method = f"{cell_method}_{meta['ranking']}"
-        rows.append({"FG": lookup(ranking) if meta["score"] != "attention" else np.nan,
-                     "FGCell": lookup(cell_method)})
-    return pd.DataFrame(rows, index=experiments.index, columns=["FG", "FGCell"])
+        found = fg is not None and cell_method in fg.index and e.cell_type in fg.columns
+        rows.append({"FGCell": float(fg.at[cell_method, e.cell_type]) if found else np.nan})
+    return pd.DataFrame(rows, index=experiments.index, columns=["FGCell"])

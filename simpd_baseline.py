@@ -7,7 +7,7 @@ averaged over the three; then the mean of PD GWAS, PanelApp and
 ParkinsonsUK-UCL minus the mean of Alzheimer, kidney and CAD.
 
 Two nulls per gene set of one dataset and cell type, --draws random sets
-each (seed 42), drawn from the cell type's universe (every gene the scGPT
+each (seed 42), drawn from the cell type's universe (every gene the scGPT |IG|
 rankings scored there):
 
   uniform   sets of the same size, any gene of the universe
@@ -16,7 +16,7 @@ rankings scored there):
             the rankings favour well-detected genes, which tend to be better
             annotated in GO, so this is the stricter null
 
-Every observed gene set (gwas_similarity's gene_level_similarity_all.csv,
+Every observed |IG| gene set (gwas_similarity's gene_level_similarity_all.csv,
 the three selections) is compared with them:
 
   z         (SimPD - null mean) / null sd
@@ -51,7 +51,10 @@ SELECTION_DIRS = {"top30": "", "z-score": "z-score", "elbow": "elbow"}
 NULLS = ("uniform", "expr")
 N_BINS = 10
 # Detection rate per gene and cell type: the OLS covariates (computed on every cell of the cell type)
-COVARIATES = "ig_residualized_ols_zero_shot_scgpt/{ct}/residualized_genes.csv"
+# (identical for every form, as they describe the cells; the first form found is used: the new
+# dataset B has no zero-shot run)
+COVARIATES = "ig_residualized_ols_{form}_scgpt/{ct}/residualized_genes.csv"
+COVARIATE_FORMS = ["zero_shot", "mlp", "step2_5", "lora"]
 
 
 def _simpd_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -63,11 +66,18 @@ def _simpd_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _universe(results_dir: Path, cell_type: str) -> list:
-    """Every gene a scGPT IG ranking scored in this cell type."""
+    """Every gene a scGPT IG ranking scored in this cell type.
+
+    Only |IG| (pooled, CSSI, cases/controls, OLS), the score the analysed
+    gene sets come from (IG± is left out for now, 2026-11-04): the attention
+    and rollout rankings were scored with other rules (rollout keeps every
+    gene present in one cell) and would make the universe depend on which of
+    them exist.
+    """
     genes = set()
     for method in gs.METHODS:
         meta = gs.METHOD_META[method]
-        if meta["model"] != "scgpt" or meta["score"] == "attention" or method not in gs.ALL_SCORE_PATHS:
+        if meta["model"] != "scgpt" or meta["score"] != "ig" or method not in gs.ALL_SCORE_PATHS:
             continue
         path = results_dir / gs.ALL_SCORE_PATHS[method].format(ct=cell_type)
         if path.exists():
@@ -100,7 +110,9 @@ class SetScorer:
 
 def _detection_bins(results_dir: Path, cell_type: str, universe: list) -> np.ndarray:
     """Decile of detection rate of every universe gene (genes without covariates: the lowest)."""
-    cov = pd.read_csv(results_dir / COVARIATES.format(ct=cell_type), usecols=["gene", "dropout_rate"])
+    path = next(p for p in (results_dir / COVARIATES.format(form=f, ct=cell_type) for f in COVARIATE_FORMS)
+                if p.exists())
+    cov = pd.read_csv(path, usecols=["gene", "dropout_rate"])
     detection = 1.0 - cov.set_index(cov["gene"].astype(str))["dropout_rate"]
     det = detection.reindex(universe).fillna(0.0).to_numpy()
     edges = np.quantile(det, np.linspace(0, 1, N_BINS + 1)[1:-1])
@@ -126,6 +138,8 @@ def run(results_root: Path, dataset: str, draws: int) -> None:
         df = pd.read_csv(results_dir / "gwas_similarity" / sub / "gene_level_similarity_all.csv")
         obs.append(_simpd_table(df[df["distance"] == "SimRel"]).assign(selection=selection))
     obs = pd.concat(obs, ignore_index=True)
+    # Only the |IG| gene sets (IG± left out for now)
+    obs = obs[obs["method"].map(lambda m: gs.METHOD_META[m]["score"]) == "ig"].reset_index(drop=True)
 
     # Gene x gene similarities over every cell type's universe (only the missing pairs are computed)
     universes = {ct: _universe(results_dir, ct) for ct in gs.CELL_TYPES}

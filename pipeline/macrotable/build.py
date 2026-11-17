@@ -4,14 +4,14 @@
   python -m pipeline.macrotable.build --modules classifier  # recompute one part, rejoin all
   python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt \
       --modules similarity faithfulness                     # the scGPT study (then summarize_scgpt.py)
-  python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt --forms mlp step2_5 \
-      --scores ig --rankings pooled --modules similarity faithfulness   # its 48-row table
+  python -m pipeline.macrotable.build --results-dir results/scgpt --models scgpt --forms mlp lora step2_5 \
+      --scores ig --rankings pooled --modules similarity faithfulness   # its 72-row table
 
 Parts go to <results>/<name>/parts/<module>.csv and the joined table to
 <results>/<name>/macrotable.csv (--name, default macrotable; --scores and --rankings keep only those): KEY columns first, then each module's
 columns in MODULES order, and the long gene list (`genes`) last. The per-ontology similarities (Sim<R>_BP/CC/MF)
 stay in parts/similarity.csv only, so the scGPT study's table is KEY, SimPDGWAS, SimPDGE, SimPDGO, SimAD,
-SimKidney, SimCAD, SimPD, FG, FGCell. Modules not run this time are taken from their
+SimKidney, SimCAD, SimPD, FGCell. Modules not run this time are taken from their
 saved part, restricted to the current experiments.
 """
 

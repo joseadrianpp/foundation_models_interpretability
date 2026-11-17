@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 """Evaluate per-cell gene attributions and population rankings with Quantus (Problems A and B).
 
-scGPT (the study): the faithfulness gain (FG) of every form (zero_shot,
-step2_5, mlp, lora; --forms) on the same cells, from a finished pipeline
-run (run_tasks.py --task scgpt, read from --results-dir):
+scGPT (the study): FGCell, the faithfulness gain of each form's per-cell IG
+(zero_shot, step2_5, mlp, lora; --forms), on the same cells, from a
+finished pipeline run (run_tasks.py --task scgpt, read from --results-dir).
+By default only ig and random are evaluated (all FGCell needs); --rankings
+adds the population rankings (their FG, Problem B, dropped from the tables on
+2026-10-31: near chance for the classifiers) and the per-cell rollouts:
 
   cells    --cells-per-type (default 200, 800 per dataset) per cell type,
            the same for every form: cells classified correctly by both
@@ -15,7 +18,7 @@ run (run_tasks.py --task scgpt, read from --results-dir):
            cell type tokenised exactly as the pipeline did), towards the true
            class for a classifier (IG of the PD logit times +1/2 or -1/2),
            as saved for an encoder (SIGnature); random: uniform noise;
-           rank_<score>_<ranking>: every population ranking of the form
+           with --rankings, rank_<score>_<ranking>: every population ranking of the form
            (score ig or igsigned, ranking pooled, cssi or ols) as every
            cell's attribution. IG± is flipped for control cells only for an
            encoder (its PD - control mean of the SIGnature IG points to PD);
@@ -45,7 +48,8 @@ run (run_tasks.py --task scgpt, read from --results-dir):
            gene removed.
   FG       1 - deletion AUC / deletion AUC of random on the same cell (0 =
            random, higher = better; above 1 is possible for the encoders,
-           whose output can fall below that of the baseline).
+           whose output can fall below that of the baseline). The FG of
+           method ig is FGCell, the faithfulness metric of the study.
 
 Outputs per form (<results-dir>/dataset_<x>/attribution_eval/scgpt_<form>/):
 cells/<cell type>.csv (one row per cell and method) and cells/<cell
@@ -305,7 +309,7 @@ def _auc(curve: np.ndarray) -> float:
 
 
 def run_scgpt(args) -> None:
-    """FG of the scGPT forms: per-cell IG (the pipeline's), random and the population rankings."""
+    """FGCell of the scGPT forms: per-cell IG (the pipeline's) and random; with --rankings also the rankings."""
     data_dir = rt.DATASET_DIRS[args.dataset]
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     results_dir = args.results_dir / f"dataset_{args.dataset.lower()}"
@@ -347,11 +351,12 @@ def run_scgpt(args) -> None:
             ig_scores = _PipelineIG(results_dir / f"ig_{form}_scgpt" / slug / "cell_scores.npz")
             # Per-cell rollout and gradient-weighted rollout, when their tasks ran
             per_cell = {}
-            for kind in ("rollout", "gradrollout"):
+            for kind in (("rollout", "gradrollout") if args.rankings else ()):
                 npz = results_dir / f"{kind}_{form}_scgpt" / slug / "cell_scores.npz"
                 if npz.exists():
                     per_cell[kind] = _PipelineIG(npz)
-            rankings = _ranking_methods("scgpt", form, rankings_dir, args.dataset, slug, names)
+            rankings = (_ranking_methods("scgpt", form, rankings_dir, args.dataset, slug, names)
+                        if args.rankings else {})
             methods = ["ig", "random", *per_cell, *rankings]
             # Methods to compute: all, or (--add-missing) those the saved file lacks, plus
             # (--redo) those to compute again (a ranking that changed)
@@ -575,6 +580,8 @@ def main():
     p.add_argument("--redo", nargs="+", default=[],
                    help="scGPT: methods to compute again in a (form, cell type) already written, e.g. "
                         "rank_ig_pooled after its ranking changed (random's AUC of the same cell is reused).")
+    p.add_argument("--rankings", action="store_true",
+                   help="scGPT: also evaluate the population rankings (FG, Problem B) and the per-cell rollouts.")
     p.add_argument("--rankings-dir", type=Path, default=None,
                    help="Results root holding the rankings (default: --results-dir).")
     p.add_argument("--methods", nargs="+", choices=list(rank_model.EXPLAIN_FUNCS), default=["ig", "random"],

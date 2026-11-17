@@ -111,6 +111,8 @@ def init_go3(threads: Optional[int] = None):
 # same genes as gwas_similarity). Every pair is computed once per
 # (ontology, distance) and kept on disk, one matrix per file:
 #   <results root>/go3_pair_cache/<ontology>__<distance>.npz
+# (the gene-level groupwise is BMA; another one, used by simpd_measures.py,
+# goes to <ontology>__<distance>__<groupwise>.npz)
 # A set-level BMA similarity is then rebuilt exactly from its gene x gene block
 # (see bma), the same aggregation go3.compare_gene_set_pairs_batch does.
 PAIR_GROUPWISE = "bma"
@@ -162,9 +164,11 @@ class PairMatrix:
         return self.values[np.ix_([self._gi[g] for g in genes], [self._ri[r] for r in refs])]
 
 
-def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_dir: Path) -> PairMatrix:
+def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_dir: Path,
+                      groupwise: str = PAIR_GROUPWISE) -> PairMatrix:
     """Similarity of every (gene, ref gene) pair, computing only the pairs not cached yet."""
-    path = Path(cache_dir) / f"{ontology}__{distance}.npz"
+    suffix = "" if groupwise == PAIR_GROUPWISE else f"__{groupwise}"
+    path = Path(cache_dir) / f"{ontology}__{distance}{suffix}.npz"
     lock = path.with_suffix(".lock")
     with _locked(lock):
         old_genes, old_refs, old_values = _load_pairs(path)
@@ -180,14 +184,14 @@ def pair_similarities(genes, refs, ontology: str, distance: str, counter, cache_
     missing = np.argwhere(np.isnan(values[np.ix_(rows, cols)]))
     n_total = rows.size * cols.size
     if len(missing):
-        print(f"[go3 {ontology} {distance}] {len(missing):,} new gene pairs to compute "
+        print(f"[go3 {ontology} {distance} {groupwise}] {len(missing):,} new gene pairs to compute "
               f"({n_total - len(missing):,} of {n_total:,} cached)", flush=True)
-        with progress(total=len(missing), desc=f"go3 {ontology} {distance}", unit="pair",
+        with progress(total=len(missing), desc=f"go3 {ontology} {distance} {groupwise}", unit="pair",
                       unit_scale=True) as bar:
             for start in range(0, len(missing), PAIR_CHUNK):
                 chunk = missing[start:start + PAIR_CHUNK]
                 pairs = [(all_genes[rows[i]], all_refs[cols[j]]) for i, j in chunk]
-                sims = go3.compare_gene_pairs_batch(pairs, ontology, distance, PAIR_GROUPWISE, counter)
+                sims = go3.compare_gene_pairs_batch(pairs, ontology, distance, groupwise, counter)
                 values[rows[chunk[:, 0]], cols[chunk[:, 1]]] = sims
                 bar.update(len(chunk))
         # Another run may have added pairs meanwhile: merge the file on disk under the lock
