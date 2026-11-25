@@ -1,5 +1,7 @@
 # Foundation Models Interpretability
 
+The PD vs control classification of astrocytes from frozen cell embeddings (each model's forward pass with its authors' code, plus an MLP head) is separate from the interpretability: see [`classification/README.md`](classification/README.md).
+
 Run `run_tasks.py` for running the interpretability tasks of scGPT (with every gene), Geneformer V2 104M and scCello, for Parkinson's disease (PD) vs control. Each model comes in four forms:
 
 - **Zero-shot** (`attention_<model>`; scGPT also `ig_zero_shot_scgpt`): the pretrained model. Forward-passes every cell and captures the CLS-token attention to each gene. Genes are scored by `mean_attention_pd - mean_attention_control`, so the sign shows which condition attends to that gene more. Each mean is over the cells of the condition that have the gene, so it measures the gene where it is expressed and not how many cells express it, and a gene is scored only if at least 5 % of the cells of each condition have it (`MIN_PRESENT_FRAC` in `pipeline/config.py`). Every other mean (CSSI strata, donors, Integrated Gradients) follows the same rule.
